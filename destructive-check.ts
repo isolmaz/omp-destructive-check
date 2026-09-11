@@ -1853,7 +1853,8 @@ export default function destructiveCheck(pi) {
         statusNote(ctx, statusText());
         const choice = selLabel(
           await ctx.ui.select("destructive-check", [
-            { label: `protection: ${CFG.mode}`, description: "simple = block outside-project deletes · medium = + inside-project · hard = + git, scripts · custom = per-rule" },
+            { label: `enabled: ${CFG.enabled ? "yes" : "no"}`, description: "master switch — off means no checking at all; the status line then reads dc: off" },
+            { label: `protection: ${CFG.mode}${CFG.enabled ? "" : " (guard off)"}`, description: "simple = block outside-project deletes · medium = + inside-project · hard = + git, scripts · custom = per-rule" },
             { label: `checker: ${CFG.provider.model ? `${CFG.provider.name}/${CFG.provider.model}` : "no model"}`, description: "provider, model, engine, timeout" },
             { label: `ask on deny: ${CFG.askOnDeny ? "on" : "off"}`, description: "when the model denies, ask the user instead of blocking silently" },
             { label: `ask on error: ${CFG.askOnError ? "on" : "off"}`, description: "when the checker fails, ask the user instead of blocking" },
@@ -1871,7 +1872,10 @@ export default function destructiveCheck(pi) {
           ]),
         );
         if (choice === undefined || choice.toLowerCase().startsWith("close")) open = false;
-        else if (choice.startsWith("protection:")) {
+        else if (choice.startsWith("enabled:")) {
+          persistConfigChange({ enabled: !CFG.enabled });
+          ctx.ui.notify(`destructive-check: ${CFG.enabled ? "on" : "off"}`, "info");
+        } else if (choice.startsWith("protection:")) {
           const mode = selLabel(await ctx.ui.select("protection mode", MODES.map((m) => ({ label: m, description: MODE_PRESETS[m] ? `preset: ${RULE_ORDER.filter((r) => MODE_PRESETS[m][r] !== "allow").map((r) => `${r}=${MODE_PRESETS[m][r]}`).join(" ")}` : "starts from medium, every rule editable" }))));
           if (mode) {
             saveRules(mode, mode === "custom" ? { ...CFG.rules } : {});
