@@ -37,6 +37,8 @@
 import * as nodeFs from "node:fs";
 import * as nodePath from "node:path";
 import * as nodeOs from "node:os";
+import * as nodeCrypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 // ------------------------------------------------------------------ config --
 
@@ -136,10 +138,22 @@ const DEFAULTS = {
 };
 
 function readRawConfig() {
+  // A file that exists but cannot be parsed is not the same as a missing file:
+  // silently falling back to defaults could relax a stricter policy without
+  // saying so. Keep the raw object and the reason it was rejected.
+  let text = "";
   try {
-    return JSON.parse(nodeFs.readFileSync(CONFIG_FILE, "utf8"));
-  } catch {
-    return {};
+    text = nodeFs.readFileSync(CONFIG_FILE, "utf8");
+  } catch (err) {
+    const missing = err?.code === "ENOENT";
+    return { raw: {}, error: missing ? "" : `cannot read ${CONFIG_FILE}: ${String(err?.message ?? err).slice(0, 120)}` };
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { raw: {}, error: `${CONFIG_FILE} is not a JSON object — using defaults` };
+    return { raw: parsed, error: "" };
+  } catch (err) {
+    return { raw: {}, error: `${CONFIG_FILE} is not valid JSON (${String(err?.message ?? err).slice(0, 80)}) — using defaults` };
   }
 }
 
@@ -147,6 +161,16 @@ function writeRawConfig(cfg) {
   nodeFs.mkdirSync(nodePath.dirname(CONFIG_FILE), { recursive: true });
   nodeFs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n");
 }
+
+// Every number that reaches the decision path goes through this: an unvalidated
+// bound is how `logSize: -1` turned into a hung tool call.
+function clampNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+const pickBool = (value, fallback) => (typeof value === "boolean" ? value : fallback);
 
 function pickAction(value, fallback) {
   return ACTIONS.includes(value) ? value : fallback;
@@ -163,32 +187,54 @@ function providerConfig(raw) {
 }
 
 function loadConfig() {
-  const raw = readRawConfig();
-  const mode = MODES.includes(process.env.OMP_DC_MODE ?? raw.mode) ? (process.env.OMP_DC_MODE ?? raw.mode) : DEFAULTS.mode;
+  const { raw, error } = readRawConfig();
+  const warnings = error ? [error] : [];
+  const envMode = process.env.OMP_DC_MODE;
+  const wantedMode = envMode ?? raw.mode;
+  const mode = MODES.includes(wantedMode) ? wantedMode : DEFAULTS.mode;
+  if (wantedMode !== undefined && !MODES.includes(wantedMode)) warnings.push(`unknown mode "${wantedMode}" — using "${mode}"`);
+  const storedRules = raw.rules && typeof raw.rules === "object" && !Array.isArray(raw.rules) ? raw.rules : {};
+  // A preset is a guarantee: stored rule overrides only count in custom mode.
+  // Editing a rule in /dc switches the mode to custom, so "hard with one rule
+  // re-enabled" is never a state the menu produces — only a hand-edited file.
   const preset = MODE_PRESETS[mode === "custom" ? "medium" : mode] ?? MODE_PRESETS.medium;
   const rules = {};
   for (const key of Object.keys(RULES)) {
-    rules[key] = pickAction(raw.rules?.[key], preset[key] ?? "block");
+    const override = mode === "custom" ? storedRules[key] : undefined;
+    if (override !== undefined && !ACTIONS.includes(override)) warnings.push(`rules.${key}: unknown action "${override}" — ignored`);
+    rules[key] = pickAction(override, preset[key] ?? "block");
   }
+  if (mode !== "custom" && Object.keys(storedRules).length) warnings.push(`stored rule overrides are ignored while a preset (${mode}) is selected — /dc → rules switches to custom`);
+  const coverage = {};
+  for (const key of Object.keys(DEFAULTS.coverage)) {
+    const wanted = raw.coverage?.[key];
+    if (wanted !== undefined && typeof wanted !== "boolean") warnings.push(`coverage.${key}: expected true/false — using ${DEFAULTS.coverage[key]}`);
+    coverage[key] = pickBool(wanted, DEFAULTS.coverage[key]);
+  }
+  const provider = providerConfig(raw);
   return {
-    enabled: raw.enabled ?? DEFAULTS.enabled,
+    enabled: pickBool(raw.enabled, DEFAULTS.enabled),
     mode,
-    customRules: raw.rules ?? {},
+    storedRules,
+    customRules: mode === "custom" ? { ...storedRules } : {},
     rules,
-    coverage: { ...DEFAULTS.coverage, ...(raw.coverage ?? {}) },
+    coverage,
+    warnings,
+    configError: error,
     engine: ENGINES.includes(process.env.OMP_DC_ENGINE ?? raw.engine) ? (process.env.OMP_DC_ENGINE ?? raw.engine) : DEFAULTS.engine,
-    provider: providerConfig(raw),
-    timeoutMs: Number(process.env.OMP_DC_TIMEOUT_MS ?? raw.timeoutMs ?? DEFAULTS.timeoutMs),
-    maxCommandChars: raw.maxCommandChars ?? DEFAULTS.maxCommandChars,
-    maxPromptChars: raw.maxPromptChars ?? DEFAULTS.maxPromptChars,
-    includeIntent: raw.includeIntent ?? DEFAULTS.includeIntent,
-    maxIntentChars: raw.maxIntentChars ?? DEFAULTS.maxIntentChars,
-    maxOutputTokens: raw.maxOutputTokens ?? DEFAULTS.maxOutputTokens,
-    cacheEnabled: raw.cacheEnabled ?? DEFAULTS.cacheEnabled,
-    askOnDeny: raw.askOnDeny ?? DEFAULTS.askOnDeny,
-    askOnError: raw.askOnError ?? DEFAULTS.askOnError,
-    allowDirs: Array.isArray(raw.allowDirs) ? raw.allowDirs : DEFAULTS.allowDirs,
-    logSize: raw.logSize ?? DEFAULTS.logSize,
+    provider,
+    timeoutMs: clampNumber(process.env.OMP_DC_TIMEOUT_MS ?? raw.timeoutMs, DEFAULTS.timeoutMs, 200, 600_000),
+    maxCommandChars: clampNumber(raw.maxCommandChars, DEFAULTS.maxCommandChars, 40, 4000),
+    maxPromptChars: clampNumber(raw.maxPromptChars, DEFAULTS.maxPromptChars, 200, 8000),
+    includeIntent: pickBool(raw.includeIntent, DEFAULTS.includeIntent),
+    maxIntentChars: clampNumber(raw.maxIntentChars, DEFAULTS.maxIntentChars, 0, 2000),
+    maxOutputTokens: clampNumber(raw.maxOutputTokens, DEFAULTS.maxOutputTokens, 0, 200_000),
+    cacheEnabled: pickBool(raw.cacheEnabled, DEFAULTS.cacheEnabled),
+    askOnDeny: pickBool(raw.askOnDeny, DEFAULTS.askOnDeny),
+    askOnError: pickBool(raw.askOnError, DEFAULTS.askOnError),
+    allowDirs: Array.isArray(raw.allowDirs) ? raw.allowDirs.filter((d) => typeof d === "string" && d.trim()).map((d) => d.trim()) : DEFAULTS.allowDirs,
+    logSize: clampNumber(raw.logSize, DEFAULTS.logSize, 1, 1000),
+    reasoning: provider.reasoning,
   };
 }
 
@@ -197,6 +243,20 @@ const CFG = loadConfig();
 // Extension host handle, captured when the factory runs; used for the optional
 // CLI checker engine.
 let EXT_PI = null;
+
+// The audit entry names the session that made the decision. The documented way
+// to ask is ctx.sessionManager.getSessionId(); the handler ctx is rebuilt per
+// invocation, so the last one seen is kept for log writes that happen deeper in
+// the decision path.
+let lastSessionId = "";
+
+const sessionIdOf = (ctx) => {
+  try {
+    return String(ctx?.sessionManager?.getSessionId?.() ?? "");
+  } catch {
+    return "";
+  }
+};
 
 // Settings changed through /dc are merged over the live config; env overrides
 // still win because loadConfig() re-reads them. A read-only config (see the
@@ -210,7 +270,7 @@ function reloadConfig() {
 
 function persistConfigChange(patch) {
   try {
-    writeRawConfig({ ...readRawConfig(), ...patch });
+    writeRawConfig({ ...readRawConfig().raw, ...patch });
     lastPersistError = "";
   } catch (err) {
     lastPersistError = String(err?.message ?? err).slice(0, 200);
@@ -234,58 +294,86 @@ const LOG_DIR = nodePath.join(nodeOs.homedir(), ".omp", "logs");
 const LOG_FILE = nodePath.join(LOG_DIR, "destructive-check.jsonl");
 const LOG_MAX_BYTES = 5 * 1024 * 1024;
 const LOG_KEYS = ["ts", "session", "tool", "rule", "action", "detail", "command", "cwd", "mode", "ms"];
-let logChainPrev = null; // "" | <hash>: seeded from the file, null = not looked yet
 
-function logField(value, max) {
-  const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+// The chain is never kept in memory: two omp sessions write the same file, and a
+// cached "previous hash" would make the second writer chain onto a line that is
+// no longer last. The tail is re-read for every append instead.
+function readTail(file, bytes = 8192) {
+  let fd = 0;
+  try {
+    fd = nodeFs.openSync(file, "r");
+    const size = nodeFs.fstatSync(fd).size;
+    const len = Math.min(bytes, size);
+    if (!len) return "";
+    const buf = Buffer.alloc(len);
+    nodeFs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd) {
+      try {
+        nodeFs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+    }
+  }
 }
 
-function auditChainPrev() {
-  if (logChainPrev !== null) return logChainPrev;
-  logChainPrev = "";
-  try {
-    const lines = nodeFs.readFileSync(LOG_FILE, "utf8").split("\n").filter(Boolean);
-    const last = JSON.parse(lines[lines.length - 1]);
-    if (typeof last?.chain === "string") logChainPrev = last.chain;
-  } catch {
-    /* no log yet, or unreadable: the chain starts here */
+function lastChainInFile() {
+  const lines = readTail(LOG_FILE).split("\n").filter((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(lines[i]);
+      if (typeof parsed?.chain === "string") return parsed.chain;
+    } catch {
+      /* the tail may start mid-line */
+    }
   }
-  return logChainPrev;
+  return "";
+}
+
+// Secrets can reach a command line (`--token=…`, `Authorization: Bearer …`):
+// the audit log keeps the decision, not the credential.
+const SECRET_RE = /\b((?:api[_-]?key|token|secret|password|passwd|authorization|bearer)\s*[:=]\s*)(\S{4,})/gi;
+
+function logField(value, max) {
+  const text = String(value ?? "").replace(/\s+/g, " ").replace(SECRET_RE, "$1***").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 function rotateAuditLog() {
   try {
     if (nodeFs.statSync(LOG_FILE).size < LOG_MAX_BYTES) return;
+    // Each file carries its own chain: the first line of the new file points at
+    // nothing (the tail read below sees an empty file), so a rotation is never
+    // reported as tampering.
     nodeFs.renameSync(LOG_FILE, `${LOG_FILE}.1`); // the previous .1 is replaced
-    // Each file carries its own chain: the first line of the new file must point
-    // at nothing, or verification would call every rotation a tampering.
-    logChainPrev = "";
   } catch {
     /* rotation is best-effort: a full disk must not stop the guard */
   }
 }
 
 // One audit line: the entry plus the hash that chains it to the line before.
+// Pure — the chain state lives in the file, not in this process.
 function auditLine(entry) {
   const core = {};
   for (const key of LOG_KEYS) if (entry[key] !== undefined) core[key] = key === "detail" || key === "command" ? logField(entry[key], key === "detail" ? 200 : 240) : entry[key];
-  core.prev = auditChainPrev();
-  const chain = sha256Hex(JSON.stringify(core));
-  core.chain = chain;
-  logChainPrev = chain;
+  core.prev = lastChainInFile();
+  core.chain = sha256Hex(JSON.stringify(core));
   return JSON.stringify(core);
 }
 
 function logDecision(entry) {
   const record = { at: new Date().toISOString().slice(11, 19), ...entry };
   decisionLog.push(record);
-  while (decisionLog.length > CFG.logSize) decisionLog.shift();
+  while (decisionLog.length > Math.max(1, CFG.logSize)) decisionLog.shift();
   try {
     rotateAuditLog();
     const core = {
       ts: new Date().toISOString(),
-      session: String(EXT_PI?.sessionId ?? EXT_PI?.ctx?.sessionId ?? ""),
+      session: String(EXT_PI?.sessionId ?? EXT_PI?.ctx?.sessionId ?? lastSessionId ?? ""),
       tool: entry.tool,
       rule: entry.rule,
       action: entry.action,
@@ -296,7 +384,9 @@ function logDecision(entry) {
       ms: entry.ms,
     };
     nodeFs.mkdirSync(LOG_DIR, { recursive: true });
-    nodeFs.appendFileSync(LOG_FILE, auditLine(core) + "\n");
+    // 0600: the log holds command text, and only the user who ran the command
+    // has any business reading it.
+    nodeFs.appendFileSync(LOG_FILE, auditLine(core) + "\n", { mode: 0o600 });
   } catch {
     /* the decision itself must never fail because the log could not be written */
   }
@@ -346,77 +436,33 @@ function recentAuditEntries(count = 12) {
 
 // ------------------------------------------------------- guard integrity ---
 
-// SHA-256, self-contained. The guard ships as one file with no imports outside
-// node:fs/path/os (it is copied verbatim into ~/.omp/shared), and the install
-// manifest plus the audit chain need a real digest rather than a checksum.
-const SHA256_K = new Uint32Array([
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-]);
-const rotr = (x, n) => ((x >>> n) | (x << (32 - n))) >>> 0;
-
+// The install manifest and the audit chain need a real digest. node:crypto is
+// available in every host that loads this extension, so there is no reason to
+// ship a hand-rolled SHA-256 next to the policy it is supposed to protect.
 function sha256Hex(input) {
-  const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
-  const len = bytes.length;
-  const padded = new Uint8Array(((len + 9 + 63) >> 6) << 6);
-  padded.set(bytes);
-  padded[len] = 0x80;
-  const view = new DataView(padded.buffer);
-  const bits = len * 8;
-  view.setUint32(padded.length - 8, Math.floor(bits / 0x100000000));
-  view.setUint32(padded.length - 4, bits >>> 0);
-  const h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
-  const w = new Uint32Array(64);
-  for (let off = 0; off < padded.length; off += 64) {
-    for (let i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4);
-    for (let i = 16; i < 64; i++) {
-      const x = w[i - 15];
-      const y = w[i - 2];
-      w[i] = (w[i - 16] + (rotr(x, 7) ^ rotr(x, 18) ^ (x >>> 3)) + w[i - 7] + (rotr(y, 17) ^ rotr(y, 19) ^ (y >>> 10))) >>> 0;
-    }
-    let a = h[0];
-    let b = h[1];
-    let c = h[2];
-    let d = h[3];
-    let e = h[4];
-    let f = h[5];
-    let g = h[6];
-    let k = h[7];
-    for (let i = 0; i < 64; i++) {
-      const t1 = (k + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[i] + w[i]) >>> 0;
-      const t2 = ((rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
-      k = g;
-      g = f;
-      f = e;
-      e = (d + t1) >>> 0;
-      d = c;
-      c = b;
-      b = a;
-      a = (t1 + t2) >>> 0;
-    }
-    h[0] = (h[0] + a) >>> 0;
-    h[1] = (h[1] + b) >>> 0;
-    h[2] = (h[2] + c) >>> 0;
-    h[3] = (h[3] + d) >>> 0;
-    h[4] = (h[4] + e) >>> 0;
-    h[5] = (h[5] + f) >>> 0;
-    h[6] = (h[6] + g) >>> 0;
-    h[7] = (h[7] + k) >>> 0;
-  }
-  return [...h].map((x) => x.toString(16).padStart(8, "0")).join("");
+  return nodeCrypto.createHash("sha256").update(input).digest("hex");
 }
 
-// install.mjs writes a manifest next to the copied guard. The extension compares
-// it against its own bytes at load: an edit outside the installer is visible in
-// /dc instead of silently changing what runs.
-const MANIFEST_FILE = nodePath.join(nodeOs.homedir(), ".omp", "shared", "destructive-check.manifest.json");
-const INSTALLED_GUARD = nodePath.join(nodeOs.homedir(), ".omp", "shared", "destructive-check.ts");
+// install.mjs writes a manifest next to the copied guard. The extension hashes
+// **the file that is actually loaded** against it: a hardcoded path would report
+// "ok" while a different copy (auto-discovered, vendored, hand-edited) ran the
+// policy. A loaded file with no manifest next to it is "unmanaged", not "ok".
+const SHARED_DIR = nodePath.join(nodeOs.homedir(), ".omp", "shared");
+const INSTALLED_GUARD = nodePath.join(SHARED_DIR, "destructive-check.ts");
+
+function loadedGuardPath() {
+  try {
+    const url = import.meta?.url;
+    if (typeof url === "string" && url.startsWith("file:")) return fileURLToPath(url);
+  } catch {
+    /* a host that compiles the extension may not expose import.meta */
+  }
+  return "";
+}
+
+const LOADED_GUARD = loadedGuardPath();
+const GUARD_FILE = LOADED_GUARD || INSTALLED_GUARD;
+const MANIFEST_FILE = nodePath.join(nodePath.dirname(GUARD_FILE), "destructive-check.manifest.json");
 
 function fileSha256(file) {
   try {
@@ -433,11 +479,12 @@ function guardIntegrity() {
   } catch {
     /* not installed through install.mjs */
   }
-  const actual = fileSha256(INSTALLED_GUARD);
-  if (!manifest?.sha256) return { state: "unmanaged", actual, expected: "" };
-  if (!actual) return { state: "missing", actual, expected: String(manifest.sha256) };
-  if (actual !== manifest.sha256) return { state: "changed", actual, expected: String(manifest.sha256), installedAt: manifest.installedAt };
-  return { state: "ok", actual, expected: String(manifest.sha256), installedAt: manifest.installedAt };
+  const actual = fileSha256(GUARD_FILE);
+  const base = { actual, loaded: GUARD_FILE, manifestFile: MANIFEST_FILE };
+  if (!manifest?.sha256) return { state: "unmanaged", expected: "", ...base };
+  if (!actual) return { state: "missing", expected: String(manifest.sha256), ...base };
+  if (actual !== manifest.sha256) return { state: "changed", expected: String(manifest.sha256), installedAt: manifest.installedAt, ...base };
+  return { state: "ok", expected: String(manifest.sha256), installedAt: manifest.installedAt, ...base };
 }
 
 // A read-only attribute is not a security boundary (the same user can clear it),
@@ -467,24 +514,26 @@ function applyReadOnly(files, lock) {
 }
 
 function setGuardLock(lock) {
-  return applyReadOnly([INSTALLED_GUARD, CONFIG_FILE], lock);
+  return applyReadOnly([GUARD_FILE, CONFIG_FILE], lock);
 }
 
 // The config has to stay writable for /dc to change anything, so the guard file
 // alone can be locked: that is the copy an agent would have to edit to disarm
 // the check.
 function setGuardLockOnly() {
-  return applyReadOnly([INSTALLED_GUARD], true);
+  return applyReadOnly([GUARD_FILE], true);
 }
 
 function restorePreviousGuard() {
-  const backup = `${INSTALLED_GUARD}.bak`;
+  // The backup belongs to the copy that is running: restoring a .bak from a
+  // different directory would swap the wrong file.
+  const backup = `${GUARD_FILE}.bak`;
   try {
     if (!nodeFs.existsSync(backup)) return [`no backup at ${backup}`, "install.mjs keeps one every time it replaces the installed copy."];
-    nodeFs.copyFileSync(backup, INSTALLED_GUARD);
+    nodeFs.copyFileSync(backup, GUARD_FILE);
     return [
-      `restored : ${backup} → ${INSTALLED_GUARD}`,
-      `sha256   : ${fileSha256(INSTALLED_GUARD).slice(0, 16)}`,
+      `restored : ${backup} → ${GUARD_FILE}`,
+      `sha256   : ${fileSha256(GUARD_FILE).slice(0, 16)}`,
       `manifest : ${guardIntegrity().state}`,
       "",
       "Restart the omp session (or reload extensions) so the restored copy is the one that runs.",
@@ -495,15 +544,24 @@ function restorePreviousGuard() {
 }
 
 function guardLockState() {
-  return [INSTALLED_GUARD, CONFIG_FILE].map((file) => `${nodePath.basename(file)}: ${writable(file) ? "writable" : "read-only"}`).join(" · ");
+  return [GUARD_FILE, CONFIG_FILE].map((file) => `${nodePath.basename(file)}: ${writable(file) ? "writable" : "read-only"}`).join(" · ");
 }
-// Verdicts and user approvals are cached per (cwd + action signature) so the
-// same command in the same workspace is never re-evaluated twice per session.
+
+// Verdicts and user approvals are cached per (policy + workspace + operation).
+// The display summary is truncated and the first line of a code block is not an
+// operation, so the identity is a hash of the full input the decision was made
+// about: a different eval body, a different patch or a policy change can never
+// inherit an earlier "allow".
 const verdictCache = new Map();
 const sessionAllows = new Set();
 
-function cacheKeyFor(scope, action) {
-  return `${scope.cwdAbs}|${action}`;
+function policyRevision() {
+  return sha256Hex(JSON.stringify({ mode: CFG.mode, rules: CFG.rules, coverage: CFG.coverage }));
+}
+
+function cacheKeyFor(plan) {
+  const identity = plan.identity ?? plan.summary ?? "";
+  return `${policyRevision()}|${sha256Hex(`${plan.kind}\u0000${plan.scope.cwdAbs}\u0000${identity}`)}`;
 }
 
 // ------------------------------------------------------- scope and targets --
@@ -568,25 +626,40 @@ function buildScope(cwd, extraDirs = []) {
   return { cwdAbs, roots: [...new Set(roots.map((r) => r.toLowerCase()))], tmpRoot: TMP_ROOT };
 }
 
+// `/tmp` and `/var/tmp` are the OS temp trees on POSIX (and what Git Bash means
+// by them). The check runs on a textually normalized path so `/tmp/../etc` is
+// judged as `/etc`, not as a temp path.
+function stripDotSegments(p) {
+  const parts = [];
+  for (const seg of String(p).split("/")) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return `/${parts.join("/")}`;
+}
+
 function classify(raw, scope) {
   const stripped = normalizePath(raw);
   const path = stripped || unquote(raw).replace(/[\\/]+$/, "") || "/";
   if (!path) return { kind: "dynamic", path };
   if (/^[a-zA-Z]:$/.test(path) || path === "/" || path === "\\" || ROOT_RE.test(path)) return { kind: "root", path };
-  if (/^\/(?:tmp|var\/tmp)(?:\/|$)/i.test(path)) return { kind: "artifact", path };
   if (path.startsWith("/") && (POSIX_SYS_RE.test(path) || POSIX_HOME_RE.test(path) || POSIX_WINDOWS_RE.test(path))) return { kind: "system", path };
-  if (/[\\/]?[^\\/]*\*/.test(path) || DYNAMIC_RE.test(path)) {
-    // Wildcards and variables can expand anywhere: resolve the literal prefix
-    // when it is a real directory, otherwise leave the target unclassified.
-    const literal = path.replace(/[\\/][^\\/]*(\*|\?|\[|\$|`).*$/, "");
-    if (literal && literal !== path && !DYNAMIC_RE.test(literal)) {
+  if (path.startsWith("/") && /^\/(?:tmp|var\/tmp)(?:\/|$)/i.test(stripDotSegments(path))) return { kind: "artifact", path };
+  // A shell variable can hold anything, `../..` included: it is always an
+  // unresolved target, never a prefix-exempt one. A glob cannot walk upwards, so
+  // a pure wildcard keeps its literal directory (`node_modules/*` deletes inside
+  // node_modules).
+  if (/[$`]|%[A-Za-z_][^%]*%/.test(path)) return { kind: "dynamic", path };
+  if (/[*?[]/.test(path)) {
+    const literal = path.replace(/[\\/][^\\/]*[*?[].*$/, "");
+    if (literal && literal !== path) {
       const prefixAbs = resolveAgainst(literal, scope);
       if (prefixAbs) return classifyResolved(prefixAbs, path, scope, TEMP_SEGMENT_RE.test(prefixAbs));
     }
     return { kind: "dynamic", path };
   }
   const abs = resolveAgainst(path, scope);
-  if (!abs) return { kind: "dynamic", path };
   return classifyResolved(abs, path, scope, TEMP_SEGMENT_RE.test(abs));
 }
 
@@ -601,7 +674,7 @@ function resolveAgainst(p, scope) {
 function classifyResolved(abs, raw, scope, tempish) {
   const lower = abs.toLowerCase();
   const home = nodeOs.homedir().toLowerCase();
-  const inTemp = lower.includes("\\appdata\\local\\temp") || lower.includes("/tmp/");
+  const inTemp = lower.includes("\\appdata\\local\\temp");
   if (lower === home) return { kind: "system", path: raw };
   if (/^[a-z]:[\\/]?$/i.test(abs) || PROTECTED_DIR_RE.test(abs)) return { kind: "system", path: raw };
   if (SYSTEM_SEGMENT_RE.test(abs) && !inTemp) return { kind: "system", path: raw };
@@ -612,14 +685,16 @@ function classifyResolved(abs, raw, scope, tempish) {
   if (/^[a-z]:[\\/]?$/i.test(scope.cwdAbs) || scope.cwdAbs === "/" || scope.cwdAbs === "\\") {
     return inTmp || inTemp || tempish ? { kind: "artifact", path: raw } : { kind: "system", path: raw };
   }
-  const inCwd = underDir(lower, scopeLower);
   if (lower === scopeLower || scope.roots.some((r) => underDir(r, lower) && r !== lower)) {
     // The target is the workspace itself or an ancestor of a project root.
     return { kind: "projectRoot", path: raw };
   }
+  // "Inside" is about the roots the session is authorized for, not about where
+  // the command happens to run: a tool call with its own `cwd`, or a `cd` into a
+  // foreign directory, must not turn that directory into project scope.
   const inProject = scope.roots.some((r) => underDir(lower, r));
   if ((tempish || inTemp || inTmp) && (inProject || inTmp || inTemp)) return { kind: "artifact", path: raw };
-  if (inProject || inCwd) return { kind: "inside", path: raw };
+  if (inProject) return { kind: "inside", path: raw };
   return { kind: "outside", path: raw };
 }
 
@@ -679,13 +754,54 @@ function splitSubcommands(cmd) {
 }
 
 // Tokenize one sub-command; quoting is preserved so a quoted "rm" is not read
-// as a command position (`git commit -m "rm -rf cleanup"`).
+// as a command position (`git commit -m "rm -rf cleanup"`). Fragments that the
+// shell would glue into one word (`r\m`, `r"m"`) are joined here, before any
+// command-position check: an escaped or split name is a spelling, not an
+// argument.
 function tokenize(sub) {
   const out = [];
-  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  const re = /"([^"]*)"|'([^']*)'|((?:\\.|[^\s"'])+)/g;
   let m;
   while ((m = re.exec(sub))) {
-    out.push({ text: m[1] ?? m[2] ?? m[3], quoted: m[1] !== undefined || m[2] !== undefined, raw: m[0], index: m.index });
+    const unquoted = m[3];
+    out.push({
+      text: m[1] ?? m[2] ?? unquoted,
+      quoted: m[1] !== undefined || m[2] !== undefined,
+      raw: m[0],
+      index: m.index,
+      escaped: unquoted !== undefined && unquoted.includes("\\"),
+    });
+  }
+  const merged = [];
+  for (const t of out) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.index + prev.raw.length === t.index) {
+      merged[merged.length - 1] = {
+        text: prev.text + t.text,
+        quoted: prev.quoted || t.quoted,
+        raw: sub.slice(prev.index, t.index + t.raw.length),
+        index: prev.index,
+        escaped: prev.escaped || t.escaped,
+      };
+      continue;
+    }
+    merged.push({ ...t });
+  }
+  // `word` is the shell's view of the token (backslash escapes collapsed) and is
+  // used for command-position checks; `text` stays literal, because a Windows
+  // path in an argument must keep its separators (`C:\Users\x`).
+  return merged.map((t) => ({ ...t, word: t.quoted || !t.escaped ? t.text : t.text.replace(/\\(.)/g, "$1") }));
+}
+
+// `$(…)` and backticks run their body: `echo "$(rm -rf src)"` deletes src, and
+// the outer scanner would only ever see a quoted string.
+const SUBSTITUTION_RE = /\$\(([^()]*(?:\([^()]*\)[^()]*)*)\)|`([^`]*)`/g;
+
+function substitutionBodies(text) {
+  const out = [];
+  for (const m of String(text ?? "").matchAll(SUBSTITUTION_RE)) {
+    const body = (m[1] ?? m[2] ?? "").trim();
+    if (body) out.push(body);
   }
   return out;
 }
@@ -767,9 +883,9 @@ function catastrophicViolations(text, depth = 0) {
     const toks = tokenize(part);
     const words = toks.filter((t) => !t.quoted);
     let i = 0;
-    while (i < words.length && (isFlagTok(words[i].text) || LAUNCHER_RE.test(cmdWord(words[i].text)) || /^\d+[smhd]?$/i.test(words[i].text))) i++;
+    while (i < words.length && (isFlagTok(words[i].text) || LAUNCHER_RE.test(cmdWord(words[i].word ?? words[i].text)) || /^\d+[smhd]?$/i.test(words[i].text))) i++;
     if (i >= words.length) continue;
-    const word = cmdWord(words[i].text);
+    const word = cmdWord(words[i].word ?? words[i].text);
     const args = toks.slice(toks.indexOf(words[i]) + 1).map((t) => t.text);
     if (/^mkfs(?:\.|$)/i.test(word)) out.push(violation("catastrophic", `formats a filesystem: ${part.trim()}`));
     else if (/^diskpart$/i.test(word)) out.push(violation("catastrophic", "rewrites the disk partition table: diskpart"));
@@ -831,23 +947,29 @@ function runScriptTarget(rawPath, scope, depth, found, record) {
   state.depth--;
 }
 
-// Collect the verb and the candidate path arguments of one sub-command.
+// Collect the verb and the candidate path arguments of one sub-command. Command
+// words are skipped only while the walk is still in command position (`sudo rm`):
+// once an argument is seen, a token that merely looks like a command name is an
+// argument too (`rm -rf dist bash` deletes a directory called bash).
 function extractInfo(sub) {
   const verb = (sub.match(/\b(rm|rmdir|rd|del|erase|remove-item|mv|move|git|gh|npm|pnpm|yarn|docker|cargo|dotnet|kubectl)\b/i) || [])[1]?.toLowerCase() ?? "";
   const toks = tokenize(sub);
   const targets = [];
   let prevWasPkg = false;
+  let inPrefix = true;
   for (const t of toks) {
     if (t.quoted) {
       targets.push(t.text);
       prevWasPkg = false;
+      inPrefix = false;
       continue;
     }
     if (isFlagTok(t.text)) continue;
-    if (COMMAND_WORD_RE.test(t.text)) {
+    if (inPrefix && COMMAND_WORD_RE.test(t.text)) {
       prevWasPkg = PKG_SUB_RE.test(t.text);
       continue;
     }
+    inPrefix = false;
     if (prevWasPkg && PKG_EXEC_SUB_RE.test(t.text)) {
       prevWasPkg = false;
       continue;
@@ -856,43 +978,62 @@ function extractInfo(sub) {
     if (CMD_SWITCH_RE.test(t.text) && CMD_SWITCH_VERBS.test(verb)) continue;
     targets.push(unquote(t.text));
   }
-  const first = targets[0] ?? "";
-  const list = targets.length && sub.toLowerCase().startsWith(first.toLowerCase()) ? targets.slice(1) : targets;
-  return { sub, verb, toks, targets: list.filter((t) => !/^[&|;<>()$`]+$/.test(t)) };
+  return { sub, verb, toks, targets: targets.filter((t) => !/^[&|;<>()$`]+$/.test(t)) };
 }
+
+// Global options that consume the next token (`-C <path>`, `--git-dir <dir>`);
+// the `=` form carries its value inline.
+const GIT_VALUE_OPT_RE = /^(?:-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--super-prefix)$/;
+const gitOption = (text) => /^-{1,2}[A-Za-z][\w-]*(=.*)?$/.test(text);
 
 function isDestructiveGit(rest) {
   let k = 0;
-  while (k < rest.length && (isFlagTok(rest[k].text) || rest[k].quoted)) {
-    k += /^-(?:c|C)$/.test(rest[k].text) ? 2 : 1; // git -C <path> / -c k=v take a value
+  while (k < rest.length && !rest[k].quoted && gitOption(rest[k].text)) {
+    k += GIT_VALUE_OPT_RE.test(rest[k].text) ? 2 : 1;
   }
-  const sub = (rest[k]?.text ?? "").toLowerCase();
-  const tail = ` ${rest.slice(k + 1).map((t) => t.text).join(" ")} `;
+  const sub = String(rest[k]?.text ?? "").toLowerCase();
+  const args = rest.slice(k + 1);
+  const tail = ` ${args.map((t) => t.text).join(" ")} `;
   const has = (re) => re.test(tail);
+  // `-Df`, `-qD`: combined short flags are common, and a flag test that only
+  // matches `-D ` misses them.
+  const shorts = args
+    .map((t) => t.text)
+    .filter((t) => /^-[A-Za-z]{1,}$/.test(t))
+    .join("")
+    .slice(1);
+  const hasShort = (ch) => shorts.includes(ch);
   if (sub === "rm" || sub === "clean") return true;
   if (sub === "reset" && has(/--hard\b/)) return true;
   if (sub === "stash" && has(/(^|\s)(drop|clear)(\s|$)/)) return true;
-  if (sub === "push" && has(/(^|\s)(--force|--delete|-f)(\s|$)/)) return true;
+  if (sub === "push") {
+    // `--force-with-lease` is deliberately not in this list: it refuses to
+    // overwrite a ref that moved since the last fetch, so it cannot silently
+    // destroy work that was not already seen.
+    if (has(/(^|\s)(--force|--delete)(\s|=|$)/) || hasShort("f")) return true;
+    // A refspec that starts with `+` rewrites the ref even without --force.
+    if (args.some((t) => /^\+[^+]/.test(t.text))) return true;
+  }
   if (sub === "branch") {
     // -D / --delete --force drop unmerged work; plain -d / --delete refuse to.
-    if (has(/(^|\s)-D(\s|$)/)) return true;
-    if (has(/(^|\s)(-d|--delete)(\s|$)/) && has(/(^|\s)(-f|--force)(\s|$)/)) return true;
+    if (has(/(^|\s)-D(\s|$)/) || hasShort("D")) return true;
+    if ((has(/(^|\s)(-d|--delete)(\s|$)/) || hasShort("d")) && (has(/(^|\s)(-f|--force)(\s|$)/) || hasShort("f"))) return true;
   }
   if (sub === "checkout") {
-    if (has(/(^|\s)(-f|--force)(\s|$)/)) return true;
+    if (has(/(^|\s)(-f|--force)(\s|$)/) || hasShort("f")) return true;
     // `checkout -- <path>` (with or without a ref) restores those paths with no
     // flag at all; switching branches without -- is safe, git refuses to lose work.
     if (has(/(^|\s)--(\s|$)/)) return true;
   }
   // `switch` is the modern checkout: only its force/discard flags lose work.
-  if (sub === "switch" && has(/(^|\s)(-f|--force|--discard-changes)(\s|$)/)) return true;
+  if (sub === "switch" && (has(/(^|\s)(-f|--force|--discard-changes)(\s|$)/) || hasShort("f"))) return true;
   if (sub === "restore") {
     // The working tree is the default target: `git restore <path>` overwrites it.
-    // `--staged` alone only resets the index and keeps the working tree.
-    const stagedOnly = has(/(^|\s)--staged(\s|$)/) && !has(/(^|\s)(--worktree|--source|-s)(\s|=|$)/);
+    // `--staged` alone only resets the index; `-W`/`--worktree` puts it back.
+    const stagedOnly = has(/(^|\s)--staged(\s|$)/) && !has(/(^|\s)(--worktree|-W|--source|-s)(\s|=|$)/) && !hasShort("W") && !hasShort("s");
     if (!stagedOnly) return true;
   }
-  if (sub === "worktree" && has(/(^|\s)remove(\s|$)/) && has(/(^|\s)(--force|-f)(\s|$)/)) return true;
+  if (sub === "worktree" && has(/(^|\s)remove(\s|$)/) && (has(/(^|\s)(--force|-f)(\s|$)/) || hasShort("f"))) return true;
   // The "make it unrecoverable" pair plus history rewrites: reflog entries are the
   // only thing keeping reset/amend/clean casualties alive.
   if (sub === "reflog" && has(/(^|\s)expire(\s|$)/) && has(/--expire(?:=|\s+)now/)) return true;
@@ -911,7 +1052,12 @@ function scopeAfterCd(scope, target) {
   if (/^[a-zA-Z]:$/.test(next)) next += nodePath.sep;
   try {
     const resolved = nodePath.resolve(scope.cwdAbs, next);
-    if (nodeFs.statSync(resolved).isDirectory()) return buildScope(resolved, CFG.allowDirs);
+    if (nodeFs.statSync(resolved).isDirectory()) {
+      // Only the directory targets resolve against moves. The authorized roots
+      // do not: `cd <somewhere else>` is not a way to adopt a new project, so a
+      // delete there is still "outside the project".
+      return { ...scope, cwdAbs: resolved };
+    }
   } catch {
     /* the cd would fail at runtime: the working directory is unchanged */
   }
@@ -955,6 +1101,9 @@ function scanScoped(command, scope, depth, found) {
   }
   let current = scope;
   for (const part of splitSubcommands(command)) {
+    // Whatever a substitution runs happens before the command it sits in: judge
+    // it on its own, at one nesting level deeper.
+    for (const body of substitutionBodies(part)) scanScoped(body, current, depth + 1, found);
     const cd = part.match(CD_RE);
     if (cd) {
       const next = scopeAfterCd(current, cd[1]);
@@ -992,7 +1141,7 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
       loose = true;
       continue;
     }
-    const cmd = cmdWord(t.text);
+    const cmd = cmdWord(t.word ?? t.text);
     if (PROBE_RE.test(cmd) && isProbe(toks.slice(i + 1))) return found;
     if (DELETE_VERBS.test(cmd) || MOVE_VERBS.test(cmd)) {
       record({ verb: DELETE_VERBS.test(cmd) ? "delete" : "move" });
@@ -1012,6 +1161,14 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
       }
       return found;
     }
+    if (/^(?:source|\.)$/i.test(cmd)) {
+      // Sourcing runs the file in this shell: judge it like a script it names.
+      let k = i + 1;
+      while (k < toks.length && isFlagTok(toks[k].text)) k++;
+      const target = toks[k];
+      if (target && !target.quoted) runScriptTarget(target.text, scope, depth, found, record);
+      return found;
+    }
     if (SHELL_RE.test(cmd)) {
       const flag = toks[i + 1];
       if (flag && !flag.quoted && SHELL_EXEC_FLAG_RE.test(flag.text)) {
@@ -1021,7 +1178,12 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
       let k = i + 1;
       while (k < toks.length && isFlagTok(toks[k].text)) k++;
       const scriptArg = toks[k];
-      if (scriptArg && !scriptArg.quoted && (SCRIPT_RE.test(cmdWord(scriptArg.text)) || (SH_INTERPRETER_RE.test(cmd) && looksLikePath(scriptArg.text)))) {
+      // A POSIX shell treats its first non-option argument as a script path,
+      // extension or not (`sh cleanup`); cmd/powershell/wsl only get that
+      // treatment when the argument actually looks like a file, so `wsl ls -la`
+      // is not mistaken for a script that cannot be read.
+      const fileish = SCRIPT_RE.test(cmdWord(scriptArg?.word ?? scriptArg?.text ?? "")) || looksLikePath(scriptArg?.text ?? "");
+      if (scriptArg && !scriptArg.quoted && (fileish || SH_INTERPRETER_RE.test(cmd))) {
         runScriptTarget(scriptArg.text, scope, depth, found, record);
         return found;
       }
@@ -1047,7 +1209,7 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
     if (PKG_SUB_RE.test(cmd)) {
       let k = i + 1;
       while (k < toks.length && (isFlagTok(toks[k].text) || toks[k].text === "--")) k++;
-      const subWord = k < toks.length ? cmdWord(toks[k].text) : "";
+      const subWord = k < toks.length ? cmdWord(toks[k].word ?? toks[k].text) : "";
       if (DELETE_VERBS.test(subWord) || MOVE_VERBS.test(subWord) || SCRIPT_RE.test(subWord)) {
         if (SCRIPT_RE.test(subWord) && !DELETE_VERBS.test(subWord) && !MOVE_VERBS.test(subWord)) {
           runScriptTarget(toks[k].text, scope, depth, found, record);
@@ -1139,25 +1301,94 @@ function violationsForCommand(command, scope) {
         const bad = dests.find((c) => c.kind === "root" || c.kind === "projectRoot" || c.kind === "system");
         if (bad) add(targetViolations(bad.kind, bad.path));
         else if (dests.some((c) => c.kind === "outside")) add([violation("outsideMove", `moves data outside the project (${dests.map((d) => d.path).join(", ")})`)]);
+        else if (dests.some((c) => c.kind === "dynamic")) add([violation("dynamicTargets", `move with an unresolved destination: ${x.sub}`)]);
         else if (!dests.length) add([violation("dynamicTargets", `move without a resolvable destination: ${x.sub}`)]);
       }
       continue;
     }
-    // Deletes: an all-artifact target list is benign, anything else is not.
+    // Deletes: an all-artifact target list is the one case the artifactDelete
+    // rule owns — it is a rule, not an early return, so `artifactDelete: block`
+    // actually means something.
     const classes = classifyAll(x.targets, callScope);
     if (!classes.length) {
       add([violation("codeDelete", `delete with no resolvable target: ${x.sub}`)]);
       continue;
     }
-    if (classes.every((c) => c.kind === "artifact")) continue;
-    for (const c of classes) add(targetViolations(c.kind, c.path));
+    if (classes.every((c) => c.kind === "artifact")) {
+      add([violation("artifactDelete", `deletes build artifacts or temp paths: ${x.targets.join(", ")}`)]);
+      continue;
+    }
+    for (const c of classes) {
+      if (c.kind === "artifact") add([violation("artifactDelete", `deletes build artifacts or temp paths: ${c.path}`)]);
+      else add(targetViolations(c.kind, c.path));
+    }
   }
   return out;
 }
 
 // Deletes/moves performed through eval code or the file tools.
 const CODE_DELETE_RE = /\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|Path\([^)]*\)\.unlink|\.rmtree|send2trash|fs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)|fsPromises\.(?:rm|unlink|rmdir)|Deno\.remove|removeSync|unlinkSync)\s*\(|[)]\s*\.remove\s*\(/;
-const PATH_LITERAL_RE = /"([^"\n]{2,240})"|'([^'\n]{2,240})'/g;
+const CODE_CALL_RE = /\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|Path\([^)]*\)\.unlink|\.rmtree|send2trash|fs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)|fsPromises\.(?:rm|unlink|rmdir)|Deno\.remove|removeSync|unlinkSync)\s*\(|[)]\s*\.remove\s*\(/g;
+
+// The text of the first argument of the call whose `(` sits at `open`, with
+// balanced parentheses and quoting respected.
+function firstArgument(text, open) {
+  let depth = 0;
+  let quote = "";
+  let start = open + 1;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      if (depth === 1) start = i + 1;
+      continue;
+    }
+    if (ch === ")") {
+      depth--;
+      if (depth === 0) return text.slice(start, i).trim();
+      continue;
+    }
+    if (ch === "," && depth === 1) return text.slice(start, i).trim();
+  }
+  return "";
+}
+
+// A literal answers only for the delete call it is the argument of. An unrelated
+// string in the same cell says nothing about the target (`note = "dist"` next to
+// `shutil.rmtree(target)`), and a path mentioned in passing does not make a
+// computed delete safe. A single `name = "literal"` binding is followed; anything
+// more indirect stays unresolved.
+function evalDeleteTargets(text) {
+  const targets = [];
+  let dynamic = false;
+  for (const m of text.matchAll(CODE_CALL_RE)) {
+    const arg = firstArgument(text, m.index + m[0].length - 1);
+    if (!arg) {
+      dynamic = true;
+      continue;
+    }
+    const literal = /^(?:"([^"\n]*)"|'([^'\n]*)')$/.exec(arg);
+    if (literal) {
+      targets.push(literal[1] ?? literal[2] ?? "");
+      continue;
+    }
+    const ident = /^([A-Za-z_$][\w$]*)$/.exec(arg);
+    const bound = ident ? new RegExp(`(?:^|[\\s;])${ident[1]}\\s*=\\s*(?:"([^"\\n]*)"|'([^'\\n]*)')`, "m").exec(text) : null;
+    const value = bound?.[1] ?? bound?.[2];
+    if (value) targets.push(value);
+    else dynamic = true;
+  }
+  return { targets: targets.filter(Boolean), dynamic };
+}
 
 function violationsForCode(language, code, scope) {
   const text = String(code ?? "");
@@ -1174,56 +1405,104 @@ function violationsForCode(language, code, scope) {
     }
   }
   if (deleteApi) {
-    const literals = [];
-    for (const m of text.matchAll(PATH_LITERAL_RE)) {
-      const value = m[1] ?? m[2] ?? "";
-      if (value.length > 240) continue;
-      literals.push(unquote(value));
+    const { targets, dynamic } = evalDeleteTargets(text);
+    for (const target of targets) {
+      const c = classify(target, scope);
+      if (c.kind !== "artifact") out.push(...targetViolations(c.kind, c.path));
     }
-    const classes = classifyAll(literals, scope).filter((c) => c.kind !== "artifact");
-    if (classes.length) {
-      for (const c of classes) out.push(...targetViolations(c.kind, c.path));
-    } else if (!literals.length && !out.length) {
-      out.push(violation("codeDelete", `delete performed from ${language} code with a computed target`));
-    }
+    if (dynamic) out.push(violation("codeDelete", `delete from ${language} code with a computed target`));
   }
   return out;
 }
 
 const PATCH_DELETE_LINE_RE = /^\s*\*\*\*\s*Delete File:\s*(.+?)\s*$/gim;
 const PATCH_DELETE_OP_RE = /^\s*(?:\*\*\*\s*Delete File:|DELETE\s+|REM\b)/im;
-const PATCH_MOVE_LINE_RE = /^\s*(?:\*\*\*\s*Move to:|\*\*\*\s*Move File:.*?->|MV\s+)(.+?)\s*$/im;
+const PATCH_MOVE_LINE_RE = /^\s*(?:\*\*\*\s*Move to:|\*\*\*\s*Move File:.*?->|MV\s+)(.+?)\s*$/gim;
 const PATCH_HEADER_RE = /^\[([^\]\n]+?)#[0-9A-Fa-f]*\]\s*$/gm;
 
+// A patch is a series of file sections; every one of them is judged, and each
+// move is paired with the section header above it rather than with the first
+// header in the payload.
 function violationsForPatch(patchText, scope) {
   const text = String(patchText ?? "");
   const out = [];
-  const headers = [...text.matchAll(PATCH_HEADER_RE)].map((m) => unquote(m[1]));
+  const headers = [...text.matchAll(PATCH_HEADER_RE)].map((m) => ({ path: unquote(m[1]), index: m.index }));
   const deletedPaths = [...text.matchAll(PATCH_DELETE_LINE_RE)].map((m) => unquote(m[1]));
   const deleteOp = PATCH_DELETE_OP_RE.test(text);
   if (deleteOp) {
-    const targets = (deletedPaths.length ? deletedPaths : headers).filter(Boolean);
+    const targets = (deletedPaths.length ? deletedPaths : headers.map((h) => h.path)).filter(Boolean);
     const classes = classifyAll(targets, scope);
-    if (classes.length) for (const c of classes) out.push(...(c.kind === "artifact" ? [] : targetViolations(c.kind, c.path)));
-    else out.push(violation("codeDelete", "file deletion with an unknown target"));
+    if (classes.length) {
+      for (const c of classes) {
+        if (c.kind === "artifact") out.push(violation("artifactDelete", `deletes a build artifact or temp file: ${c.path}`));
+        else out.push(...targetViolations(c.kind, c.path));
+      }
+    } else out.push(violation("codeDelete", "file deletion with an unknown target"));
   }
-  const moveMatch = text.match(PATCH_MOVE_LINE_RE);
-  if (moveMatch) {
-    const dest = unquote(moveMatch[1]);
-    const srcs = classifyAll(headers, scope);
+  for (const m of text.matchAll(PATCH_MOVE_LINE_RE)) {
+    const dest = unquote(m[1]);
+    const header = [...headers].reverse().find((h) => h.index < m.index);
     const destClass = classify(dest, scope);
     if (["root", "projectRoot", "system"].includes(destClass.kind)) out.push(...targetViolations(destClass.kind, destClass.path));
     else if (destClass.kind === "outside") out.push(violation("outsideMove", `moves a file outside the project (${dest})`));
-    else if (!srcs.length && !dest) out.push(violation("dynamicTargets", "file move with no resolvable target"));
+    else if (destClass.kind === "dynamic") out.push(violation("dynamicTargets", `move with an unresolved destination: ${dest}`));
+    if (header) {
+      const srcClass = classify(header.path, scope);
+      if (["root", "projectRoot", "system"].includes(srcClass.kind)) out.push(...targetViolations(srcClass.kind, srcClass.path));
+    }
   }
   return out;
 }
 
-// Pick the highest-severity rule and its configured action.
+// Structured edit operations (`{path, edits: [{op: "delete"}]}`) are their own
+// schema: converting the object to JSON and matching line-anchored text patterns
+// against it finds nothing, which reads as "safe".
+function violationsForEditInput(input, scope) {
+  const out = [];
+  const base = typeof input?.path === "string" ? input.path : "";
+  const edits = Array.isArray(input?.edits) ? input.edits : [];
+  for (const edit of edits) {
+    const op = String(edit?.op ?? edit?.operation ?? "").toLowerCase();
+    if (op === "delete" || op === "remove") {
+      if (!base) {
+        out.push(violation("codeDelete", "file deletion with an unknown target"));
+        continue;
+      }
+      const c = classify(base, scope);
+      if (c.kind === "artifact") out.push(violation("artifactDelete", `deletes a build artifact or temp file: ${c.path}`));
+      else out.push(...targetViolations(c.kind, c.path));
+    } else if (op === "rename" || op === "move") {
+      const dest = String(edit?.to ?? edit?.destination ?? edit?.path ?? "");
+      if (!dest) {
+        out.push(violation("dynamicTargets", "move with no resolvable destination"));
+        continue;
+      }
+      const c = classify(dest, scope);
+      if (["root", "projectRoot", "system"].includes(c.kind)) out.push(...targetViolations(c.kind, c.path));
+      else if (c.kind === "outside") out.push(violation("outsideMove", `moves a file outside the project (${dest})`));
+      else if (c.kind === "dynamic") out.push(violation("dynamicTargets", `move with an unresolved destination: ${dest}`));
+    }
+  }
+  return out;
+}
+
+// Decide over every effect the call produced, most restrictive first: an allowed
+// target must never release a blocked one. Ties go to the higher-severity rule.
+const ACTION_RANK = { block: 0, ask: 1, model: 2, allow: 3 };
+
 function resolveAction(violations) {
   let best = null;
+  let bestRank = Infinity;
+  let bestOrder = Infinity;
   for (const v of violations) {
-    if (!best || RULE_ORDER.indexOf(v.rule) < RULE_ORDER.indexOf(best.rule)) best = v;
+    const action = pickAction(CFG.rules[v.rule], "block");
+    const rank = ACTION_RANK[action] ?? 0;
+    const order = RULE_ORDER.indexOf(v.rule);
+    if (rank < bestRank || (rank === bestRank && order < bestOrder)) {
+      best = v;
+      bestRank = rank;
+      bestOrder = order;
+    }
   }
   if (!best) return null;
   return { violation: best, action: pickAction(CFG.rules[best.rule], "block") };
@@ -1234,30 +1513,53 @@ function resolveAction(violations) {
 // Analyze one tool call. Returns null when the tool is not covered or nothing
 // destructive was found.
 function analyzeCall(event, cwd) {
-  const scope = buildScope(cwd, CFG.allowDirs);
+  const sessionScope = buildScope(cwd, CFG.allowDirs);
   const name = String(event?.toolName ?? "");
   const input = event?.input ?? {};
+  // Both bash and hub take their own `cwd`, and the host rewrites a leading
+  // `cd X && …` into it. Moving the *execution* directory must never move the
+  // authorized project roots — only where relative targets resolve.
+  const requested = typeof input.cwd === "string" && input.cwd.trim() ? input.cwd.trim() : "";
+  const resolvedBase = requested ? resolveAgainst(requested, sessionScope) : "";
+  const scope = resolvedBase ? { ...sessionScope, cwdAbs: resolvedBase } : sessionScope;
   if (name === "bash" && CFG.coverage.bash) {
     const command = String(input.command ?? "");
     if (!command) return null;
     const violations = violationsForCommand(command, scope);
-    return violations.length ? { scope, kind: "bash", summary: command, violations } : null;
+    return violations.length ? { scope, kind: "bash", summary: command, identity: command, violations } : null;
   }
   if (name === "eval" && CFG.coverage.eval) {
     const code = String(input.code ?? "");
     if (!code) return null;
-    const violations = violationsForCode(String(input.language ?? "code"), code, scope);
-    return violations.length ? { scope, kind: "eval", summary: firstLine(code), violations } : null;
+    const language = String(input.language ?? "code");
+    const violations = violationsForCode(language, code, scope);
+    return violations.length ? { scope, kind: "eval", summary: firstLine(code), identity: `${language}\u0000${code}`, violations } : null;
   }
   if ((name === "edit" || name === "apply_patch") && CFG.coverage.fileTools) {
-    const patch = typeof input.input === "string" ? input.input : JSON.stringify(input);
-    const violations = violationsForPatch(patch, scope);
-    return violations.length ? { scope, kind: name, summary: firstLine(patch), violations } : null;
+    const text = typeof input.input === "string" ? input.input : "";
+    const violations = Array.isArray(input.edits) && !text ? violationsForEditInput(input, scope) : violationsForPatch(text || JSON.stringify(input), scope);
+    if (!violations.length) return null;
+    const identity = text || JSON.stringify(input);
+    return { scope, kind: name, summary: firstLine(identity), identity: `${name}\u0000${identity}`, violations };
   }
   // A process launched through hub used to be a fully unwatched channel: the
   // command travelled in `application` + `args`, and nothing looked at either.
   if (name === "hub" && CFG.coverage.processes) {
-    if (!["start", "restart"].includes(String(input.op ?? ""))) return null;
+    const op = String(input.op ?? "");
+    // `restart` and `send` carry no command of their own — the spec lives in the
+    // host, out of reach of this handler. An effect nobody can inspect is not an
+    // effect that is safe; it is unknown, and the workaround is the soft mode or
+    // turning the process channel off in /dc.
+    if (op === "restart" || op === "send") {
+      return {
+        scope,
+        kind: `hub ${op}`,
+        summary: `hub ${op} ${String(input.name ?? "(no name)")}${op === "send" ? `: ${String(input.text ?? "").slice(0, 120)}` : ""}`,
+        identity: JSON.stringify(input),
+        violations: [violation("dynamicTargets", `hub ${op}: the command behind "${String(input.name ?? "?")}" is not in this call`)],
+      };
+    }
+    if (op !== "start") return null;
     const command = [input.application, ...(Array.isArray(input.args) ? input.args : [])]
       .filter((part) => part !== undefined && part !== null && part !== "")
       .map((part) => String(part))
@@ -1271,7 +1573,7 @@ function analyzeCall(event, cwd) {
       // to stop it, so the risk is part of what the rule sees.
       violations.push(violation("dynamicTargets", `launched with ${flags.join(" + ")}: the process outlives this session`));
     }
-    return { scope, kind: `hub ${input.op}`, summary: command, violations };
+    return { scope, kind: "hub start", summary: command, identity: JSON.stringify(input), violations };
   }
   return null;
 }
@@ -1416,8 +1718,8 @@ function checkerHeaders(cred, sessionId) {
 
 // One request. `anthropic-messages` needs its own envelope; the OpenAI dialect
 // covers openai-completions, openrouter and every OpenAI-compatible gateway.
-async function postChecker(base, api, model, cred, prompt, sessionId) {
-  const signal = AbortSignal.timeout(CFG.timeoutMs);
+async function postChecker(base, api, model, cred, prompt, sessionId, deadline = 0) {
+  const signal = AbortSignal.timeout(Math.max(200, (deadline || Date.now() + CFG.timeoutMs) - Date.now()));
   // No output cap by default: a tight ceiling truncates reasoning models before
   // they emit the verdict line. Set maxOutputTokens > 0 in /dc to bound cost.
   const cap = Number(CFG.maxOutputTokens) > 0 ? Number(CFG.maxOutputTokens) : 0;
@@ -1438,7 +1740,8 @@ async function postChecker(base, api, model, cred, prompt, sessionId) {
     if (!res.ok) return { status: res.status, text: body, missingSession: body.includes("MissingSessionID") };
     try {
       const data = JSON.parse(body);
-      return { status: 200, text: (data?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("\n") };
+      const text = (data?.content ?? []).filter((b) => b?.type === "text").map((b) => b.text ?? "").join("\n");
+      return { status: 200, text, empty: !text.trim(), finish: String(data?.stop_reason ?? "") };
     } catch {
       return { status: 200, text: body };
     }
@@ -1463,8 +1766,13 @@ async function postChecker(base, api, model, cred, prompt, sessionId) {
   const body = await res.text();
   if (!res.ok) return { status: res.status, text: body, missingSession: body.includes("MissingSessionID") };
   try {
-    const message = JSON.parse(body)?.choices?.[0]?.message ?? {};
-    return { status: 200, text: [message.content, message.reasoning_content].filter((t) => typeof t === "string").join("\n") };
+    // Only the assistant's own message is a verdict: `reasoning_content` is
+    // chain-of-thought, and a verdict parsed out of it is arbitrary text the
+    // model wrote while thinking, not a decision.
+    const choice = JSON.parse(body)?.choices?.[0] ?? {};
+    const content = choice?.message?.content;
+    const text = typeof content === "string" ? content : "";
+    return { status: 200, text, empty: !text.trim(), finish: String(choice?.finish_reason ?? "") };
   } catch {
     return { status: 200, text: body };
   }
@@ -1472,15 +1780,20 @@ async function postChecker(base, api, model, cred, prompt, sessionId) {
 
 // In-process checker: one provider request, no subprocess, no agent session and
 // no tool schemas — the token cost is the prompt plus the one-line verdict.
-async function askModelHttp(ctx, model, cred, prompt) {
+async function askModelHttp(ctx, model, cred, prompt, deadline) {
   const api = String(model.api ?? "");
   if (!HTTP_APIS.has(api)) throw new Error(`api "${api}" is not supported by the in-process engine — set engine to auto or cli in /dc`);
   const base = String(model.baseUrl ?? registryOf(ctx)?.getProviderBaseUrl?.(model.provider) ?? "").replace(/\/+$/, "");
   if (!base) throw new Error(`provider "${model.provider}" has no base URL`);
   let sessionId = wantsSessionHeader(model) ? checkerSessionId(ctx) : "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const res = await postChecker(base, api, model, cred, prompt, sessionId);
-    if (res.status === 200) return res.text;
+    const res = await postChecker(base, api, model, cred, prompt, sessionId, deadline);
+    if (res.status === 200) {
+      // An empty message with finish_reason=length means the provider spent the
+      // whole budget on reasoning: that is a configuration error, not a denial.
+      if (res.empty) throw new Error(`checker returned an empty message (finish_reason: ${res.finish || "unknown"})${res.finish === "length" ? " — raise maxOutputTokens or turn reasoning off in /dc" : ""}`);
+      return res.text;
+    }
     // Gateways that route per conversation say so on the first miss; retry with
     // a session id once before giving up.
     if (res.missingSession && !sessionId) {
@@ -1492,16 +1805,29 @@ async function askModelHttp(ctx, model, cred, prompt) {
   throw new Error("checker HTTP request failed twice");
 }
 
+// Which binary runs the CLI checker. Extensions normally run *inside* omp, so
+// process.execPath is omp itself; when the host is something else (a test
+// runner, an editor, a bundled runtime) execPath is the wrong program and the
+// installed CLI on PATH is the right one.
+function ompBinary() {
+  const explicit = String(process.env.OMP_DC_BIN ?? process.env.OMP_BIN ?? "").trim();
+  if (explicit) return explicit;
+  const base = nodePath.basename(process.execPath).toLowerCase();
+  if (/^omp(\.exe|-[\w.]+)?$/.test(base)) return process.execPath;
+  return "omp";
+}
+
 // CLI checker: one nested `omp -p` run. Slower (process boot per check) but it
 // covers every provider API through the CLI's own dispatch.
-async function askModelCli(prompt) {
+async function askModelCli(prompt, deadline = 0) {
   const provider = CFG.provider;
   if (!provider.model) throw new Error(`no checker model configured for provider "${provider.name || "(unset)"}" — pick one in /dc`);
   if (typeof EXT_PI?.exec !== "function") throw new Error("exec is unavailable in this extension host");
-  const ompBin = process.env.OMP_DC_BIN || process.execPath;
+  const ompBin = ompBinary();
   const args = ["-p", "--no-session", "--no-tools", "--no-extensions", "--model", `${provider.name}/${provider.model}`, `${CHECKER_SYSTEM_PROMPT}\n\n${prompt}`];
-  const res = await EXT_PI.exec(ompBin, args, { timeout: CFG.timeoutMs, cwd: nodeOs.tmpdir() });
-  if (res.killed) throw new Error(`checker process was killed after ${CFG.timeoutMs} ms (timeout or abort)`);
+  const budget = Math.max(200, (deadline || Date.now() + CFG.timeoutMs) - Date.now());
+  const res = await EXT_PI.exec(ompBin, args, { timeout: budget, cwd: nodeOs.tmpdir() });
+  if (res.killed) throw new Error(`checker process was killed after ${budget} ms (timeout or abort)`);
   if (res.code !== 0) {
     const tail = String(res.stderr ?? "")
       .replace(/\x1b\[[0-9;]*[A-Za-z]/g, "")
@@ -1531,18 +1857,21 @@ async function askModel(ctx, prompt) {
   } catch (err) {
     cred = { ok: false, error: String(err?.message ?? err) };
   }
+  // One budget for the entire decision: a fallback must not restart the clock.
+  const deadline = Date.now() + CFG.timeoutMs;
   const engine = CFG.engine === "cli" ? "cli" : CFG.engine === "auto" && !HTTP_APIS.has(String(model.api ?? "")) ? "cli" : CFG.engine;
-  if (engine === "cli") return parseVerdictOrThrow(await askModelCli(prompt), "");
+  if (engine === "cli") return parseVerdictOrThrow(await askModelCli(prompt, deadline), "");
   try {
     // In auto mode a missing credential is worth a CLI attempt: the CLI owns
     // OAuth plumbing that the raw HTTP path cannot reach.
     if (!cred?.ok) throw new Error(cred?.error ?? `no credential for provider "${model.provider}"`);
-    return parseVerdictOrThrow(await askModelHttp(ctx, model, cred, prompt), "");
+    return parseVerdictOrThrow(await askModelHttp(ctx, model, cred, prompt, deadline), "");
   } catch (err) {
     if (CFG.engine !== "auto" || err?.name === "AbortError" || err?.name === "TimeoutError") throw err;
+    if (deadline - Date.now() < 1000) throw err;
     // Unsupported shape or a provider hiccup: fall back to the CLI once.
     try {
-      return parseVerdictOrThrow(await askModelCli(prompt), "");
+      return parseVerdictOrThrow(await askModelCli(prompt, deadline), "");
     } catch (cliErr) {
       throw new Error(`${err?.message ?? err}; CLI fallback: ${cliErr?.message ?? cliErr}`);
     }
@@ -1673,18 +2002,24 @@ function decide(plan, event, ctx) {
   const resolved = resolveAction(plan.violations);
   if (!resolved) return undefined;
   const { violation, action } = resolved;
-  const cwd = plan.scope.cwdAbs;
-  const audit = { command: plan.summary, cwd };
-  const key = cacheKeyFor(plan.scope, `${plan.kind}:${plan.summary}`);
-  if (action === "allow" || sessionAllows.has(key)) {
+  const audit = { command: plan.summary, cwd: plan.scope.cwdAbs };
+  const key = cacheKeyFor(plan);
+  if (action === "allow") {
     logDecision({ tool: plan.kind, rule: violation.rule, action: "allow", detail: violation.detail, ...audit });
     statusNote(ctx, statusFor("allowed", violation.rule));
     return undefined;
   }
+  // A decision the current policy makes on its own comes first: a stored
+  // approval may answer a question, never overrule a block.
   if (action === "block") {
     logDecision({ tool: plan.kind, rule: violation.rule, action: "block", detail: violation.detail, ...audit });
     statusNote(ctx, statusFor("blocked", violation.rule), "warning");
     return blockedResult(violation.rule, violation);
+  }
+  if (sessionAllows.has(key)) {
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "allow(session)", detail: violation.detail, ...audit });
+    statusNote(ctx, statusFor("allowed", violation.rule));
+    return undefined;
   }
   if (action === "ask") {
     return askThenDecide(ctx, key, violation.rule, violation, plan);
@@ -1718,7 +2053,7 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
     }
   } catch (err) {
     err.dcMs = Date.now() - started;
-    return onCheckerFailure(ctx, violation, err, plan);
+    return onCheckerFailure(ctx, violation, err, plan, key);
   }
   const took = cached ? "cached" : `${verdict.ms} ms`;
   if (verdict.verdict === "allow") {
@@ -1730,6 +2065,9 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
   const reason = verdict.reason || "no reason given";
   if (CFG.askOnDeny) {
     const answer = await askUser(ctx, reason, `dc: model denied · ${reason} · ${took}`);
+    // The human's answer is the final decision: the log has to carry it, not
+    // just the model's verdict.
+    logDecision({ tool: plan.kind, rule: violation.rule, action: `model:deny:${answer}`, detail: reason, command: plan.summary, cwd: plan.scope.cwdAbs });
     if (answer === "allow-once") return undefined;
     if (answer === "allow-session") {
       sessionAllows.add(key);
@@ -1742,13 +2080,19 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
 
 // Checker failures are never reported as a model denial — the real reason is
 // surfaced and the user is asked when a UI exists.
-async function onCheckerFailure(ctx, violation, err, plan) {
+async function onCheckerFailure(ctx, violation, err, plan, key) {
   const detail = `${String(err?.message ?? err).slice(0, 300)} (after ${err?.dcMs ?? 0} ms)`;
   logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "error", detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
   statusNote(ctx, statusFor("checker error", violation.rule), "warning");
   if (CFG.askOnError && ctx?.hasUI) {
     const answer = await askUser(ctx, `checker unavailable: ${detail}`, "dc: checker failed");
-    if (answer === "allow-once" || answer === "allow-session") return undefined;
+    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: `error:${answer}`, detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
+    // "Allow for this session" has to mean what the label says on this path too.
+    if (answer === "allow-once") return undefined;
+    if (answer === "allow-session") {
+      sessionAllows.add(key);
+      return undefined;
+    }
   }
   return {
     block: true,
@@ -1839,7 +2183,10 @@ export default function destructiveCheck(pi) {
     /* label is cosmetic */
   }
 
-  pi.on("session_start", (_event, ctx) => statusNote(ctx, statusText()));
+  pi.on("session_start", (_event, ctx) => {
+    lastSessionId = sessionIdOf(ctx);
+    statusNote(ctx, statusText());
+  });
 
   pi.registerCommand("dc", {
     description: "destructive-check settings (protection mode, rules, checker)",
@@ -1901,7 +2248,7 @@ export default function destructiveCheck(pi) {
               if (provider) {
                 const model = await pickModel(ctx, provider, CFG.provider.model);
                 if (model) {
-                  const raw = readRawConfig();
+                  const raw = readRawConfig().raw;
                   persistConfigChange({ provider, providers: { ...(raw.providers ?? {}), [provider]: { ...(raw.providers ?? {})[provider], model } } });
                   ctx.ui.notify(`checker: ${provider}/${model} (${effectiveEngine(ctx)})`, "info");
                 }
@@ -2036,7 +2383,7 @@ export default function destructiveCheck(pi) {
         } else if (choice.startsWith("guard:")) {
           const act = selLabel(
             await ctx.ui.select("guard", [
-              { label: `integrity: ${guardIntegrity().state}`, description: "the installed file hashed against the manifest install.mjs wrote" },
+              { label: `integrity: ${guardIntegrity().state}`, description: "the file that is running hashed against the manifest install.mjs wrote next to it" },
               { label: `lock: ${guardLockState()}`, description: "make the guard (and optionally the config) read-only, or clear that again" },
               { label: "restore the previous guard (.bak)", description: "put the copy install.mjs replaced back over the installed file" },
               { label: "cancel", description: "close this submenu" },
@@ -2045,13 +2392,13 @@ export default function destructiveCheck(pi) {
           if (selLabel(act)?.startsWith("integrity")) {
             const status = guardIntegrity();
             const text = [
-              `installed : ${INSTALLED_GUARD}`,
+              `loaded    : ${status.loaded || "(unknown path)"}`,
               `state     : ${status.state}`,
-              `expected  : ${status.expected || "(no manifest — copied by hand, or installed before manifests existed)"}`,
-              `actual    : ${status.actual || "(the installed file cannot be read)"}`,
+              `expected  : ${status.expected || "(no manifest next to the loaded file — not installed through install.mjs)"}`,
+              `actual    : ${status.actual || "(the loaded file cannot be read)"}`,
               "",
               status.state === "ok"
-                ? "The installed guard is byte-identical to what install.mjs wrote."
+                ? "The file that is running is byte-identical to what install.mjs wrote."
                 : "Reinstall from the repo: node install.mjs --force — or install.mjs --restore to go back to the previous copy.",
             ].join("\n");
             await ctx.ui.confirm("guard integrity", text);
@@ -2083,6 +2430,7 @@ export default function destructiveCheck(pi) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    lastSessionId = sessionIdOf(ctx);
     if (process.env.OMP_DC_DISABLE === "1" || !CFG.enabled) return;
     try {
       const cwd = ctx?.cwd ?? process.cwd();
@@ -2090,9 +2438,10 @@ export default function destructiveCheck(pi) {
       if (!plan) return;
       return decide(plan, event, ctx);
     } catch (err) {
-      // The handler itself must not misfire: report, do not block. The failure
-      // is recorded so a silently unprotected call is visible in
-      // "/dc > recent decisions" and not just in a notification.
+      // The handler itself must not misfire: report, and in hard mode do not
+      // call an unanalyzable covered call "safe" either. `hard` is the mode that
+      // promises deterministic blocking, so its failure direction is a block;
+      // the other modes keep the call running and record the failure.
       const detail = String(err?.message ?? err).slice(0, 200);
       // The event is the thing that just blew up: its fields may be hostile
       // objects whose String() throws, so read only what is already a string.
@@ -2102,6 +2451,12 @@ export default function destructiveCheck(pi) {
         ctx?.ui?.notify?.(`destructive-check: internal error — ${detail}`, "warning");
       } catch {
         /* ignore */
+      }
+      if (CFG.mode === "hard") {
+        return {
+          block: true,
+          reason: `destructive-check: the analysis failed and hard mode does not guess — ${detail}. Nothing was executed. Fix the guard (or switch /dc → protection) before retrying.`,
+        };
       }
       return;
     }

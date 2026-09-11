@@ -2,7 +2,7 @@
 // Every probe loads a fresh module instance (verdict caches are module-global).
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, checkerRequests, check, report, results } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, results } from "./harness.mjs";
 
 const HOME = mkHome("static");
 const CWD = "C:\\scratch\\proj";
@@ -19,7 +19,9 @@ const cfg = (extra = {}) => ({
 
 // Each probe loads a fresh module instance and threads one ctx through the handler.
 async function run(event, { config = cfg(), cwd = CWD, selects = [], hasUI = true } = {}) {
-  installFetch(() => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: stub" } }] }) }));
+  // Full Response shape: the checker reads the body with res.text(), and a stub
+  // without it made the CLI fallback answer every test silently.
+  installFetch(() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: stub" } }] }));
   const ext = await loadExt({ home: HOME, config, registry: REG });
   const ctx = makeCtx({ cwd, hasUI, selects: [...selects], registry: REG });
   const result = await callTool(ext, event, ctx);
@@ -309,8 +311,9 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
 // --------------------------------------------------------- internal error ---
 {
   // A malformed tool event must not brick the session, and must not disappear
-  // silently either: the call proceeds unguarded, but the failure is recorded
-  // where a human reviewing /dc can see it.
+  // silently either. Which way it fails depends on the mode: medium keeps the
+  // call running and records the failure, while hard — the mode that promises
+  // deterministic blocking — refuses to call an unanalyzable call safe.
   // A command value that explodes when the guard reads it: the analyzers call
   // String() on it long before any decision is made.
   const hostile = {
@@ -324,19 +327,22 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
       },
     },
   };
-  const p = await run(hostile, { config: cfg({ mode: "hard" }) });
-  check("internal error fails open (the command is not bricked)", !p.blocked, JSON.stringify(p.result));
+  const medium = await run(hostile, { config: cfg({ mode: "medium" }) });
+  check("internal error fails open outside hard mode (the command is not bricked)", !medium.blocked, JSON.stringify(medium.result));
   check(
     "internal error is reported to the UI",
-    p.ctx.notes.some((n) => /internal error/.test(n.message) && n.level === "warning"),
-    JSON.stringify(p.ctx.notes).slice(0, 200),
+    medium.ctx.notes.some((n) => /internal error/.test(n.message) && n.level === "warning"),
+    JSON.stringify(medium.ctx.notes).slice(0, 200),
   );
+
+  const hard = await run(hostile, { config: cfg({ mode: "hard" }) });
+  check("internal error blocks in hard mode", hard.blocked && /analysis failed/.test(String(hard.result?.reason ?? "")), JSON.stringify(hard.result));
 
   let confirmText = "";
   const menuCtx = makeCtx({ cwd: CWD, registry: REG, selects: [pick("recent decisions"), pick("close")] });
   menuCtx.ui.confirm = async (_title, message) => ((confirmText = String(message)), true);
-  await callTool({ toolCall: p.ext.toolCall }, hostile, menuCtx);
-  await p.ext.commands.get("dc").handler("", menuCtx);
+  await callTool({ toolCall: medium.ext.toolCall }, hostile, menuCtx);
+  await medium.ext.commands.get("dc").handler("", menuCtx);
   check("internal error reaches the decision log", /internal/.test(confirmText), confirmText.slice(0, 200));
 }
 

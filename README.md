@@ -27,9 +27,20 @@ available, and otherwise blocks with the real error text so the failure is debug
 | `insideDelete` — deletes inside the project that are not artifacts | allow | block | block |
 | `artifactDelete` — `node_modules`, `dist`, `build`, `.next`, temp dirs | allow | allow | allow |
 | `dynamicTargets` — targets that cannot be resolved statically (`$VAR`, `rm -rf *`) | model | model | block |
-| `gitDestructive` — `git clean`/`rm`, `reset --hard`, `push --force`, `branch -D`, `stash drop`, bare `restore` / `checkout -- `/`switch -f`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, history rewrites | allow | model | block |
+| `gitDestructive` — `git clean`/`rm`, `reset --hard`, `push --force`/`--delete`, `branch -D`, `stash drop`, bare `restore` / `checkout -- `/`switch -f`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, history rewrites | allow | model | block |
 | `scriptExec` — a script whose body could not be read (missing, >64 KiB, binary, nested deeper than 2, changed while reading) | allow | model | ask |
 | `codeDelete` — deletes issued through eval with a computed target | allow | block | block |
+
+`artifactDelete` is a rule like any other, not an early return: in `custom` you can set it to `ask`,
+`model` or `block` and artifact cleanup stops being free. A call that produces several violations is
+decided by the **most restrictive** action among them (ties go to the higher-severity rule), so an
+allowed target can never release a blocked one.
+
+`gitDestructive` follows what git actually does, not one spelling of it: `--force-with-lease` is
+deliberately **allowed** (it refuses to overwrite a ref that moved since the last fetch), `+HEAD:main`
+refspecs and combined short flags (`branch -Df`, `git clean -qD`) are not, `git --git-dir=… reset
+--hard` is found through global options, and `restore --staged` only unstages (safe) while
+`restore --staged -W` puts the worktree back (destructive).
 
 `catastrophic` is the one class with no path to the checker: these signatures have no legitimate use
 inside an agent session, so they are denied statically in every mode and are matched on command
@@ -59,7 +70,7 @@ Each rule can be set to one of four actions:
 | `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking, **script bodies** (`sh ./x.sh`, `bash -x x.sh`, `./x.sh`, `cmd /c x.cmd`) up to 64 KiB and 2 files deep |
 | `git` | destructive subcommands: `clean`/`rm`, `reset --hard`, `push --force`/`--delete`, `branch -D` (and `-d --force`), `stash drop`/`clear`, bare `restore` (but not `--staged`, which only unstages), `checkout -f` and the `checkout [ref] -- <path>` form, `switch -f`/`--discard-changes`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, `filter-branch`/`filter-repo`. Git arguments are not path-classified: the subcommand decides, so this list is the coverage. |
 | `eval` | delete APIs in Python (`shutil.rmtree`, `os.remove`, …) and JS/TS (`fs.rmSync`, `fs.unlinkSync`, `Deno.remove`, …), plus destructive shell strings and catastrophic one-liners inside the code |
-| `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` |
+| `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` — every file section in the payload, each move paired with the section above it — and the structured form (`{path, edits: [{op: "delete"}]}`), which is its own schema and used to be read as JSON text that matched nothing |
 | `hub` | `start` / `restart`: `application` + `args` are scanned like a command line; `detached` / `persist` add a `dynamicTargets` violation because the process outlives the session. Disable with `coverage.processes: false`. |
 
 Deleting a project directory through `eval` was a real bypass in earlier versions; it is covered now.
@@ -71,6 +82,7 @@ launched through `hub` — command *strings* were the only thing the scanner eve
 ```bash
 node install.mjs            # copies the extension to ~/.omp/shared/ and prints the config.yml snippet
 node install.mjs --force    # overwrite without asking (a .bak copy is kept)
+node install.mjs --unlock   # allowed to replace a copy locked from /dc; the mode is restored after
 ```
 
 Then make sure `~/.omp/agent/config.yml` references it (the installer prints the exact block):
@@ -173,27 +185,37 @@ Every decision is appended to `~/.omp/logs/destructive-check.jsonl`, one JSON ob
 It rotates to `.1` at 5 MiB and keeps the last two files.
 
 Each line carries `prev` (the previous line's `chain`) and `chain`, the SHA-256 of the line without
-`chain`. `node tools/dc-audit.mjs` (or `/dc → audit log → verify the audit chain`) re-walks the file
-with an independent implementation: editing, reordering or removing a line in the middle is reported
-with its line number. Trimming the tail is not detectable, and anything that can write the file can
-re-chain it — the log is a record, not a vault. A checker or config failure never fails a decision
-because the log could not be written; `/dc → status` says the log path either way.
+`chain`. The previous hash is read from the **tail of the file** on every append — two omp sessions
+share the log, and a hash cached in memory would let the second writer chain onto a line that is no
+longer last. Command text is masked for credentials (`token=…`, `api_key: …`, `authorization: …`,
+`bearer …`) before it is written and the file is created `0600`: the log records the decision, not the
+secret.
+
+`node tools/dc-audit.mjs` (or `/dc → audit log → verify the audit chain`) re-walks the file with an
+independent implementation: editing, reordering or removing a line in the middle is reported with its
+line number. Trimming the tail is not detectable, and anything that can write the file can re-chain it
+— the log is a record, not a vault. A checker or config failure never fails a decision because the log
+could not be written; `/dc → status` says the log path either way.
 
 ## Guard integrity, lock and restore
 
 `install.mjs` writes `~/.omp/shared/destructive-check.manifest.json` (file hash, byte count, version,
-timestamp). At load the guard hashes its own installed copy and compares:
+timestamp). At load the guard hashes **the copy it was loaded from** — the path is shown in the panel —
+against the manifest sitting next to that file:
 
 - `ok` — byte-identical to what the installer wrote.
-- `changed` — the installed file differs from the manifest: `/dc → guard → integrity` shows both hashes
-  and the reinstall command.
-- `unmanaged` / `missing` — copied by hand, or the file is gone.
+- `changed` — the file that is running differs from its manifest: `/dc → guard → integrity` shows the
+  loaded path, both hashes and the reinstall command.
+- `unmanaged` / `missing` — a copy with no manifest beside it (hand-copied, vendored, auto-discovered),
+  or the file is gone. A hash taken from a manifest that describes a *different* file is never reported
+  as `ok`.
 
-`/dc → guard → lock` sets the read-only attribute on the installed extension (and optionally on the
+`/dc → guard → lock` sets the read-only attribute on the loaded extension (and optionally on the
 config). That is not a security boundary — the same user can clear it — but an accidental in-place edit
 fails instead of silently changing the policy, and an edit that clears the attribute is visible as a
-changed hash. `/dc → guard → restore the previous guard (.bak)` puts the copy `install.mjs` replaced
-back, and `install.mjs --restore` does the same from the shell.
+changed hash. `install.mjs` will not replace a locked copy unless you pass `--unlock`, and it puts the
+mode back afterwards (a locked guard stays locked); `/dc → guard → restore the previous guard (.bak)`
+and `install.mjs --restore` do the same for the backup.
 
 ## Threat B: an out-of-band boundary (runbook)
 
@@ -237,8 +259,16 @@ the ACLs in this list.
 - **CLI**: one nested `omp -p` run for providers that need the CLI's own auth plumbing (Gemini CLI,
   OAuth-only APIs, `openai-responses`). Correct but slower (process boot per check).
 - **`engine: "auto"`** (default) picks in-process when the provider's API is supported, and falls back
-  to the CLI once if the request fails. A failed check is never a denial: with a UI the user is asked,
-  headless it blocks with the real error text (HTTP status and body included).
+  to the CLI once if the request fails, inside the same `timeoutMs` budget — a fallback never restarts
+  the clock. A failed check is never a denial: with a UI the user is asked, headless it blocks with the
+  real error text (HTTP status and body included).
+- **Only the assistant's message counts.** A verdict in `reasoning_content` (or any thinking trace) is
+  ignored, and an empty or truncated reply fails with the reason named (`finish_reason: length` points
+  at `maxOutputTokens` / `reasoning`, not at a denial) — that is one more way an ALLOW can never be
+  invented.
+- **The checker is asked for one binary answer per call**: `block` / `ask` / `model` / `allow`. When a
+  call fires several rules, the most restrictive action wins (ties: higher-severity rule), so a
+  "model"-action finding and a "block"-action finding on the same call end in a block.
 - The verdict prompt is bounded: action text (`maxCommandChars`), `cwd`, each fired rule with the target
   the classifier resolved for it, and — when `includeIntent` is on — the agent's one-line intent,
   explicitly labelled as agent-written and untrusted (it is context for the checker, never evidence,
@@ -258,13 +288,16 @@ node tests/t-static.mjs   # policy layers: modes, rules, coverage, path classifi
 node tests/t-llm.mjs      # checker: HTTP verdicts, fallback, failure policy, cache, prompt
 node tests/t-menu.mjs     # /dc menu: modes, rule edits, toggles, persistence
 node tests/t-coverage.mjs # script bodies, hub launches, probes, catastrophic class, audit log
+node tests/t-review.mjs   # the external review's 19 finding groups (paths, git, eval, hub, audit, …)
 node tests/t-isolation.mjs    # deny-ACE mechanics from the README runbook (Windows)
 node tests/mutation-check.mjs  # breaks the extension in 25 places and requires the suites to fail
 node tests/t-e2e.mjs           # real omp sessions against a real provider (slower, needs auth)
 ```
 
-`t-static` / `t-llm` / `t-menu` / `t-coverage` use an isolated `HOME` (default `~/.omp-destructive-check-tests`,
-override with `DC_TEST_ROOT`), a stubbed extension host and a stubbed `fetch`, so they run offline. `mutation-check` re-runs them against deliberately broken copies of
+`t-static` / `t-llm` / `t-menu` / `t-coverage` / `t-review` use an isolated `HOME` (default `~/.omp-destructive-check-tests`,
+override with `DC_TEST_ROOT`), a stubbed extension host and a stubbed `fetch`, so they run offline. The
+stubs fail closed: the default `exec` (CLI checker) answers with exit code 1 rather than a friendly
+`ALLOW`, so a test cannot accidentally pass on a path it did not exercise. `mutation-check` re-runs them against deliberately broken copies of
 the extension: a check that still passes is a check that asserts nothing.
 `t-e2e` spawns real sessions; `OMP_BIN`, `DC_E2E_MODEL` (default `opencode-go/deepseek-v4.1-flash`),
 `DC_E2E_HOME` and `DC_E2E_AGENT_DIR` override the binary, model and scratch locations. Its hub case
@@ -296,6 +329,15 @@ is reported as a skip, never as a pass.
   and whoever can write the file can recompute the chain.
 - Symlinks are not resolved, so a link inside the project can point outside it.
 - Path handling targets Windows + Git Bash; POSIX roots are recognized but not exhaustively.
+- In an unquoted shell word, a backslash is read as an escape for the *command* position (`r\m` is
+  `rm`) while the argument text keeps its literal backslashes, so a Windows path still resolves
+  (`C:\Users\x` does not become `C:Usersx`). Quoting the path is still the clearest spelling.
+- `git push --force-with-lease` is allowed on purpose (it refuses to overwrite a ref that moved since
+  the last fetch); `--force` and `+refspec` pushes are not. The lease is only as good as the last
+  fetch: a stale remote-tracking ref makes it as destructive as `--force`.
+- `maxOutputTokens` is a real trap door: a provider that truncates the message (`finish_reason:
+  length`) produces an error, not a verdict, so every gray-zone call blocks until the cap or
+  `reasoning` is fixed in `/dc`.
 - An omp profile selected on the command line (`omp --profile x`) is invisible to the extension, so the
   CLI engine would run under the default profile's credentials. The in-process engine resolves the
   provider by name and is unaffected.

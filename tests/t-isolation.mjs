@@ -73,4 +73,5 @@ try {
   console.error(`isolation: scratch cleanup left ${ROOT} behind`);
 }
 
-report("isolation");
+const bad = report("isolation");
+process.exitCode = bad ? 1 : 0;

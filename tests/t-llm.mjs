@@ -71,10 +71,14 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
   check("DENY + 'allow once' lets the command through", !p.blocked, JSON.stringify(p.result));
 }
 {
+  // Reasoning traces are not verdicts: a model that "thinks" an ALLOW and then
+  // returns no message has produced no decision, and that fails closed.
   const p = await run({
     handler: () => fetchResponse(200, { choices: [{ message: { content: "", reasoning_content: "checking …\nALLOW: only generated files" } }] }),
+    hasUI: false,
+    exec: async () => ({ stdout: "", stderr: "cli down", code: 1, killed: false }),
   });
-  check("verdict is read from reasoning_content too", !p.blocked, JSON.stringify(p.result));
+  check("a verdict in reasoning_content is not a verdict", p.blocked, JSON.stringify(p.result));
 }
 {
   const p = await run({ handler: () => ok("DENY: risky"), selects: ["Allow for this session"] });
@@ -132,7 +136,7 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
 }
 {
   const p = await run({ handler: () => fetchResponse(200, { choices: [{ message: {} }] }), hasUI: false, exec: async () => ({ stdout: "", stderr: "cli down", code: 1, killed: false }) });
-  check("empty reply blocks with an actionable reason", p.blocked && /empty reply/.test(p.result?.reason ?? ""), p.result?.reason);
+  check("empty reply blocks with an actionable reason", p.blocked && /empty message \(finish_reason/.test(p.result?.reason ?? ""), p.result?.reason);
 }
 {
   const p = await run({ config: cfg({ provider: "opencode-go", providers: {}, model: "" }), hasUI: false });

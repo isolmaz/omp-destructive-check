@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, checkerRequests, check, report, dialogDefects, confirmLog } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, dialogDefects, confirmLog, EXT_PATH } from "./harness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AUDIT = path.join(HERE, "..", "tools", "dc-audit.mjs");
@@ -33,7 +33,7 @@ const cfg = (extra = {}) => ({
   ...extra,
 });
 
-const stubFetch = () => installFetch(() => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "ALLOW: stub" } }] }) }));
+const stubFetch = () => installFetch(() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: stub" } }] }));
 
 async function run(event, { config = cfg(), cwd = PROJ, selects = [], hasUI = true } = {}) {
   stubFetch();
@@ -43,10 +43,11 @@ async function run(event, { config = cfg(), cwd = PROJ, selects = [], hasUI = tr
   return { result, completions: checkerRequests().length, blocked: result?.block === true, reason: String(result?.reason ?? "") };
 }
 
-// Drives the /dc menu; returns the panels it opened.
-async function dc({ selects = [], config = cfg(), cwd = PROJ } = {}) {
+// Drives the /dc menu; returns the panels it opened. `extPath` runs the panel
+// against the installed copy instead of the repository file.
+async function dc({ selects = [], config = cfg(), cwd = PROJ, extPath } = {}) {
   stubFetch();
-  const ext = await loadExt({ home: HOME, config, registry: REG });
+  const ext = await loadExt({ home: HOME, config, registry: REG, extPath });
   const ctx = makeCtx({ cwd, selects: [...selects], registry: REG });
   const before = confirmLog.length;
   await ext.commands.get("dc").handler("", ctx);
@@ -276,30 +277,47 @@ for (const [command, label] of [
 }
 
 // --------------------------------------------------------- guard integrity ----
+// The integrity check hashes the file that is *running*, so these cases install a
+// real copy into the fake home and load the extension from there.
 try {
   fs.mkdirSync(SHARED, { recursive: true });
-  fs.writeFileSync(INSTALLED, "// installed copy\n");
-  fs.writeFileSync(MANIFEST, JSON.stringify({ sha256: createHash("sha256").update(fs.readFileSync(INSTALLED)).digest("hex"), installedAt: "2026-09-11T00:00:00.000Z", version: "2.4" }));
+  fs.copyFileSync(EXT_PATH, INSTALLED);
+  const manifestOf = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+  fs.writeFileSync(MANIFEST, JSON.stringify({ sha256: manifestOf(INSTALLED), installedAt: "2026-09-11T00:00:00.000Z", version: "2.4" }));
   {
-    const { panels } = await dc({ selects: ["guard: ok", "integrity: ok", "close"] });
-    check("guard integrity: a matching install reports ok", /state\s*: ok/.test(panels.at(-1) ?? ""), panels.at(-1) ?? "");
+    const { panels } = await dc({ selects: ["guard: ok", "integrity: ok", "close"], extPath: INSTALLED });
+    const panel = panels.at(-1) ?? "";
+    check("guard integrity: a matching install reports ok", /state\s*: ok/.test(panel), panel);
+    check("guard integrity: the panel names the loaded file", panel.includes(INSTALLED), panel);
   }
   {
-    fs.writeFileSync(INSTALLED, "// edited after the install, off the books\n");
-    const { panels } = await dc({ selects: ["guard: changed", "integrity: changed", "close"] });
+    // Appended, not replaced: the panel has to run against a file the host can
+    // still load, and an extra comment is a real edit with a new hash.
+    fs.appendFileSync(INSTALLED, "\n// edited after the install, off the books\n");
+    const { panels } = await dc({ selects: ["guard: changed", "integrity: changed", "close"], extPath: INSTALLED });
     const panel = panels.at(-1) ?? "";
     check("guard integrity: an edit after the install reports changed", /state\s*: changed/.test(panel) && /install\.mjs --force/.test(panel), panel);
   }
   {
-    await dc({ selects: ["guard: changed", "lock: destructive-check.ts: writable · destructive-check.json: writable", "lock the guard only", "close"] });
+    // A copy with no manifest next to it is "unmanaged" — never a passing hash
+    // taken from a manifest that describes some other file.
+    fs.rmSync(MANIFEST, { force: true });
+    const { panels } = await dc({ selects: ["guard: unmanaged", "integrity: unmanaged", "close"], extPath: INSTALLED });
+    const panel = panels.at(-1) ?? "";
+    check("guard integrity: a copy with no manifest is unmanaged, not ok", /state\s*: unmanaged/.test(panel), panel);
+  }
+  {
+    fs.copyFileSync(EXT_PATH, INSTALLED);
+    fs.writeFileSync(MANIFEST, JSON.stringify({ sha256: manifestOf(INSTALLED), installedAt: "2026-09-11T00:00:00.000Z", version: "2.4" }));
+    await dc({ selects: ["guard: ok", "lock: destructive-check.ts: writable · destructive-check.json: writable", "lock the guard only", "close"], extPath: INSTALLED });
     check("guard lock: locking leaves the installed file read-only", (fs.statSync(INSTALLED).mode & 0o200) === 0, `mode ${fs.statSync(INSTALLED).mode.toString(8)}`);
     check("guard lock: the config stays writable when only the guard is locked", (fs.statSync(path.join(HOME, ".omp", "destructive-check.json")).mode & 0o200) !== 0, "");
-    await dc({ selects: ["guard: changed", "lock: destructive-check.ts: read-only · destructive-check.json: writable", "unlock both files", "close"] });
+    await dc({ selects: ["guard: ok", "lock: destructive-check.ts: read-only · destructive-check.json: writable", "unlock both files", "close"], extPath: INSTALLED });
     check("guard lock: unlocking restores a writable file", (fs.statSync(INSTALLED).mode & 0o200) !== 0, `mode ${fs.statSync(INSTALLED).mode.toString(8)}`);
   }
   {
     fs.writeFileSync(`${INSTALLED}.bak`, "// the previous guard\n");
-    const { panels } = await dc({ selects: ["guard: changed", "restore the previous guard (.bak)", "close"] });
+    const { panels } = await dc({ selects: ["guard: ok", "restore the previous guard (.bak)", "close"], extPath: INSTALLED });
     check("guard restore: the previous copy is written back", fs.readFileSync(INSTALLED, "utf8") === "// the previous guard\n", fs.readFileSync(INSTALLED, "utf8"));
     check("guard restore: the panel says a restart is needed", /Restart the omp session/.test(panels.at(-1) ?? ""), panels.at(-1) ?? "");
   }
@@ -314,4 +332,5 @@ try {
   }
 }
 
-report("coverage");
+const bad = report("coverage");
+process.exitCode = bad ? 1 : 0;

@@ -54,7 +54,7 @@ export function dialogDefects() {
 let seq = 0;
 
 // ------------------------------------------------------------------ loader --
-export async function loadExt({ home, config, registry, exec } = {}) {
+export async function loadExt({ home, config, registry, exec, extPath } = {}) {
   fs.mkdirSync(path.join(home, ".omp"), { recursive: true });
   const configPath = path.join(home, ".omp", "destructive-check.json");
   fs.writeFileSync(configPath, JSON.stringify(config ?? {}, null, 2));
@@ -63,7 +63,10 @@ export async function loadExt({ home, config, registry, exec } = {}) {
   process.env.USERPROFILE = home;
   process.env.HOME = home;
 
-  const mod = await import(`${pathToFileURL(EXT_PATH).href}?v=${++seq}`);
+  // extPath loads a *copy* (the installed layout): the guard hashes the file it
+  // was loaded from, so integrity tests have to control that path.
+  const target = extPath ?? EXT_PATH;
+  const mod = await import(`${pathToFileURL(target).href}?v=${++seq}`);
   const handlers = new Map();
   const commands = new Map();
   const execCalls = [];
@@ -79,7 +82,10 @@ export async function loadExt({ home, config, registry, exec } = {}) {
     async exec(cmd, args, opts) {
       execCalls.push({ cmd, args, opts });
       if (exec) return exec(cmd, args, opts);
-      return { stdout: "ALLOW: default stub", stderr: "", code: 0, killed: false };
+      // Fail closed: a test that silently depends on the CLI checker is a test
+      // that never exercised the path it believes it exercised. Pass an explicit
+      // exec stub to test the CLI engine.
+      return { stdout: "", stderr: "dc-test: no CLI checker stub installed", code: 1, killed: false };
     },
     pi: {
     },
@@ -114,7 +120,7 @@ export function fakeRegistry(entries) {
   };
 }
 
-export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [] } = {}) {
+export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "" } = {}) {
   const notes = [];
   const statuses = [];
   const ui = {
@@ -140,7 +146,7 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
     cwd,
     modelRegistry: registry,
     models: { resolve: (spec) => (registry ? registry.getAvailable().find((m) => `${m.provider}/${m.id}` === spec) : undefined) },
-    sessionManager: { getBranch: () => branch },
+    sessionManager: { getBranch: () => branch, getSessionId: () => sessionId },
   };
 }
 

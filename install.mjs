@@ -5,6 +5,7 @@
  *
  *   node install.mjs            # copy; asks before overwriting a different file
  *   node install.mjs --force    # overwrite without asking (a .bak copy is kept)
+ *   node install.mjs --unlock   # allowed to replace a copy locked from /dc (mode restored)
  *   node install.mjs --restore  # put the .bak copy back and rewrite the manifest
  *
  * A manifest (destructive-check.manifest.json) is written next to the copy: the
@@ -34,6 +35,15 @@ const AUTO_DISCOVERED = path.join(OMP, "agent", "extensions", "destructive-check
 
 const args = process.argv.slice(2);
 const force = args.includes("--force");
+
+// The mode of the installed copy, or null when there is nothing to preserve.
+function modeOf(file) {
+  try {
+    return fs.statSync(file).mode & 0o777;
+  } catch {
+    return null;
+  }
+}
 
 // Display paths relative to the home directory; separators normalized for
 // output. path.relative handles separator and (on Windows) case differences.
@@ -80,7 +90,14 @@ async function restore() {
     console.error(`restore: no backup at ${short(backup)} — the installer writes one every time it replaces the installed copy.`);
     return 1;
   }
-  fs.copyFileSync(backup, DEST);
+  const previousMode = modeOf(DEST);
+  try {
+    fs.copyFileSync(backup, DEST);
+    if (previousMode !== null) fs.chmodSync(DEST, previousMode);
+  } catch (err) {
+    console.error(`restore: cannot write ${short(DEST)} (${err.code}) — unlock it in /dc → guard → lock, or run this as a user that may write it.`);
+    return 1;
+  }
   const manifest = writeManifest();
   console.log(`restored: ${short(backup)} → ${short(DEST)}`);
   console.log(`sha256  : ${manifest.sha256}`);
@@ -102,7 +119,7 @@ async function confirm(question) {
 
 async function main() {
   if (args.includes("--help") || args.includes("-h")) {
-    console.log("usage: node install.mjs [--force] [--restore]");
+    console.log("usage: node install.mjs [--force] [--unlock] [--restore]");
     return 0;
   }
 
@@ -120,13 +137,24 @@ async function main() {
   }
 
   fs.mkdirSync(path.dirname(DEST), { recursive: true });
-  // A guard locked from /dc is read-only on purpose: say so instead of failing
-  // halfway through the copy.
-  try {
-    if (fs.existsSync(DEST)) fs.chmodSync(DEST, 0o644);
-  } catch (err) {
-    console.error(`install: cannot make ${short(DEST)} writable (${err.code}) — unlock it in /dc → guard → lock.`);
+  // The lock set from /dc is protection, not an obstacle to route around: a
+  // read-only guard is only replaced when the user says so with --unlock, and the
+  // mode is put back afterwards.
+  const previousMode = modeOf(DEST);
+  const locked = previousMode !== null && (previousMode & 0o200) === 0;
+  const unlock = args.includes("--unlock");
+  if (locked && !unlock) {
+    console.error(`install: ${short(DEST)} is read-only (locked from /dc → guard → lock).`);
+    console.error("         Unlock it there first, or re-run with --unlock to replace it anyway; the mode is restored after the copy.");
     return 1;
+  }
+  if (locked) {
+    try {
+      fs.chmodSync(DEST, 0o644);
+    } catch (err) {
+      console.error(`install: cannot unlock ${short(DEST)} (${err.code}).`);
+      return 1;
+    }
   }
 
   if (fs.existsSync(DEST)) {
@@ -139,12 +167,17 @@ async function main() {
       fs.copyFileSync(SRC, DEST);
       console.log(`installed: ${short(DEST)} (previous copy in ${short(backup)})`);
     } else {
+      if (locked) fs.chmodSync(DEST, previousMode);
       console.error(`install: kept the existing ${short(DEST)} — re-run with --force to overwrite.`);
       return 1;
     }
   } else {
     fs.copyFileSync(SRC, DEST);
     console.log(`installed: ${short(DEST)}`);
+  }
+  if (previousMode !== null) {
+    fs.chmodSync(DEST, previousMode);
+    if (locked) console.log(`locked  : ${short(DEST)} stays read-only`);
   }
 
   const manifest = writeManifest();
