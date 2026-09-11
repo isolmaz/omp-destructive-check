@@ -123,6 +123,13 @@ const mutations = [
     from: '    gitDestructive: "model",\n    scriptExec: "allow",\n    codeDelete: "block",',
     to: '    gitDestructive: "allow",\n    scriptExec: "allow",\n    codeDelete: "block",',
   },
+  {
+    name: "an approval option loses its explanation",
+    suite: "tests/t-llm.mjs",
+    expect: "carries an explanation",
+    from: '    { label: "Block", description: "refuse the command; nothing is executed" },',
+    to: '    { label: "Block" },',
+  },
 ];
 
 const rows = [];

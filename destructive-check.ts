@@ -1115,10 +1115,17 @@ function statusNote(ctx, text, level) {
   }
 }
 
+// The status line is a glance surface and it sits right next to the model segment,
+// which already names the model: the resting text stays minimal, every decision
+// states what happened and which rule caused it, and the full detail lives in
+// /dc → status and recent decisions.
 function statusText() {
-  const p = CFG.provider;
-  const checker = p.model ? `${p.name}/${p.model}` : "no model";
-  return `dc: ${CFG.mode} | ${checker} | ask-on-deny ${CFG.askOnDeny ? "on" : "off"}`;
+  return CFG.enabled ? `dc: ${CFG.mode}` : "dc: off";
+}
+
+function statusFor(verb, rule) {
+  const label = RULES[rule] ?? rule ?? "";
+  return label ? `dc: ${CFG.mode} · ${verb} · ${label}` : `dc: ${CFG.mode} · ${verb}`;
 }
 
 // Which engine the next check will actually use, so the menu does not claim
@@ -1187,7 +1194,11 @@ function fullStatus(ctx) {
 async function askUser(ctx, title, reason) {
   if (!ctx?.hasUI || !ctx?.ui?.select) return "block";
   statusNote(ctx, reason, "warning");
-  const options = ["Allow once", "Allow for this session", "Block"];
+  const options = [
+    { label: "Allow once", description: "run this command now; the next one is checked again" },
+    { label: "Allow for this session", description: "stop asking for this exact command in this workspace until the session ends" },
+    { label: "Block", description: "refuse the command; nothing is executed" },
+  ];
   const choice = selLabel(await ctx.ui.select(`destructive-check: ${title}`, options));
   if (choice === "Allow once") return "allow-once";
   if (choice === "Allow for this session") return "allow-session";
@@ -1211,12 +1222,12 @@ function decide(plan, event, ctx) {
   const key = cacheKeyFor(plan.scope, `${plan.kind}:${plan.summary}`);
   if (action === "allow" || sessionAllows.has(key)) {
     logDecision({ tool: plan.kind, rule: violation.rule, action: "allow", detail: violation.detail });
-    statusNote(ctx, `dc: allowed · ${violation.rule}`);
+    statusNote(ctx, statusFor("allowed", violation.rule));
     return undefined;
   }
   if (action === "block") {
     logDecision({ tool: plan.kind, rule: violation.rule, action: "block", detail: violation.detail });
-    statusNote(ctx, `dc: blocked · ${violation.rule}`, "warning");
+    statusNote(ctx, statusFor("blocked", violation.rule), "warning");
     return blockedResult(violation.rule, violation);
   }
   if (action === "ask") {
@@ -1256,7 +1267,7 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
   const took = cached ? "cached" : `${verdict.ms} ms`;
   if (verdict.verdict === "allow") {
     logDecision({ tool: plan.kind, rule: violation.rule, action: cached ? "model:allow(cached)" : "model:allow", detail: verdict.reason || violation.detail, ms: verdict.ms });
-    statusNote(ctx, `dc: model allowed · ${violation.rule} · ${took}`);
+    statusNote(ctx, `${statusFor("checker allowed", violation.rule)} · ${took}`);
     return undefined;
   }
   logDecision({ tool: plan.kind, rule: violation.rule, action: "model:deny", detail: verdict.reason ?? "", ms: verdict.ms });
@@ -1278,7 +1289,7 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
 async function onCheckerFailure(ctx, violation, err) {
   const detail = `${String(err?.message ?? err).slice(0, 300)} (after ${err?.dcMs ?? 0} ms)`;
   logDecision({ tool: "checker", rule: violation.rule, action: "error", detail });
-  statusNote(ctx, `dc: checker error · ${detail}`, "warning");
+  statusNote(ctx, statusFor("checker error", violation.rule), "warning");
   if (CFG.askOnError && ctx?.hasUI) {
     const answer = await askUser(ctx, `checker unavailable: ${detail}`, "dc: checker failed");
     if (answer === "allow-once" || answer === "allow-session") return undefined;
@@ -1481,33 +1492,42 @@ export default function destructiveCheck(pi) {
             }
           }
         } else if (choice.startsWith("coverage:")) {
-          const key = selLabel(await ctx.ui.select("coverage", [
-            { label: `bash: ${CFG.coverage.bash ? "on" : "off"}` },
-            { label: `eval: ${CFG.coverage.eval ? "on" : "off"}` },
-            { label: `fileTools: ${CFG.coverage.fileTools ? "on" : "off"}` },
+          const key = selLabel(await ctx.ui.select("coverage — which tools the guard watches", [
+            { label: `bash: ${CFG.coverage.bash ? "on" : "off"}`, description: "shell commands, wrappers, nested shells and package runners" },
+            { label: `eval: ${CFG.coverage.eval ? "on" : "off"}`, description: "delete APIs and shell snippets inside eval code (python, js)" },
+            { label: `fileTools: ${CFG.coverage.fileTools ? "on" : "off"}`, description: "edit REM/MV lines and apply_patch delete/move operations" },
           ]));
           if (key) {
-            const name = key.split(":")[0].trim();
+            const name = String(key).split(":")[0].trim();
             if (name in CFG.coverage) persistConfigChange({ coverage: { ...CFG.coverage, [name]: !CFG.coverage[name] } });
           }
         } else if (choice.startsWith("intent:")) {
           persistConfigChange({ includeIntent: !CFG.includeIntent });
         } else if (choice.startsWith("cache:")) {
-          const act = selLabel(await ctx.ui.select("cache", ["toggle", "clear verdicts", "clear approvals", "cancel"]));
-          if (act === "toggle") persistConfigChange({ cacheEnabled: !CFG.cacheEnabled });
-          else if (act === "clear verdicts") {
+          const act = selLabel(await ctx.ui.select("cache", [
+            { label: `toggle (now ${CFG.cacheEnabled ? "on" : "off"})`, description: "reuse a verdict for the same command in the same workspace" },
+            { label: `clear verdicts (${verdictCache.size})`, description: "forget cached verdicts; the next matching command is checked again" },
+            { label: `clear approvals (${sessionAllows.size})`, description: "forget the 'allow for this session' answers you gave" },
+            { label: "cancel", description: "close this submenu" },
+          ]));
+          if (selLabel(act)?.startsWith("toggle")) persistConfigChange({ cacheEnabled: !CFG.cacheEnabled });
+          else if (selLabel(act)?.startsWith("clear verdicts")) {
             verdictCache.clear();
             ctx.ui.notify("verdict cache cleared", "info");
-          } else if (act === "clear approvals") {
+          } else if (selLabel(act)?.startsWith("clear approvals")) {
             sessionAllows.clear();
             ctx.ui.notify("session approvals cleared", "info");
           }
         } else if (choice.startsWith("allowed dirs:")) {
-          const act = selLabel(await ctx.ui.select("allowed dirs", ["add a directory", "clear the list", "cancel"]));
-          if (act === "add a directory") {
+          const act = selLabel(await ctx.ui.select("allowed dirs — extra project scope", [
+            { label: "add a directory", description: "treat this directory as part of the project: deletes inside it are judged as inside-project" },
+            { label: `clear the list (${CFG.allowDirs.length})`, description: "drop every extra directory; only the session cwd and its git root stay in scope" },
+            { label: "cancel", description: "close this submenu" },
+          ]));
+          if (selLabel(act) === "add a directory") {
             const dir = await ctx.ui.input("directory path", "");
             if (dir && String(dir).trim()) persistConfigChange({ allowDirs: [...CFG.allowDirs, String(dir).trim()] });
-          } else if (act === "clear the list") {
+          } else if (selLabel(act)?.startsWith("clear the list")) {
             persistConfigChange({ allowDirs: [] });
           }
         } else if (choice.startsWith("test checker")) {

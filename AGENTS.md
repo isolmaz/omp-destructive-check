@@ -38,7 +38,14 @@ Everything the guard needs ships in `destructive-check.ts`: no build step, no im
 6. **The scanner never fails open by accident.** Bailing out — wrapper nesting past `MAX_SCAN_DEPTH`,
   unresolvable targets, escaped shell bodies — records a violation for `dynamicTargets` instead of
   returning clean.
-7. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
+7. **Every option in a dialogue explains itself.** The `/dc` menus and the approval prompt are the
+   only configuration surface users touch; `tests/t-menu.mjs` and `tests/t-llm.mjs` both call
+   `dialogDefects()` from the harness and fail on any label without a description.
+8. **The status line carries the mode, nothing else.** `ctx.ui.setStatus(dc, …)` renders next to the
+   model segment (`statusLine.preset: custom`, `showHookStatus: false`); the resting text is
+   `dc: <mode>` and decisions append `· blocked · <rule label>`. Keep it short — the model segment is
+   already on that line.
+9. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
    the "do not retry this through another tool" sentence. Tests and users match on that shape.
 
 ## Checker wiring (the parts that actually bite)

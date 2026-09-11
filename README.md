@@ -109,7 +109,32 @@ disabledExtensions:
 Environment overrides (win over the file): `OMP_DC_DISABLE=1`, `OMP_DC_MODE`, `OMP_DC_PROVIDER`,
 `OMP_DC_MODEL`, `OMP_DC_ENGINE`, `OMP_DC_TIMEOUT_MS`, `OMP_DC_BIN` (CLI engine binary).
 
+## Status line
+
+The guard keeps one short status next to the model segment — `dc: medium` while it is protecting,
+`dc: medium · blocked · Destructive git commands` after a decision — instead of a line under the
+editor:
+
+```yaml
+statusLine:
+  preset: custom
+  showHookStatus: false          # no duplicate line beneath the editor
+  leftSegments: [pi, vim, model, status, mode, collab, path, git, pr, context_pct, cost]
+  rightSegments: [session_name]
+  segmentOptions:
+    model: { showThinkingLevel: true }
+    path: { abbreviate: true, maxLength: 40, stripWorkPrefix: true }
+    git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: true }
+```
+
+The extension writes through `ctx.ui.setStatus("dc", …)`, so the built-in presets show it in the
+footer right away; the `custom` preset above is what moves it next to the model. `/dc → status` always
+has the full picture.
+
 ## `/dc` menu
+
+Every option in every menu (and in the approval prompt) carries a one-line explanation; a choice
+without one is treated as a defect by the tests.
 
 ```
 protection: medium          simple | medium | hard | custom

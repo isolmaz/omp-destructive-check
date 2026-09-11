@@ -13,6 +13,7 @@ import {
   checkerHeaders,
   lastCheckerRequest,
   checkerPrompt,
+  dialogDefects,
   checkerUserPrompt,
   check,
   report,
@@ -236,6 +237,12 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
   check("auto: in-process failure falls back to the CLI", p.execCalls === 1 && !p.blocked, `exec=${p.execCalls} blocked=${p.blocked}`);
   const both = await run({ handler: () => err(502, "bad gateway"), exec: async () => ({ stdout: "", stderr: "boom", code: 1, killed: false }), hasUI: false });
   check("auto: both engines failing reports both causes", both.blocked && /502/.test(both.result?.reason ?? "") && /boom/.test(both.result?.reason ?? ""), both.result?.reason);
+}
+
+// The approval prompt is the one dialogue this suite opens.
+{
+  const defects = dialogDefects();
+  check("every approval option carries an explanation", defects.length === 0, defects.join(" | "));
 }
 
 const bad = report("checker layer");
