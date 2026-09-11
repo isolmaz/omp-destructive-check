@@ -1,5 +1,6 @@
 // Test harness: isolated HOME, stubbed extension host, real module import.
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -18,7 +19,10 @@ export function report(title) {
   return bad.length;
 }
 
-export const mkHome = (name) => path.join("C:\\Users\\dev\\.omp-dc-review", name);
+// Scratch root for every suite. Deliberately outside the OS temp directory: the
+// guard treats temp paths as disposable artifacts, and an isolated HOME under
+// %TEMP% would quietly change what several cases are testing.
+export const mkHome = (name) => path.join(process.env.DC_TEST_ROOT ?? path.join(os.homedir(), ".omp-destructive-check-tests"), name);
 
 let seq = 0;
 

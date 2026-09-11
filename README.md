@@ -158,10 +158,11 @@ node tests/mutation-check.mjs  # breaks the extension in 9 places and requires t
 node tests/t-e2e.mjs           # real omp sessions against a real provider (slower, needs auth)
 ```
 
-`t-static` / `t-llm` / `t-menu` use an isolated `HOME`, a stubbed extension host and a stubbed
-`fetch`, so they run offline. `mutation-check` re-runs them against deliberately broken copies of
+`t-static` / `t-llm` / `t-menu` use an isolated `HOME` (default `~/.omp-destructive-check-tests`,
+override with `DC_TEST_ROOT`), a stubbed extension host and a stubbed `fetch`, so they run offline. `mutation-check` re-runs them against deliberately broken copies of
 the extension: a check that still passes is a check that asserts nothing.
-`t-e2e` spawns real sessions (`DC_E2E_MODEL`, default `opencode-go/deepseek-v4.1-flash`).
+`t-e2e` spawns real sessions; `OMP_BIN`, `DC_E2E_MODEL` (default `opencode-go/deepseek-v4.1-flash`),
+`DC_E2E_HOME` and `DC_E2E_AGENT_DIR` override the binary, model and scratch locations.
 
 ## Known limitations
 
