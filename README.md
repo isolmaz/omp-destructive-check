@@ -26,9 +26,11 @@ available, and otherwise blocks with the real error text so the failure is debug
 | `insideDelete` — deletes inside the project that are not artifacts | allow | block | block |
 | `artifactDelete` — `node_modules`, `dist`, `build`, `.next`, temp dirs | allow | allow | allow |
 | `dynamicTargets` — targets that cannot be resolved statically (`$VAR`, `rm -rf *`) | model | model | block |
-| `gitDestructive` — `git clean`, `reset --hard`, `push --force`, `branch -D`, `stash drop` | allow | allow | block |
+| `gitDestructive` — `git clean`/`rm`, `reset --hard`, `push --force`, `branch -D`, `stash drop`, bare `restore` / `checkout -- `/`switch -f`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, history rewrites | allow | model | block |
 | `scriptExec` — running `.bat` / `.cmd` / `.ps1` files | allow | allow | ask |
 | `codeDelete` — deletes issued through eval with a computed target | allow | block | block |
+
+In `medium`, destructive git commands are escalated to the checker rather than allowed: they are the most common way an agent silently destroys uncommitted work.
 
 Project scope = the session `cwd` + the nearest `.git` root + any directory added to `allowDirs`.
 Artifacts are only recognized **inside** that scope or under the OS temp directory: `rm -rf D:\other-project\out`
@@ -45,7 +47,8 @@ Each rule can be set to one of four actions:
 
 | Tool | Covered |
 | --- | --- |
-| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking |
+| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking |
+| `git` | destructive subcommands: `clean`/`rm`, `reset --hard`, `push --force`/`--delete`, `branch -D` (and `-d --force`), `stash drop`/`clear`, bare `restore` (but not `--staged`, which only unstages), `checkout -f` and the `checkout [ref] -- <path>` form, `switch -f`/`--discard-changes`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, `filter-branch`/`filter-repo`. Git arguments are not path-classified: the subcommand decides, so this list is the coverage. |
 | `eval` | delete APIs in Python (`shutil.rmtree`, `os.remove`, …) and JS/TS (`fs.rmSync`, `fs.unlinkSync`, `Deno.remove`, …), plus destructive shell strings inside the code |
 | `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` |
 
@@ -171,6 +174,9 @@ the extension: a check that still passes is a check that asserts nothing.
 - Script **contents** are not read — only running a `.bat` / `.cmd` / `.ps1` file is flagged.
 - Interpreters other than the `eval` tool (`node -e`, `python -c` from bash) are not parsed; their
   payloads are opaque strings. Wrapping the same logic in `eval` is covered.
+- Wrapper nesting is followed 3 levels deep (`bash -c '…'`). Commands wrapped deeper than that are
+  not silently ignored: they raise a `dynamicTargets` violation, so simple/medium ask the checker and
+  hard blocks. Escaped quotes inside nested shell bodies are unwrapped before scanning.
 - Symlinks are not resolved, so a link inside the project can point outside it.
 - Path handling targets Windows + Git Bash; POSIX roots are recognized but not exhaustively.
 - An omp profile selected on the command line (`omp --profile x`) is invisible to the extension, so the

@@ -28,8 +28,17 @@ Everything the guard needs ships in `destructive-check.ts`: no build step, no im
 3. **Verdicts are fail-closed.** Any `DENY` in the reply wins, anchored or not. A stray `ALLOW`
    mentioned in prose must never open the gate.
 4. **`mode` picks the action for a rule; classification is mode-independent.** Do not encode
-   per-mode parsing paths.
-5. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
+  per-mode parsing paths. `medium` escalates destructive git commands to the checker: they destroy
+  uncommitted work, which is exactly what this guard exists for.
+5. **`git` subcommands return from the scanner unconditionally.** Once a `git` command word is seen,
+  the rest goes to `isDestructiveGit` and the scan stops — no path rule applies to git arguments or
+  targets. That decision list *is* the coverage: a missing subcommand is invisible, not merely
+  misclassified, and a lost flag test (`branch -d` vs `-D`, `restore --staged` vs bare `restore`,
+  `switch -f`) is a silent hole. Add a case here and a row in the git tests together.
+6. **The scanner never fails open by accident.** Bailing out — wrapper nesting past `MAX_SCAN_DEPTH`,
+  unresolvable targets, escaped shell bodies — records a violation for `dynamicTargets` instead of
+  returning clean.
+7. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
    the "do not retry this through another tool" sentence. Tests and users match on that shape.
 
 ## Checker wiring (the parts that actually bite)
@@ -67,7 +76,7 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 - **A check must be able to fail.** Before adding one, name the plausible bug it catches. No
   tautologies (`x !== undefined` on a value you just built), no re-asserting the same path across
   modes, no asserting source text or mock echoes.
-- `tests/mutation-check.mjs` enforces that: it breaks the extension in 9 places and requires the
+- `tests/mutation-check.mjs` enforces that: it breaks the extension in 16 places and requires the
   suites to catch every break. **Run it after touching policy or checker code**; a "PATTERN NOT
   FOUND" line means the mutation went stale and the gate fails.
 - `t-e2e` drives real models that sometimes refuse to run destructive commands at all. Those cases

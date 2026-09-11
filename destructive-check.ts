@@ -72,7 +72,7 @@ const MODE_PRESETS = {
     insideDelete: "block",
     artifactDelete: "allow",
     dynamicTargets: "model",
-    gitDestructive: "allow",
+    gitDestructive: "model",
     scriptExec: "allow",
     codeDelete: "block",
   },
@@ -222,11 +222,15 @@ function cacheKeyFor(scope, action) {
 
 const TEMP_SEGMENT_RE = /(^|[\\/])(node_modules|dist|build|out|coverage|__pycache__|\.cache|\.next|\.turbo|\.pytest_cache|\.mypy_cache|\.gradle|\.parcel-cache|\.svelte-kit|\.nuxt|\.output|\.venv|venv|target|tmp|temp)([\\/]|$)/i;
 const SYSTEM_SEGMENT_RE = /(^|[\\/])(\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.config|\.git|windows|program files(?: \([^)]*\))?|appdata[\\/]roaming|system32)([\\/]|$)/i;
-const ROOT_RE = /^(?:[a-zA-Z]:)?[\\/]?$|^\/$|^\/(Users|Windows)(?:[\\/].*)?$/i;
+const ROOT_RE = /^(?:[a-zA-Z]:)?[\\/]?$|^\/$/;
 const DRIVE_MOUNT_RE = /^\/([a-zA-Z])(?=\/|$)/; // Git Bash: /c/Users/x -> C:\Users\x
 const PROTECTED_DIR_RE = /^[a-z]:[\\/](?:users(?:[\\/][^\\/]+)?|windows|programdata|program files(?: \(x86\))?|perflogs|recovery|\$recycle\.bin)$/i;
 const POSIX_SYS_RE = /^\/(?:etc|usr|var|bin|sbin|boot|dev|proc|sys|lib|lib64|opt|root|srv)(?:\/|$)/i;
+// /Users/<name> and /home/<name> are protected as homes; deeper paths inside them
+// belong to the scope classifier. /Windows is a Windows tree seen through a POSIX
+// path, so it stays protected at any depth.
 const POSIX_HOME_RE = /^\/(?:home|Users)(?:\/[^/]+)?$/i;
+const POSIX_WINDOWS_RE = /^\/Windows(?:\/|$)/i;
 const DYNAMIC_RE = /\$|\*|\?|%[A-Za-z_][^%]*%|`/;
 
 const TMP_ROOT = nodePath.resolve(nodeOs.tmpdir()).toLowerCase();
@@ -282,7 +286,7 @@ function classify(raw, scope) {
   if (!path) return { kind: "dynamic", path };
   if (/^[a-zA-Z]:$/.test(path) || path === "/" || path === "\\" || ROOT_RE.test(path)) return { kind: "root", path };
   if (/^\/(?:tmp|var\/tmp)(?:\/|$)/i.test(path)) return { kind: "artifact", path };
-  if (path.startsWith("/") && (POSIX_SYS_RE.test(path) || POSIX_HOME_RE.test(path))) return { kind: "system", path };
+  if (path.startsWith("/") && (POSIX_SYS_RE.test(path) || POSIX_HOME_RE.test(path) || POSIX_WINDOWS_RE.test(path))) return { kind: "system", path };
   if (/[\\/]?[^\\/]*\*/.test(path) || DYNAMIC_RE.test(path)) {
     // Wildcards and variables can expand anywhere: resolve the literal prefix
     // when it is a real directory, otherwise leave the target unclassified.
@@ -459,13 +463,36 @@ function isDestructiveGit(rest) {
   }
   const sub = (rest[k]?.text ?? "").toLowerCase();
   const tail = ` ${rest.slice(k + 1).map((t) => t.text).join(" ")} `;
+  const has = (re) => re.test(tail);
   if (sub === "rm" || sub === "clean") return true;
-  if (sub === "reset" && /--hard\b/.test(tail)) return true;
-  if (sub === "checkout" && /(^|\s)(-f|--force)(\s|$)/.test(tail)) return true;
-  if (sub === "restore" && /(^|\s)(--worktree|--staged)(\s|$)/.test(tail)) return true;
-  if (sub === "stash" && /(^|\s)(drop|clear)(\s|$)/.test(tail)) return true;
-  if (sub === "branch" && /(^|\s)(-D|--delete)(\s|$)/.test(tail)) return true;
-  if (sub === "push" && /(^|\s)(--force|--delete|-f)(\s|$)/.test(tail)) return true;
+  if (sub === "reset" && has(/--hard\b/)) return true;
+  if (sub === "stash" && has(/(^|\s)(drop|clear)(\s|$)/)) return true;
+  if (sub === "push" && has(/(^|\s)(--force|--delete|-f)(\s|$)/)) return true;
+  if (sub === "branch") {
+    // -D / --delete --force drop unmerged work; plain -d / --delete refuse to.
+    if (has(/(^|\s)-D(\s|$)/)) return true;
+    if (has(/(^|\s)(-d|--delete)(\s|$)/) && has(/(^|\s)(-f|--force)(\s|$)/)) return true;
+  }
+  if (sub === "checkout") {
+    if (has(/(^|\s)(-f|--force)(\s|$)/)) return true;
+    // `checkout -- <path>` (with or without a ref) restores those paths with no
+    // flag at all; switching branches without -- is safe, git refuses to lose work.
+    if (has(/(^|\s)--(\s|$)/)) return true;
+  }
+  // `switch` is the modern checkout: only its force/discard flags lose work.
+  if (sub === "switch" && has(/(^|\s)(-f|--force|--discard-changes)(\s|$)/)) return true;
+  if (sub === "restore") {
+    // The working tree is the default target: `git restore <path>` overwrites it.
+    // `--staged` alone only resets the index and keeps the working tree.
+    const stagedOnly = has(/(^|\s)--staged(\s|$)/) && !has(/(^|\s)(--worktree|--source|-s)(\s|=|$)/);
+    if (!stagedOnly) return true;
+  }
+  if (sub === "worktree" && has(/(^|\s)remove(\s|$)/) && has(/(^|\s)(--force|-f)(\s|$)/)) return true;
+  // The "make it unrecoverable" pair plus history rewrites: reflog entries are the
+  // only thing keeping reset/amend/clean casualties alive.
+  if (sub === "reflog" && has(/(^|\s)expire(\s|$)/) && has(/--expire(?:=|\s+)now/)) return true;
+  if (sub === "gc" && has(/--prune(?:=|\s+)now/)) return true;
+  if (sub === "filter-branch" || sub === "filter-repo") return true;
   return false;
 }
 
@@ -488,8 +515,39 @@ function scopeAfterCd(scope, target) {
 
 // Scan a command string, tracking `cd` so targets are classified against the
 // directory they will actually be resolved in (`cd / && rm -rf boot`).
+// Wrappers (sudo, xargs, shells, package runners) each descend one level. A
+// command wrapped deeper than this is not silently waved through: the scanner
+// reports it as an unresolvable target so the dynamicTargets rule decides
+// (model in simple/medium, block in hard) instead of the cutoff acting as an allow.
+const MAX_SCAN_DEPTH = 3;
+const DEPTH_DETAIL = "nested wrappers deeper than the scan limit";
+
+// A shell/launcher body arrives wrapped and re-escaped once per nesting level
+// ("bash -c \"bash -c \\\"…\\\"\""). Peel that off before scanning the body, or the
+// payload stays an opaque quoted token and nested deletes are never seen.
+function unwrapShellBody(raw) {
+  let out = String(raw ?? "").trim();
+  for (let pass = 0; pass < 8; pass++) {
+    const first = out[0];
+    if ((first === '"' || first === "'" || first === "`") && out.length > 1 && out.endsWith(first)) {
+      out = out.slice(1, -1).replace(/\\(["'`])/g, "$1").trim();
+      continue;
+    }
+    const escaped = out.match(/^\\(["'`])([\s\S]*)\1$/);
+    if (escaped) {
+      out = escaped[2].replace(/\\(["'`])/g, "$1").trim();
+      continue;
+    }
+    break;
+  }
+  return out;
+}
+
 function scanScoped(command, scope, depth, found) {
-  if (depth > 3) return found;
+  if (depth > MAX_SCAN_DEPTH) {
+    if (!found.some((f) => f.verb === "depth")) found.push({ verb: "depth", sub: command, scope });
+    return found;
+  }
   let current = scope;
   for (const part of splitSubcommands(command)) {
     const cd = part.match(CD_RE);
@@ -511,7 +569,10 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
     found.push({ ...entry, sub, scope });
     return found;
   };
-  if (depth > 3) return found;
+  if (depth > MAX_SCAN_DEPTH) {
+    if (!found.some((f) => f.verb === "depth")) found.push({ verb: "depth", sub, scope });
+    return found;
+  }
   let loose = false;
   let payload = false;
   let skipNumeric = false;
@@ -548,9 +609,7 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
     if (SHELL_RE.test(cmd)) {
       const flag = toks[i + 1];
       if (flag && !flag.quoted && SHELL_EXEC_FLAG_RE.test(flag.text)) {
-        let body = sub.slice(flag.index + flag.raw.length).trim();
-        if ((body.startsWith('"') && body.endsWith('"')) || (body.startsWith("'") && body.endsWith("'"))) body = body.slice(1, -1);
-        scanScoped(body, scope, depth + 1, found);
+        scanScoped(unwrapShellBody(sub.slice(flag.index + flag.raw.length)), scope, depth + 1, found);
         return found;
       }
       loose = true;
@@ -559,7 +618,7 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
     if (LAUNCHER_RE.test(cmd)) {
       const next = toks[i + 1];
       if (next?.quoted && PAYLOAD_LAUNCHER_RE.test(cmd)) {
-        scanScoped(next.text, scope, depth + 1, found);
+        scanScoped(unwrapShellBody(next.text), scope, depth + 1, found);
         return found;
       }
       payload = PAYLOAD_LAUNCHER_RE.test(cmd);
@@ -629,6 +688,10 @@ function violationsForCommand(command, scope) {
       out.push(violation("gitDestructive", `destructive git operation: ${x.sub}`));
       continue;
     }
+    if (call.verb === "depth") {
+      out.push(violation("dynamicTargets", DEPTH_DETAIL));
+      continue;
+    }
     if (call.verb === "script") {
       out.push(violation("scriptExec", `runs script file: ${x.sub}`));
       continue;
@@ -677,6 +740,7 @@ function violationsForCode(language, code, scope) {
     const x = extractInfo(call.sub);
     if (call.verb === "git") out.push(violation("gitDestructive", `destructive git call inside ${language} code`));
     else if (call.verb === "script") out.push(violation("scriptExec", `runs a script from ${language} code`));
+    else if (call.verb === "depth") out.push(violation("dynamicTargets", `${DEPTH_DETAIL} inside ${language} code`));
     else {
       for (const c of classifyAll(x.targets, scope)) out.push(...(c.kind === "artifact" ? [] : targetViolations(c.kind, c.path)));
     }
