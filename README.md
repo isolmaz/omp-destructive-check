@@ -149,6 +149,7 @@ Every option in every menu (and in the approval prompt) carries a one-line expla
 without one is treated as a defect by the tests.
 
 ```
+enabled: yes                master switch — off means no checking at all (status line: dc: off)
 protection: medium          simple | medium | hard | custom
 checker                     model, engine, timeout, reasoning, token cap, self-test
 ask on deny / ask on error  toggles

@@ -46,6 +46,15 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc headless prints the status", ctx.notes.some((n) => /protection/.test(n.message)), JSON.stringify(ctx.notes).slice(0, 160));
 }
 {
+  // The config has `enabled`, the status line reports it, and the menu is the only
+  // surface users touch — so the switch has to live there, not in a hand-edited file.
+  const off = await menu({ config: cfg({ enabled: false }), selections: [pick("enabled:"), pick("status"), pick("close")] });
+  check("/dc turns the guard on and persists it", off.config.enabled === true, JSON.stringify(off.config));
+  const on = await menu({ selections: [pick("enabled:"), pick("close")] });
+  check("/dc turns the guard off and persists it", on.config.enabled === false, JSON.stringify(on.config));
+  check("/dc reports the off state on the status line", on.ctx.statuses.some((s) => String(s.text) === "dc: off"), JSON.stringify(on.ctx.statuses));
+}
+{
   // The in-memory ring dies with the module instance; the log file does not, and
   // reading it back is the point of writing it.
   installFetch(() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: stub" } }] }));
