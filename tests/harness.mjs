@@ -24,6 +24,29 @@ export function report(title) {
 // %TEMP% would quietly change what several cases are testing.
 export const mkHome = (name) => path.join(process.env.DC_TEST_ROOT ?? path.join(os.homedir(), ".omp-destructive-check-tests"), name);
 
+// Every dialog the extension opens, so suites can assert on the UI contract
+// (every option explained) without re-walking the menus by hand.
+export const selectLog = [];
+
+// Options that offer no explanation. Dialogues are the only configuration surface
+// users touch, so an unexplained choice is a defect; every suite asserts this for
+// the dialogues it exercises.
+export function dialogDefects() {
+  const defects = [];
+  const seen = new Set();
+  for (const call of selectLog) {
+    for (const option of call.options) {
+      const label = typeof option === "string" ? option : option?.label;
+      const description = typeof option === "string" ? "" : option?.description;
+      const key = `${call.title}|${label}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (!label || !String(description ?? "").trim()) defects.push(`${call.title} → ${label ?? JSON.stringify(option)}`);
+    }
+  }
+  return defects;
+}
+
 let seq = 0;
 
 // ------------------------------------------------------------------ loader --
@@ -94,6 +117,7 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
     notify: (message, level) => notes.push({ message, level }),
     setStatus: (key, text) => statuses.push({ key, text }),
     select: async (_title, options) => {
+      selectLog.push({ title: String(_title), options: Array.isArray(options) ? options : [] });
       if (!selects.length) return undefined;
       const next = selects.shift();
       return typeof next === "function" ? next(options) : next;

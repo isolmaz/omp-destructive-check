@@ -1,5 +1,5 @@
 // /dc command: protection modes, per-rule editing, toggles and persistence.
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, selectLog, dialogDefects, check, report } from "./harness.mjs";
 
 const HOME = mkHome("menu");
 const CWD = "C:\\scratch\\proj";
@@ -129,7 +129,8 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("extra project directory changes classification (simple mode)", config.mode === "medium" ? inside?.block === true : inside === undefined, JSON.stringify(inside)?.slice(0, 140));
 }
 {
-  const { config } = await menu({ selections: [pick("allowed dirs"), exact("clear the list"), pick("close")] });
+  const withDirs = cfg({ allowDirs: ["C:\\shared\\libs", "D:\\scratch"] });
+  const { config } = await menu({ config: withDirs, selections: [pick("allowed dirs"), pick("clear the list"), pick("close")] });
   check("/dc clears the extra project directories", (config.allowDirs ?? []).length === 0, JSON.stringify(config.allowDirs));
 }
 
@@ -173,6 +174,15 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   }
   check("/dc survives closing the menu without choosing anything", !threw, String(threw));
   check("/dc with no selections leaves the config untouched", result && JSON.stringify(result.config) === JSON.stringify(cfg()), JSON.stringify(result?.config));
+}
+
+// ------------------------------------------------------------- explanations --
+{
+  // Dialogue coverage is asserted by every suite that opens one; this one walks
+  // the menus, t-llm covers the approval prompt.
+  const defects = dialogDefects();
+  check("every /dc option carries an explanation", defects.length === 0, defects.slice(0, 8).join(" | "));
+  check("the menu surface was actually exercised", selectLog.length > 10, `dialogs=${selectLog.length}`);
 }
 
 const bad = report("/dc command");
