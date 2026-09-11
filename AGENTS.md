@@ -15,10 +15,9 @@ README.md              user-facing documentation (keep it in sync with behavior)
 ```
 
 Everything the guard needs ships in `destructive-check.ts`: no build step, no imports outside
-`node:fs` / `node:path` / `node:os`. Keep it that way — the file is copied verbatim into
-`~/.omp/shared/` and loaded by every omp profile. That is also why it carries its own SHA-256 instead
-of importing `node:crypto`: every audit line is cross-checked against `node:crypto`'s digest by
-`tools/dc-audit.mjs` (t-coverage runs it), so the two implementations have to agree.
+`node:fs` / `node:path` / `node:os` / `node:crypto` / `node:url`. Keep it that way — the file is copied
+verbatim into `~/.omp/shared/` and loaded by every omp profile. The audit chain uses `node:crypto`'s
+SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so the two agree.
 
 ## Invariants (change these only with evidence)
 
@@ -28,11 +27,18 @@ of importing `node:crypto`: every audit line is cross-checked against `node:cryp
    all resolve to "do not run". The single deliberate exception is an internal error in the tool_call
    handler itself (fail-open so a bug cannot brick every tool call), and that path must always write
    a `rule: "internal"` entry to the decision log.
-3. **Verdicts are fail-closed.** Any `DENY` in the reply wins, anchored or not. A stray `ALLOW`
-   mentioned in prose must never open the gate.
+3. **Verdicts are fail-closed and come from the assistant message only.** Any `DENY` in the reply
+   wins, anchored or not. A stray `ALLOW` mentioned in prose must never open the gate. A
+   `reasoning_content` / thinking trace is never evidence: an empty message, a truncated one
+   (`finish_reason: length`, reported with that name) or a reply without a line is an error, not an
+   ALLOW. The whole decision — including the CLI fallback — runs inside one `timeoutMs` budget.
 4. **`mode` picks the action for a rule; classification is mode-independent.** Do not encode
-  per-mode parsing paths. `medium` escalates destructive git commands to the checker: they destroy
-  uncommitted work, which is exactly what this guard exists for.
+   per-mode parsing paths. `medium` escalates destructive git commands to the checker: they destroy
+   uncommitted work, which is exactly what this guard exists for.
+   `resolveAction` merges **every** effect a call produced and takes the most restrictive action, with
+   ties broken by rule order: an allowed target must never release a blocked one. `artifactDelete` is
+   a real rule on that path (a delete whose targets are all artifacts), not an early return, so
+   `custom` can block artifact cleanup.
 5. **`git` subcommands return from the scanner unconditionally.** Once a `git` command word is seen,
   the rest goes to `isDestructiveGit` and the scan stops — no path rule applies to git arguments or
   targets. That decision list *is* the coverage: a missing subcommand is invisible, not merely
@@ -48,21 +54,32 @@ of importing `node:crypto`: every audit line is cross-checked against `node:cryp
    `reg delete HK*`, `cipher /w`) is matched on command positions, so a quoted mention inside a commit
    message is not a hit; it never reaches the model layer. New signatures go in with a test for the
    command and one for the nearest quoted decoy.
-8. **A decision is never lost to I/O.** The audit append, the rotation and the config write all fail
-   soft: the guard keeps deciding, and `/dc → status` shows what failed. The audit chain (`prev` +
-   `chain` per line, SHA-256) is what makes an edit visible; do not trade it for a "simpler" counter,
-   and keep `tools/dc-audit.mjs` an independent implementation (node:crypto, not a copy of the guard's).
-9. **Probes are not destructive calls.** `command -v|which|type|hash <name>` runs nothing and must pass
+8. **A decision is never lost to I/O, and the record survives two writers.** The audit append, the
+   rotation and the config write all fail soft: the guard keeps deciding, and `/dc → status` shows what
+   failed. The chain (`prev` + `chain` per line, SHA-256) is what makes an edit visible; do not trade it
+   for a "simpler" counter, and keep `tools/dc-audit.mjs` an independent walk. The previous hash is read
+   from the **tail of the file** for every append, never cached in memory: two omp sessions share one
+   log, and a cached hash would let the second writer chain onto a line that is no longer last. Command
+   text is masked for credentials (`token=`, `api_key:`, `bearer …`) and the file is created `0600` —
+   the log records the decision, not the secret.
+9. **Integrity is about the file that is running.** `guardIntegrity()` hashes the loaded copy
+   (`import.meta.url`) against the manifest next to *it*; the shared install directory is a layout, not
+   an assumption. A copy with no manifest beside it is `unmanaged` — never `ok` by comparing against a
+   manifest that describes some other file. The lock and the restore act on the same loaded path.
+10. **The installer never silently unlocks.** A guard locked from `/dc` is read-only on purpose:
+   `install.mjs` refuses to replace it without `--unlock`, and restores the previous mode after the
+   copy (locked stays locked). `--restore` preserves it too.
+11. **Probes are not destructive calls.** `command -v|which|type|hash <name>` runs nothing and must pass
    without a model call; only the query flags count, so `command -p rm -rf x` stays on the launcher
    path. The false positive this removes is what taught a real agent to move its payload into a script.
-10. **Every option in a dialogue explains itself.** The `/dc` menus and the approval prompt are the
+12. **Every option in a dialogue explains itself.** The `/dc` menus and the approval prompt are the
    only configuration surface users touch; `tests/t-menu.mjs` and `tests/t-llm.mjs` both call
    `dialogDefects()` from the harness and fail on any label without a description.
-11. **The status line carries the mode, nothing else.** `ctx.ui.setStatus(dc, …)` renders next to the
+13. **The status line carries the mode, nothing else.** `ctx.ui.setStatus(dc, …)` renders next to the
    model segment (`statusLine.preset: custom`, `showHookStatus: false`); the resting text is
    `dc: <mode>` and decisions append `· blocked · <rule label>`. Integrity, lock state and the audit
    path belong in `/dc → status`, not on that line.
-12. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
+14. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
    the "do not retry this through another tool" sentence. Tests and users match on that shape.
 
 ## Checker wiring (the parts that actually bite)
@@ -75,7 +92,16 @@ of importing `node:crypto`: every audit line is cross-checked against `node:cryp
   The client also sends `user-agent`. An unknown gateway gets exactly one retry with a session id.
 - **Never cap output tokens by default.** A tight cap truncates reasoning models before they emit the
   verdict line; `maxOutputTokens: 0` (default) omits the field. Anthropic still needs `max_tokens`,
-  so it gets a generous ceiling.
+  so it gets a generous ceiling. When a provider does truncate (`finish_reason: length`), the checker
+  reports that: an empty message is an error, never a silent ALLOW.
+- **Only the assistant message is a verdict.** `reasoning_content` is dropped — a verdict parsed out of
+  a thinking trace is text the model wrote while thinking, not a decision.
+- **The CLI binary is resolved, not assumed.** `OMP_DC_BIN` / `OMP_BIN` win; otherwise
+  `process.execPath` when it *is* omp (the normal case, extensions run inside omp), else `omp` from
+  PATH. A test runner or editor host must not spawn its own runtime as the checker.
+- **Command words are read the way the shell reads them.** An unquoted `r\m`/`"r""m"` is `rm`: the
+  tokenizer keeps the literal text for targets (a Windows path keeps its separators) and a
+  backslash-collapsed `word` for command-position tests. Use `t.word ?? t.text` for the latter.
 - Prompts are deliberately tiny (action + cwd + fired rule + one line of intent) and verdicts are
   cached per `(cwd, action)`. Spend fewer tokens there, not by starving the reply.
 
@@ -86,6 +112,7 @@ node tests/t-static.mjs        # policy layers, classification, coverage, intern
 node tests/t-llm.mjs           # checker: wire contract, verdicts, failure policy, cache, prompt
 node tests/t-menu.mjs          # /dc menu: every setting persists, self-test, escape handling
 node tests/t-coverage.mjs      # script bodies, hub launches, probes, catastrophic class, audit log
+node tests/t-review.mjs        # the external review's findings D01–D23, one block per finding
 node tests/t-isolation.mjs     # deny-ACE mechanics from the README runbook (Windows only)
 node tests/mutation-check.mjs  # test-quality gate (see below)
 node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cases skip
@@ -102,9 +129,13 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 - **A check must be able to fail.** Before adding one, name the plausible bug it catches. No
   tautologies (`x !== undefined` on a value you just built), no re-asserting the same path across
   modes, no asserting source text or mock echoes.
-- `tests/mutation-check.mjs` enforces that: it breaks the extension in 16 places and requires the
+- `tests/mutation-check.mjs` enforces that: it breaks the extension in 25 places and requires the
   suites to catch every break. **Run it after touching policy or checker code**; a "PATTERN NOT
   FOUND" line means the mutation went stale and the gate fails.
+- The harness **fails closed**: `loadExt`'s default `exec` stub returns exit code 1, so a test that
+  silently depends on the CLI checker fails instead of passing on a stub's `ALLOW`. Pass an explicit
+  `exec` to test the CLI path, and pass `extPath` to load a copy (the installed layout) when the case
+  is about the guard's own file.
 - `t-e2e` drives real models that sometimes refuse to run destructive commands at all. Those cases
   are reported as `SKIP` (guard never exercised) — never fake a pass there, and never "fix" a skip by
   weakening the assertion.
