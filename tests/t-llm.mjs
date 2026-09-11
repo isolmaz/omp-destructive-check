@@ -89,6 +89,26 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
   check("askOnDeny=off blocks without prompting", p.blocked);
 }
 
+{
+  // The previous parser trusted the first verdict line, so a model that named the
+  // verdict it rejected ("an ALLOW would be wrong here … DENY:") could open the gate.
+  const p = await run({ config: cfg({ askOnDeny: false }), handler: () => ok("ALLOW: looks like a generated dir\nwait — DENY: untracked work inside") });
+  check("a reply that names both verdicts fails closed", p.blocked, JSON.stringify(p.result));
+}
+{
+  // A stuck provider must not hold the command hostage: the request carries an
+  // abort signal that fires at the configured timeout.
+  let signal;
+  await run({ config: cfg({ timeoutMs: 150 }), handler: (_url, init) => { signal = init?.signal; return ok("ALLOW: fine"); } });
+  const outcome = await new Promise((resolve) => {
+    if (!signal) return resolve("no signal on the request");
+    if (signal.aborted) return resolve("aborted");
+    const timer = setTimeout(() => resolve("never aborted"), 1500);
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve("aborted"); }, { once: true });
+  });
+  check("the request aborts at the configured timeout", outcome === "aborted", outcome);
+}
+
 // --------------------------------------------------------- failure policy ---
 {
   const p = await run({ handler: () => err(401, "unauthorized: invalid api key"), hasUI: false, exec: async () => ({ stdout: "", stderr: "cli down", code: 1, killed: false }) });
@@ -141,8 +161,7 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
   check("prompt carries the action", /action: rm -rf/.test(prompt));
   check("prompt carries the agent intent", prompt.includes("cleanup generated output"));
   check("prompt stays inside the token budget", prompt.length <= 900, `len=${prompt.length}`);
-  check("system prompt is the checker contract", typeof body.messages?.[0]?.content === "string" && /safety reviewer/.test(body.messages[0].content));
-  check("completion carries an abort timeout", p.ctx !== undefined);
+  check("checker contract is sent in the system role", body.messages?.[0]?.role === "system" && String(body.messages[0].content).length > 200);
 }
 {
   const p = await run({ config: cfg({ includeIntent: false }), handler: () => ok("ALLOW: fine"), event: bash("rm -rf src", "should not appear") });

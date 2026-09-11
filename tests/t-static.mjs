@@ -21,12 +21,15 @@ async function run(event, { config = cfg(), cwd = CWD, selects = [], hasUI = tru
   const ext = await loadExt({ home: HOME, config, registry: REG });
   const ctx = makeCtx({ cwd, hasUI, selects: [...selects], registry: REG });
   const result = await callTool(ext, event, ctx);
-  return { ctx, result, completions: checkerRequests().length, blocked: result?.block === true };
+  return { ext, ctx, result, completions: checkerRequests().length, blocked: result?.block === true };
 }
 
 const cmd = (command) => bash(command, "cleanup");
+const pick = (prefix) => (options) => options.map((o) => String(o?.label ?? o)).find((l) => l.startsWith(prefix));
 
-// ------------------------------------------------------- outside-project ---
+// Every form below must be classified as an outside-the-project delete. The
+// action for that rule is pinned once per mode, with a representative command:
+// classification and preset action are independent knobs.
 for (const [command, label] of [
   ["rm -rf C:\\other\\project\\data", "absolute path outside the project"],
   ["rm -rf ../../outside", "relative path leaving the project"],
@@ -37,10 +40,12 @@ for (const [command, label] of [
   ['bash -c "cd / && rm -rf boot"', "shell payload outside the project"],
   ["sudo -u root rm -rf /var/log", "wrapper args outside the project"],
 ]) {
-  for (const mode of ["simple", "medium", "hard"]) {
-    const p = await run(cmd(command), { config: cfg({ mode }) });
-    check(`[${mode}] outside delete blocked: ${label}`, p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 200));
-  }
+  const p = await run(cmd(command), { config: cfg({ mode: "medium" }) });
+  check(`outside delete blocked: ${label}`, p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 200));
+}
+for (const mode of ["simple", "medium", "hard"]) {
+  const p = await run(cmd("rm -rf C:\\other\\project\\data"), { config: cfg({ mode }) });
+  check(`[${mode}] outside delete blocked without a model call`, p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 200));
 }
 
 // -------------------------------------------------------- inside-project ---
@@ -58,7 +63,7 @@ for (const [command, label] of INSIDE) {
   }
 }
 
-// -------------------------------------------------------------- artifacts ---
+// Same split as above: artifact classification per form, preset action once.
 for (const [command, label] of [
   ["rm -rf node_modules", "node_modules"],
   ["rm -rf dist build .next", "build outputs"],
@@ -68,10 +73,12 @@ for (const [command, label] of [
   ["npx rimraf dist", "package runner on an artifact"],
   ["rm -rf node_modules/*", "wildcard under an artifact"],
 ]) {
-  for (const mode of ["simple", "medium", "hard"]) {
-    const p = await run(cmd(command), { config: cfg({ mode }) });
-    check(`[${mode}] artifact delete allowed without a model: ${label}`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
-  }
+  const p = await run(cmd(command), { config: cfg({ mode: "medium" }) });
+  check(`artifact delete allowed without a model: ${label}`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
+}
+for (const mode of ["simple", "medium", "hard"]) {
+  const p = await run(cmd("rm -rf node_modules"), { config: cfg({ mode }) });
+  check(`[${mode}] artifact delete allowed without a model call`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
 }
 
 // Artifact-named targets OUTSIDE the project are not artifacts.
@@ -90,7 +97,8 @@ for (const command of ["rm -rf D:\\userdata\\out", "rm -rf C:\\Users\\dev\\.cach
   check("hard: dynamic target blocked", hard.blocked && hard.completions === 0, JSON.stringify(hard.result));
 }
 
-// -------------------------------------------------------------------- git ---
+// Each destructive git form must reach the gitDestructive rule; the preset
+// action for that rule is pinned once per mode.
 for (const [command, label] of [
   ["git clean -fdx", "git clean"],
   ["git reset --hard HEAD~1", "git reset --hard"],
@@ -98,12 +106,12 @@ for (const [command, label] of [
   ["git branch -D feature", "git branch -D"],
   ["git stash drop", "git stash drop"],
 ]) {
-  for (const mode of ["simple", "medium"]) {
-    const p = await run(cmd(command), { config: cfg({ mode }) });
-    check(`[${mode}] git command allowed: ${label}`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
-  }
-  const hard = await run(cmd(command), { config: cfg({ mode: "hard" }) });
-  check(`[hard] git command blocked: ${label}`, hard.blocked, JSON.stringify(hard.result)?.slice(0, 160));
+  const p = await run(cmd(command), { config: cfg({ mode: "medium" }) });
+  check(`git command allowed without a model: ${label}`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
+}
+for (const mode of ["simple", "medium", "hard"]) {
+  const p = await run(cmd("git clean -fdx"), { config: cfg({ mode }) });
+  check(`[${mode}] destructive git ${mode === "hard" ? "blocked" : "allowed"}`, p.blocked === (mode === "hard"), JSON.stringify(p.result)?.slice(0, 160));
 }
 {
   const p = await run(cmd("git status --porcelain"), { config: cfg({ mode: "hard" }) });
@@ -216,6 +224,40 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
   const ctx = makeCtx({ cwd: CWD });
   const r = await callTool(ext, cmd("rm -rf /etc"), ctx);
   check("enabled=false disables the guard", r === undefined);
+}
+
+// --------------------------------------------------------- internal error ---
+{
+  // A malformed tool event must not brick the session, and must not disappear
+  // silently either: the call proceeds unguarded, but the failure is recorded
+  // where a human reviewing /dc can see it.
+  // A command value that explodes when the guard reads it: the analyzers call
+  // String() on it long before any decision is made.
+  const hostile = {
+    toolName: "bash",
+    input: {
+      i: "run command",
+      command: {
+        toString() {
+          throw new Error("malformed tool event");
+        },
+      },
+    },
+  };
+  const p = await run(hostile, { config: cfg({ mode: "hard" }) });
+  check("internal error fails open (the command is not bricked)", !p.blocked, JSON.stringify(p.result));
+  check(
+    "internal error is reported to the UI",
+    p.ctx.notes.some((n) => /internal error/.test(n.message) && n.level === "warning"),
+    JSON.stringify(p.ctx.notes).slice(0, 200),
+  );
+
+  let confirmText = "";
+  const menuCtx = makeCtx({ cwd: CWD, registry: REG, selects: [pick("recent decisions"), pick("close")] });
+  menuCtx.ui.confirm = async (_title, message) => ((confirmText = String(message)), true);
+  await callTool({ toolCall: p.ext.toolCall }, hostile, menuCtx);
+  await p.ext.commands.get("dc").handler("", menuCtx);
+  check("internal error reaches the decision log", /internal/.test(confirmText), confirmText.slice(0, 200));
 }
 
 const bad = report("policy modes");

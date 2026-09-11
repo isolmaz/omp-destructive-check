@@ -154,11 +154,13 @@ status                      full configuration dump
 node tests/t-static.mjs   # policy layers: modes, rules, coverage, path classification
 node tests/t-llm.mjs      # checker: HTTP verdicts, fallback, failure policy, cache, prompt
 node tests/t-menu.mjs     # /dc menu: modes, rule edits, toggles, persistence
-node tests/t-e2e.mjs      # real omp sessions against a real provider (slower, needs auth)
+node tests/mutation-check.mjs  # breaks the extension in 9 places and requires the suites to fail
+node tests/t-e2e.mjs           # real omp sessions against a real provider (slower, needs auth)
 ```
 
 `t-static` / `t-llm` / `t-menu` use an isolated `HOME`, a stubbed extension host and a stubbed
-`fetch`, so they run offline.
+`fetch`, so they run offline. `mutation-check` re-runs them against deliberately broken copies of
+the extension: a check that still passes is a check that asserts nothing.
 `t-e2e` spawns real sessions (`DC_E2E_MODEL`, default `opencode-go/deepseek-v4.1-flash`).
 
 ## Known limitations
@@ -176,10 +178,11 @@ node tests/t-e2e.mjs      # real omp sessions against a real provider (slower, n
 - The in-process engine speaks OpenAI-compatible and Anthropic Messages APIs. Providers behind OAuth
   flows (Gemini CLI, Codex, Cursor) always take the CLI path.
 
-## Layout
+## Repository layout
 
 ```
 destructive-check.ts   the extension (single file, no dependencies)
 install.mjs            copy it into ~/.omp/shared and print the config snippet
-tests/                 harness + suites
+tests/                 harness + suites + the mutation gate
+AGENTS.md              invariants and conventions for agents working on the repo
 ```
