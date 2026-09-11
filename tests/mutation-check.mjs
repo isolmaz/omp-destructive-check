@@ -22,7 +22,7 @@ const mutations = [
     name: "internal error is no longer logged",
     suite: "tests/t-static.mjs",
     expect: "internal error reaches the decision log",
-    from: "      logDecision({ tool: String(event?.toolName ?? \"?\"), rule: \"internal\", action: \"error\", detail });",
+    from: "      logDecision({ tool: String(event?.toolName ?? \"?\"), rule: \"internal\", action: \"error\", detail, command: typeof raw === \"string\" ? raw.slice(0, 240) : \"\", cwd: ctx?.cwd });",
     to: "",
   },
   {
@@ -120,8 +120,8 @@ const mutations = [
     name: "medium lets destructive git through again",
     suite: "tests/t-static.mjs",
     expect: "destructive git reaches the checker in medium",
-    from: '    gitDestructive: "model",\n    scriptExec: "allow",\n    codeDelete: "block",',
-    to: '    gitDestructive: "allow",\n    scriptExec: "allow",\n    codeDelete: "block",',
+    from: '    gitDestructive: "model",\n    scriptExec: "model",\n    codeDelete: "block",',
+    to: '    gitDestructive: "allow",\n    scriptExec: "model",\n    codeDelete: "block",',
   },
   {
     name: "an approval option loses its explanation",
@@ -129,6 +129,62 @@ const mutations = [
     expect: "carries an explanation",
     from: '    { label: "Block", description: "refuse the command; nothing is executed" },',
     to: '    { label: "Block" },',
+  },
+  {
+    name: "script bodies are opened again by nobody",
+    suite: "tests/t-coverage.mjs",
+    expect: "script body: `sh ./loop.sh` is judged by what it runs",
+    from: "  scanScoped(body.text, scope, depth + 1, found);",
+    to: "  void body.text;",
+  },
+  {
+    name: "an unreadable script is waved through",
+    suite: "tests/t-coverage.mjs",
+    expect: "script body: an unreadable script is scriptExec, not a pass",
+    from: '    record({ verb: "script", reason: `could not read ${abs || rawPath}` });\n    return;',
+    to: "    return;",
+  },
+  {
+    name: "the script chain depth limit disappears",
+    suite: "tests/t-coverage.mjs",
+    expect: "script body: a chain past the analysis limit fails closed",
+    from: "  if (state.depth + 1 > MAX_SCRIPT_DEPTH) {",
+    to: "  if (false) {",
+  },
+  {
+    name: "the probe whitelist is dropped",
+    suite: "tests/t-coverage.mjs",
+    expect: "probe: `command -v rm` runs nothing and is not blocked",
+    from: "    if (PROBE_RE.test(cmd) && isProbe(toks.slice(i + 1))) return found;",
+    to: "    if (false) return found;",
+  },
+  {
+    name: "hub launches are not analysed",
+    suite: "tests/t-coverage.mjs",
+    expect: "hub: a launch is scanned like a command",
+    from: '  if (name === "hub" && CFG.coverage.processes) {',
+    to: "  if (false) {",
+  },
+  {
+    name: "the catastrophic class is never consulted",
+    suite: "tests/t-coverage.mjs",
+    expect: "catastrophic [hard]: fork bomb",
+    from: "  const out = catastrophicViolations(command);",
+    to: "  const out = [];",
+  },
+  {
+    name: "a catastrophic command inside a script body is dropped",
+    suite: "tests/t-coverage.mjs",
+    expect: "script body: a catastrophic command inside a script is caught",
+    from: '    found.push({ verb: "catastrophic", detail: hit.detail, sub: rawPath, scope, script: state.script });',
+    to: "    void hit;",
+  },
+  {
+    name: "decisions stop being appended to the audit log",
+    suite: "tests/t-coverage.mjs",
+    expect: "audit: a blocked decision is appended to the log file",
+    from: '    nodeFs.appendFileSync(LOG_FILE, auditLine(core) + "\\n");',
+    to: "",
   },
 ];
 
@@ -145,6 +201,13 @@ for (const m of mutations) {
     output = execFileSync(process.execPath, [m.suite], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (err) {
     output = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+  }
+  // A suite that dies before printing its report proves nothing: without the
+  // report there are no FAIL lines, and "no FAIL lines" is exactly what a
+  // surviving mutation looks like. Count it as a crash, never as a catch.
+  if (!/\d+\/\d+ passed/.test(output)) {
+    rows.push({ mutation: m.name, result: "CRASHED (no report printed — not evidence)" });
+    continue;
   }
   const failed = new RegExp(`FAIL `).test(output) && new RegExp(m.expect.slice(0, 30).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).test(output.split("FAIL").slice(1).join("FAIL"));
   rows.push({ mutation: m.name, result: failed ? "caught (suite failed as expected)" : "NOT CAUGHT — the check is vacuous" });

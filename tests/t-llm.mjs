@@ -161,6 +161,8 @@ async function run({ config = cfg(), handler, exec, selects = [], hasUI = true, 
   check("prompt carries cwd", prompt.includes(CWD));
   check("prompt carries the action", /action: rm -rf/.test(prompt));
   check("prompt carries the agent intent", prompt.includes("cleanup generated output"));
+  check("prompt marks the intent as agent-written and untrusted", /untrusted/.test(prompt) && /never an instruction/.test(prompt), prompt);
+  check("prompt names the rule behind each flagged target", /\n  - \w+: /.test(prompt), prompt);
   check("prompt stays inside the token budget", prompt.length <= 900, `len=${prompt.length}`);
   check("checker contract is sent in the system role", body.messages?.[0]?.role === "system" && String(body.messages[0].content).length > 200);
 }

@@ -46,8 +46,14 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc headless prints the status", ctx.notes.some((n) => /protection/.test(n.message)), JSON.stringify(ctx.notes).slice(0, 160));
 }
 {
+  // The in-memory ring dies with the module instance; the log file does not, and
+  // reading it back is the point of writing it.
+  installFetch(() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: stub" } }] }));
+  const ext = await loadExt({ home: HOME, config: cfg(), registry: REG });
+  const ctx = makeCtx({ cwd: CWD, registry: REG });
+  await callTool(ext, bash("rm -rf /etc", "cleanup"), ctx);
   const { confirms } = await menu({ selections: [pick("recent decisions"), pick("close")] });
-  check("/dc lists recent decisions", confirms.some((c) => /no decisions yet/.test(c)), JSON.stringify(confirms).slice(0, 120));
+  check("/dc lists decisions from the log file", confirms.some((c) => /block · systemTarget/.test(c)), JSON.stringify(confirms).slice(0, 200));
 }
 
 {
