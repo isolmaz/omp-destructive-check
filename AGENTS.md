@@ -8,14 +8,17 @@ three layers, cheapest first — static deny, static allow, then one bounded mod
 
 ```
 destructive-check.ts   the whole extension (single file, zero dependencies)
-install.mjs            copies the extension into ~/.omp/shared/ and prints the config snippet
+install.mjs            copies the extension into ~/.omp/shared/, writes the manifest, --restore
+tools/dc-audit.mjs     independent audit-log verifier (node:crypto, exit 1 on a broken chain)
 tests/                 stubbed-host suites + real-session e2e + a mutation gate
 README.md              user-facing documentation (keep it in sync with behavior)
 ```
 
 Everything the guard needs ships in `destructive-check.ts`: no build step, no imports outside
 `node:fs` / `node:path` / `node:os`. Keep it that way — the file is copied verbatim into
-`~/.omp/shared/` and loaded by every omp profile.
+`~/.omp/shared/` and loaded by every omp profile. That is also why it carries its own SHA-256 instead
+of importing `node:crypto`: every audit line is cross-checked against `node:crypto`'s digest by
+`tools/dc-audit.mjs` (t-coverage runs it), so the two implementations have to agree.
 
 ## Invariants (change these only with evidence)
 
@@ -36,16 +39,30 @@ Everything the guard needs ships in `destructive-check.ts`: no build step, no im
   misclassified, and a lost flag test (`branch -d` vs `-D`, `restore --staged` vs bare `restore`,
   `switch -f`) is a silent hole. Add a case here and a row in the git tests together.
 6. **The scanner never fails open by accident.** Bailing out — wrapper nesting past `MAX_SCAN_DEPTH`,
-  unresolvable targets, escaped shell bodies — records a violation for `dynamicTargets` instead of
-  returning clean.
-7. **Every option in a dialogue explains itself.** The `/dc` menus and the approval prompt are the
+   unresolvable targets, escaped shell bodies — records a violation for `dynamicTargets` instead of
+   returning clean. Script bodies are the same rule: a body that cannot be read (missing, over 64 KiB,
+   binary, nested past `MAX_SCRIPT_DEPTH`, changed while being read) records `scriptExec`, and a body
+   that *can* be read is judged by its own rules — never by the fact that it is a script.
+7. **Signatures with no legitimate use are denied statically, in every mode.** The `catastrophic`
+   class (fork bombs, `mkfs`, `dd of=/dev/…`, `format C:`, `diskpart`, `shutdown`/`reboot`,
+   `reg delete HK*`, `cipher /w`) is matched on command positions, so a quoted mention inside a commit
+   message is not a hit; it never reaches the model layer. New signatures go in with a test for the
+   command and one for the nearest quoted decoy.
+8. **A decision is never lost to I/O.** The audit append, the rotation and the config write all fail
+   soft: the guard keeps deciding, and `/dc → status` shows what failed. The audit chain (`prev` +
+   `chain` per line, SHA-256) is what makes an edit visible; do not trade it for a "simpler" counter,
+   and keep `tools/dc-audit.mjs` an independent implementation (node:crypto, not a copy of the guard's).
+9. **Probes are not destructive calls.** `command -v|which|type|hash <name>` runs nothing and must pass
+   without a model call; only the query flags count, so `command -p rm -rf x` stays on the launcher
+   path. The false positive this removes is what taught a real agent to move its payload into a script.
+10. **Every option in a dialogue explains itself.** The `/dc` menus and the approval prompt are the
    only configuration surface users touch; `tests/t-menu.mjs` and `tests/t-llm.mjs` both call
    `dialogDefects()` from the harness and fail on any label without a description.
-8. **The status line carries the mode, nothing else.** `ctx.ui.setStatus(dc, …)` renders next to the
+11. **The status line carries the mode, nothing else.** `ctx.ui.setStatus(dc, …)` renders next to the
    model segment (`statusLine.preset: custom`, `showHookStatus: false`); the resting text is
-   `dc: <mode>` and decisions append `· blocked · <rule label>`. Keep it short — the model segment is
-   already on that line.
-9. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
+   `dc: <mode>` and decisions append `· blocked · <rule label>`. Integrity, lock state and the audit
+   path belong in `/dc → status`, not on that line.
+12. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
    the "do not retry this through another tool" sentence. Tests and users match on that shape.
 
 ## Checker wiring (the parts that actually bite)
@@ -68,6 +85,8 @@ Everything the guard needs ships in `destructive-check.ts`: no build step, no im
 node tests/t-static.mjs        # policy layers, classification, coverage, internal errors
 node tests/t-llm.mjs           # checker: wire contract, verdicts, failure policy, cache, prompt
 node tests/t-menu.mjs          # /dc menu: every setting persists, self-test, escape handling
+node tests/t-coverage.mjs      # script bodies, hub launches, probes, catastrophic class, audit log
+node tests/t-isolation.mjs     # deny-ACE mechanics from the README runbook (Windows only)
 node tests/mutation-check.mjs  # test-quality gate (see below)
 node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cases skip
 ```

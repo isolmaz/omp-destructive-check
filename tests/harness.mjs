@@ -28,6 +28,10 @@ export const mkHome = (name) => path.join(process.env.DC_TEST_ROOT ?? path.join(
 // (every option explained) without re-walking the menus by hand.
 export const selectLog = [];
 
+// Same for the confirm panels: /dc reports (status, integrity, audit chain) go
+// through confirm, and their text is part of what the suite checks.
+export const confirmLog = [];
+
 // Options that offer no explanation. Dialogues are the only configuration surface
 // users touch, so an unexplained choice is a defect; every suite asserts this for
 // the dialogues it exercises.
@@ -123,7 +127,10 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
       return typeof next === "function" ? next(options) : next;
     },
     input: async () => (inputs.length ? inputs.shift() : undefined),
-    confirm: async () => true,
+    confirm: async (title, message) => {
+      confirmLog.push({ title: String(title), message: String(message ?? "") });
+      return true;
+    },
   };
   return {
     ui,
