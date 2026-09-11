@@ -91,6 +91,19 @@ for (const command of ["rm -rf D:\\userdata\\out", "rm -rf C:\\Users\\dev\\.cach
   }
 }
 
+// macOS exposes homes as /Users/<name>. A project inside one must be classified by
+// scope (artifact / inside the project), not rejected up front as a filesystem root:
+// `~` expands to the same shape, so this is the common case there, not an edge one.
+{
+  const posixCwd = "C:\\Users\\dev\\proj";
+  const inside = await run(cmd("rm -rf /Users/dev/proj/dist"), { config: cfg({ mode: "medium" }), cwd: posixCwd });
+  check("posix home path inside the project is not treated as a root", !inside.blocked && inside.completions === 0, JSON.stringify(inside.result)?.slice(0, 200));
+  const home = await run(cmd("rm -rf /Users/dev"), { config: cfg({ mode: "simple" }) });
+  check("a bare posix home stays protected", home.blocked, JSON.stringify(home.result)?.slice(0, 200));
+  const windows = await run(cmd("rm -rf /Windows/System32"), { config: cfg({ mode: "simple" }) });
+  check("posix-style /Windows path stays protected", windows.blocked, JSON.stringify(windows.result)?.slice(0, 200));
+}
+
 // ---------------------------------------------------------------- dynamic ---
 {
   const medium = await run(cmd('rm -rf "$UNSET_VAR/data"'), { config: cfg({ mode: "medium" }) });
@@ -98,9 +111,28 @@ for (const command of ["rm -rf D:\\userdata\\out", "rm -rf C:\\Users\\dev\\.cach
   const hard = await run(cmd('rm -rf "$UNSET_VAR/data"'), { config: cfg({ mode: "hard" }) });
   check("hard: dynamic target blocked", hard.blocked && hard.completions === 0, JSON.stringify(hard.result));
 }
+{
+  // Wrappers nest: five levels of shell wrapping is past the scanner's depth
+  // limit, and the cutoff must escalate, not wave the payload through.
+  const nested = (levels) => {
+    let inner = "rm -rf /etc";
+    for (let i = 1; i < levels; i++) inner = `bash -c ${JSON.stringify(inner)}`;
+    return inner;
+  };
+  const escaped = nested(2); // bash -c "bash -c \"rm -rf /etc\""
+  const deep = nested(5);
+  const shallow = await run(cmd(nested(1)), { config: cfg({ mode: "simple" }) });
+  check("a single wrapper resolves its payload", shallow.blocked && /systemTarget/.test(shallow.result?.reason ?? ""), shallow.result?.reason);
+  const two = await run(cmd(escaped), { config: cfg({ mode: "simple" }) });
+  check("escaped quotes do not hide a nested payload", two.blocked && /systemTarget/.test(two.result?.reason ?? ""), `${JSON.stringify(two.result)?.slice(0, 160)} cmd=${escaped}`);
+  const hard = await run(cmd(deep), { config: cfg({ mode: "hard" }) });
+  check("hard: too-deep nesting is blocked, not ignored", hard.blocked && hard.completions === 0, `${JSON.stringify(hard.result)?.slice(0, 160)} cmd=${deep.slice(0, 90)}`);
+  const medium = await run(cmd(deep), { config: cfg({ mode: "medium" }) });
+  check("medium: too-deep nesting escalates to the model", medium.completions === 1, `completions=${medium.completions} blocked=${medium.blocked} cmd=${deep.slice(0, 90)}`);
+}
 
-// Each destructive git form must reach the gitDestructive rule; the preset
-// action for that rule is pinned once per mode.
+// Each destructive git form must reach the gitDestructive rule; the preset action
+// for that rule is pinned once per mode below.
 for (const [command, label] of [
   ["git clean -fdx", "git clean"],
   ["git reset --hard HEAD~1", "git reset --hard"],
@@ -109,11 +141,57 @@ for (const [command, label] of [
   ["git stash drop", "git stash drop"],
 ]) {
   const p = await run(cmd(command), { config: cfg({ mode: "medium" }) });
-  check(`git command allowed without a model: ${label}`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
+  check(`destructive git reaches the checker in medium: ${label}`, p.completions === 1, `completions=${p.completions} blocked=${p.blocked}`);
 }
 for (const mode of ["simple", "medium", "hard"]) {
   const p = await run(cmd("git clean -fdx"), { config: cfg({ mode }) });
-  check(`[${mode}] destructive git ${mode === "hard" ? "blocked" : "allowed"}`, p.blocked === (mode === "hard"), JSON.stringify(p.result)?.slice(0, 160));
+  const expected = mode === "hard" ? p.blocked && p.completions === 0 : mode === "medium" ? !p.blocked && p.completions === 1 : !p.blocked && p.completions === 0;
+  check(`[${mode}] destructive git ${mode === "hard" ? "blocked" : mode === "medium" ? "escalated to the model" : "allowed without a model"}`, expected, JSON.stringify(p.result)?.slice(0, 160));
+}
+
+// Uncommitted work can be discarded without any flag at all: `restore` defaults
+// to the worktree, `checkout <ref> -- <path>` restores from the index, and
+// `switch -f`/`--discard-changes` throws the working tree away on the way out.
+for (const command of [
+  "git restore src/app.js",
+  "git restore --source=HEAD~1 src/app.js",
+  "git checkout -- src/app.js",
+  "git checkout HEAD -- src/app.js",
+  "git switch -f main",
+  "git switch --discard-changes main",
+  "git worktree remove --force ../wt",
+  "git reflog expire --expire=now --all",
+  "git gc --prune=now",
+  "git filter-branch --force --all",
+]) {
+  const hard = await run(cmd(command), { config: cfg({ mode: "hard" }) });
+  check(`[hard] uncommitted work destroyed: ${command}`, hard.blocked && hard.completions === 0, JSON.stringify(hard.result)?.slice(0, 160));
+  const medium = await run(cmd(command), { config: cfg({ mode: "medium" }) });
+  check(`[medium] escalated to the model: ${command}`, medium.completions === 1, `completions=${medium.completions} blocked=${medium.blocked}`);
+  const simple = await run(cmd(command), { config: cfg({ mode: "simple" }) });
+  check(`[simple] allowed without a model: ${command}`, !simple.blocked && simple.completions === 0, JSON.stringify(simple.result)?.slice(0, 160));
+}
+
+// …but these look similar and destroy nothing, so they must stay silent.
+for (const command of [
+  "git restore --staged src/app.js", // unstage: the working tree is kept
+  "git checkout main", // git refuses when it would lose local changes
+  "git switch main",
+  "git switch -c feature/x",
+  "git branch -d merged-feature", // refuses unmerged branches
+  "git branch --delete merged-feature",
+  "git gc", // plain gc only prunes unreachable objects git already dropped
+  "git reflog",
+  "git worktree remove ../wt", // without --force git refuses a dirty worktree
+]) {
+  const hard = await run(cmd(command), { config: cfg({ mode: "hard" }) });
+  check(`[hard] not destructive, stays silent: ${command}`, !hard.blocked && hard.completions === 0, JSON.stringify(hard.result)?.slice(0, 160));
+}
+{
+  const forced = await run(cmd("git branch --delete --force feature/x"), { config: cfg({ mode: "hard" }) });
+  check("[hard] branch --delete --force is destructive", forced.blocked && forced.completions === 0, JSON.stringify(forced.result)?.slice(0, 160));
+  const forcedShort = await run(cmd("git branch -D feature/x"), { config: cfg({ mode: "hard" }) });
+  check("[hard] branch -D is destructive", forcedShort.blocked, JSON.stringify(forcedShort.result)?.slice(0, 160));
 }
 {
   const p = await run(cmd("git status --porcelain"), { config: cfg({ mode: "hard" }) });

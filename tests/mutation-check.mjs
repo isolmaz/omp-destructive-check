@@ -74,6 +74,55 @@ const mutations = [
     from: '  if (!ctx?.hasUI || !ctx?.ui?.select) return "block";',
     to: '  if (!ctx?.hasUI || !ctx?.ui?.select) return "allow-once";',
   },
+  {
+    name: "bare git restore is no longer destructive",
+    suite: "tests/t-static.mjs",
+    expect: "uncommitted work destroyed: git restore src/app.js",
+    from: "    const stagedOnly = has(/(^|\\s)--staged(\\s|$)/) && !has(/(^|\\s)(--worktree|--source|-s)(\\s|=|$)/);",
+    to: "    const stagedOnly = true;",
+  },
+  {
+    name: "git switch -f loses its force detection",
+    suite: "tests/t-static.mjs",
+    expect: "uncommitted work destroyed: git switch -f main",
+    from: "  if (sub === \"switch\" && has(/(^|\\s)(-f|--force|--discard-changes)(\\s|$)/)) return true;",
+    to: "  if (sub === \"switch\" && false) return true;",
+  },
+  {
+    name: "git checkout -- pathspec restore is missed again",
+    suite: "tests/t-static.mjs",
+    expect: "uncommitted work destroyed: git checkout -- src/app.js",
+    from: "    if (has(/(^|\\s)--(\\s|$)/)) return true;",
+    to: "    if (false) return true;",
+  },
+  {
+    name: "nested shell bodies are not unwrapped",
+    suite: "tests/t-static.mjs",
+    expect: "escaped quotes do not hide a nested payload",
+    from: '        scanScoped(unwrapShellBody(sub.slice(flag.index + flag.raw.length)), scope, depth + 1, found);',
+    to: '        scanScoped(sub.slice(flag.index + flag.raw.length), scope, depth + 1, found);',
+  },
+  {
+    name: "depth cutoff goes back to waving payloads through",
+    suite: "tests/t-static.mjs",
+    expect: "too-deep nesting is blocked",
+    from: '  if (depth > MAX_SCAN_DEPTH) {\n    if (!found.some((f) => f.verb === "depth")) found.push({ verb: "depth", sub: command, scope });\n    return found;\n  }',
+    to: '  if (depth > MAX_SCAN_DEPTH) return found;',
+  },
+  {
+    name: "posix home paths are roots again",
+    suite: "tests/t-static.mjs",
+    expect: "posix home path inside the project is not treated as a root",
+    from: "const ROOT_RE = /^(?:[a-zA-Z]:)?[\\\\/]?$|^\\/$/;",
+    to: "const ROOT_RE = /^(?:[a-zA-Z]:)?[\\\\/]?$|^\\/(Users|Windows)(?:[\\\\/].*)?$/i;",
+  },
+  {
+    name: "medium lets destructive git through again",
+    suite: "tests/t-static.mjs",
+    expect: "destructive git reaches the checker in medium",
+    from: '    gitDestructive: "model",\n    scriptExec: "allow",\n    codeDelete: "block",',
+    to: '    gitDestructive: "allow",\n    scriptExec: "allow",\n    codeDelete: "block",',
+  },
 ];
 
 const rows = [];
