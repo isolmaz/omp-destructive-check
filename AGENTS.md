@@ -38,7 +38,7 @@ Everything the guard needs ships in `destructive-check.ts`: no build step, no im
   (`openai-completions`, `openrouter`) and Anthropic Messages are spoken natively; anything else
   (Gemini CLI OAuth, Codex, Cursor) routes to the CLI engine via `engine: "auto"`.
 - **OpenCode-style gateways require `x-opencode-session`.** Without it they answer
-  `400 MissingSessionID` and every check silently pays for a CLI run (measured 8.6 s vs 1.7 s).
+  `400 MissingSessionID` and every check silently pays for a CLI run (measured 8.6 s vs 1.7-3.0 s).
   The client also sends `user-agent`. An unknown gateway gets exactly one retry with a session id.
 - **Never cap output tokens by default.** A tight cap truncates reasoning models before they emit the
   verdict line; `maxOutputTokens: 0` (default) omits the field. Anthropic still needs `max_tokens`,
@@ -68,7 +68,7 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
   are reported as `SKIP` (guard never exercised) — never fake a pass there, and never "fix" a skip by
   weakening the assertion.
 - After changing the extension: run the three stub suites, the mutation gate, then
-  `DC_E2E_ONLY=checker node tests/t-e2e.mjs` to confirm the in-process path still answers in ~2 s.
+  `DC_E2E_ONLY=checker node tests/t-e2e.mjs` to confirm the in-process path still answers in ~2-3 s.
 
 ## Shipping
 

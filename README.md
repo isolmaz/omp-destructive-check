@@ -7,7 +7,7 @@ It decides **before** a command runs, in three layers — cheapest first:
 | --- | --- | --- |
 | 1. static deny | 0 ms, no model | filesystem roots, system and credential locations, known catastrophic signatures |
 | 2. static allow | 0 ms, no model | build artifacts and temp paths inside the project scope |
-| 3. model | one HTTPS request, ~0.2k tokens, 1.5–2.5 s | everything the static layers cannot classify — in-process, no subprocess, cached |
+| 3. model | one HTTPS request, ~0.2k tokens, 1.7–3.0 s | everything the static layers cannot classify — in-process, no subprocess, cached |
 
 A checker failure or timeout is **never** reported as a model denial: the guard asks the user when a UI is
 available, and otherwise blocks with the real error text so the failure is debuggable.
@@ -127,8 +127,8 @@ status                      full configuration dump
 - **In-process** (default): one HTTPS request straight to the provider, credentials resolved from the
   model registry. No subprocess, no agent session, no tool schemas. OpenAI-compatible
   (`openai-completions`, `openrouter`) and Anthropic Messages providers are spoken natively; anything
-  else falls back to the CLI. Measured against OpenCode Go: 1.5–2.5 s, ~120 input / ~100 output tokens
-  per gray-zone decision.
+  else falls back to the CLI. Measured against OpenCode Go over four real sessions: 1.7–3.0 s,
+  ~120 input / ~100 output tokens per gray-zone decision (the CLI path cost 8.6 s).
 - Requests identify themselves (`user-agent: omp-destructive-check/x`) and carry a stable
   `x-opencode-session` for OpenCode-style gateways, which reject requests without one
   (`400 MissingSessionID`). A gateway that answers `MissingSessionID` is retried once with a session id,
@@ -143,7 +143,7 @@ status                      full configuration dump
 - Verdicts are cached per `(cwd, action)` for the session; `askOnDeny` turns a model denial into a
   user prompt (allow once / allow for this session / block) instead of a blind refusal.
 - Every model decision records its latency, visible in `/dc > recent decisions` and in the tool result
-  (`(checker: 1622 ms)`).
+  (`(checker: 2274 ms)`).
 - Output tokens are **uncapped by default**: a tight ceiling truncates reasoning models before they emit
   the verdict line. Spend fewer tokens by keeping the prompt small (the action line plus a one-line
   intent) and by caching verdicts — not by starving the reply.
