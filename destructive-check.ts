@@ -786,16 +786,30 @@ const CHECKER_SYSTEM_PROMPT = [
 
 const VERDICT_RE = /^[-*•>\s]*(allow|deny)\b\s*(?:[:\-–—]\s*)?(.*)$/i;
 const VERDICT_PROSE_RE = /^(?:or|and|if|unless|when|only)\b/i;
+// A verdict also shows up mid-line ("… wait — DENY: untracked work inside").
+const DENY_ANYWHERE_RE = /\bdeny\b\s*[:\-–—]\s*([^\n]{0,200})/i;
 
 function verdictFromLines(text) {
-  for (const line of String(text ?? "").replace(/\*\*|__|`{1,3}/g, "").split(/\r?\n/)) {
+  const flat = String(text ?? "").replace(/\*\*|__|`{1,3}/g, "");
+  let allow = null;
+  let deny = null;
+  for (const line of flat.split(/\r?\n/)) {
     const m = line.trim().match(VERDICT_RE);
     if (!m) continue;
     const reason = m[2].trim();
     if (reason && VERDICT_PROSE_RE.test(reason)) continue;
-    return { verdict: m[1].toLowerCase(), reason: reason || undefined };
+    const hit = { verdict: m[1].toLowerCase(), reason: reason || undefined };
+    if (hit.verdict === "deny") deny ??= hit;
+    else allow ??= hit;
   }
-  return null;
+  if (!deny) {
+    // Only DENY is honoured off the line start: a stray "ALLOW" somewhere in a
+    // paragraph must never open the gate, while a DENY buried in prose still
+    // closes it — a whole class of reasoning-model answers used to pass here.
+    const m = flat.match(DENY_ANYWHERE_RE);
+    if (m) deny = { verdict: "deny", reason: m[1].trim() || undefined };
+  }
+  return deny ?? allow;
 }
 
 function parseVerdict(text) {
@@ -1456,9 +1470,13 @@ export default function destructiveCheck(pi) {
       if (!plan) return;
       return decide(plan, event, ctx);
     } catch (err) {
-      // The handler itself must not misfire: report, do not block.
+      // The handler itself must not misfire: report, do not block. The failure
+      // is recorded so a silently unprotected call is visible in
+      // "/dc > recent decisions" and not just in a notification.
+      const detail = String(err?.message ?? err).slice(0, 200);
+      logDecision({ tool: String(event?.toolName ?? "?"), rule: "internal", action: "error", detail });
       try {
-        ctx?.ui?.notify?.(`destructive-check: internal error — ${String(err?.message ?? err).slice(0, 200)}`, "warning");
+        ctx?.ui?.notify?.(`destructive-check: internal error — ${detail}`, "warning");
       } catch {
         /* ignore */
       }

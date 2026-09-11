@@ -46,10 +46,6 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc headless prints the status", ctx.notes.some((n) => /protection/.test(n.message)), JSON.stringify(ctx.notes).slice(0, 160));
 }
 {
-  const { ctx } = await menu({ selections: [pick("close")] });
-  check("/dc reports no decision log entries gracefully", ctx.notes !== undefined);
-}
-{
   const { confirms } = await menu({ selections: [pick("recent decisions"), pick("close")] });
   check("/dc lists recent decisions", confirms.some((c) => /no decisions yet/.test(c)), JSON.stringify(confirms).slice(0, 120));
 }
@@ -145,11 +141,38 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc keeps the other provider entry", config.providers?.["opencode-go"]?.model === "deepseek-v4.1-flash", JSON.stringify(config.providers));
 }
 
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("engine:"), "cli", pick("back"), pick("close")] });
+  check("/dc persists the checker engine", config.engine === "cli", JSON.stringify(config.engine));
+}
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("token cap"), "512", pick("back"), pick("close")], inputs: ["512"] });
+  check("/dc persists the output token cap", config.maxOutputTokens === 512, JSON.stringify(config.maxOutputTokens));
+}
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("reasoning:"), "low", pick("back"), pick("close")] });
+  check("/dc persists the reasoning effort", config.reasoning === "low", JSON.stringify(config.reasoning));
+}
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("timeout:"), pick("back"), pick("close")], inputs: ["2500"] });
+  check("/dc persists the checker timeout", config.timeoutMs === 2500, JSON.stringify(config.timeoutMs));
+}
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("timeout:"), pick("back"), pick("close")], inputs: ["not a number"] });
+  check("/dc ignores a nonsense timeout", config.timeoutMs === undefined, JSON.stringify(config.timeoutMs));
+}
+
 // ------------------------------------------------------- escapes and safety --
 {
-  const { ext, config } = await menu({ selections: [] });
-  check("/dc with no selections leaves the config untouched", JSON.stringify(config) === JSON.stringify(cfg()), JSON.stringify(config));
-  check("/dc never throws on escape", Boolean(ext.commands.has("dc")));
+  let threw = null;
+  let result = null;
+  try {
+    result = await menu({ selections: [undefined, undefined], inputs: [undefined] });
+  } catch (err) {
+    threw = err;
+  }
+  check("/dc survives closing the menu without choosing anything", !threw, String(threw));
+  check("/dc with no selections leaves the config untouched", result && JSON.stringify(result.config) === JSON.stringify(cfg()), JSON.stringify(result?.config));
 }
 
 const bad = report("/dc command");
