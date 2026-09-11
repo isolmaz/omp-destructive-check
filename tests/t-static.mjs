@@ -1,10 +1,12 @@
 // Policy layers: protection modes, rule actions, coverage, target classification.
 // Every probe loads a fresh module instance (verdict caches are module-global).
+import * as os from "node:os";
+import * as path from "node:path";
 import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, checkerRequests, check, report, results } from "./harness.mjs";
 
 const HOME = mkHome("static");
 const CWD = "C:\\scratch\\proj";
-const TEMP_DIR = "C:\\Users\\dev\\AppData\\Local\\Temp\\dc-scratch";
+const TEMP_DIR = path.join(os.tmpdir(), "dc-scratch");
 const REG = fakeRegistry([["opencode-go", "deepseek-v4.1-flash"]]);
 
 const cfg = (extra = {}) => ({
@@ -36,7 +38,7 @@ for (const [command, label] of [
   ["rm -rf /etc", "posix system directory"],
   ["rm -rf C:\\Windows\\System32", "windows system directory"],
   ["rm -rf ~/.ssh", "credential directory"],
-  ["del /f /s /q C:\\Users\\dev\\Documents", "cmd delete outside the project"],
+  ['del /f /s /q C:\\Users\\dev\\Documents', "cmd delete outside the project"],
   ['bash -c "cd / && rm -rf boot"', "shell payload outside the project"],
   ["sudo -u root rm -rf /var/log", "wrapper args outside the project"],
 ]) {

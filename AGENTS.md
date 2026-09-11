@@ -57,7 +57,13 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 ```
 
 - Suites use an isolated `HOME`, a stubbed extension host and a stubbed `fetch` — no network, no
-  credentials, no real deletions. Keep them that way.
+  credentials, no real deletions. Keep them that way. Overrides for a machine that differs:
+  `DC_TEST_ROOT` (scratch root, default `~/.omp-destructive-check-tests`), `OMP_BIN`
+  (the `omp` binary the e2e spawns), `DC_E2E_HOME`, `DC_E2E_AGENT_DIR`, `DC_E2E_MODEL`,
+  `DC_E2E_DUMP=1` (print the raw session transcript).
+- Scratch paths stay **outside** the OS temp directory on purpose: the guard treats temp paths as
+  disposable artifacts, so an isolated HOME under `%TEMP%` would silently change what the policy
+  cases actually test.
 - **A check must be able to fail.** Before adding one, name the plausible bug it catches. No
   tautologies (`x !== undefined` on a value you just built), no re-asserting the same path across
   modes, no asserting source text or mock echoes.

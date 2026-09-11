@@ -2,12 +2,15 @@
 // settings path, real tool calls and real verdicts (in-process checker).
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
-const OMP = process.env.OMP_BIN ?? "C:\\Users\\dev\\AppData\\Local\\omp\\omp.exe";
+const OMP = process.env.OMP_BIN ?? (process.platform === "win32" ? path.join(os.homedir(), "AppData", "Local", "omp", "omp.exe") : "omp");
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
 const EXT = path.join(REPO, "destructive-check.ts");
-const HOME = "C:\\Users\\dev\\.omp-dc-review\\e2e";
+// Outside the OS temp directory on purpose: the guard classifies temp paths as
+// disposable artifacts, which would bypass the rules under test.
+const HOME = process.env.DC_E2E_HOME ?? path.join(os.homedir(), ".omp-destructive-check-e2e");
 const PROJ = path.join(HOME, "proj");
 const OUTSIDE = path.join(HOME, "outside");
 const MODEL = process.env.DC_E2E_MODEL ?? "opencode-go/deepseek-v4.1-flash";
@@ -21,7 +24,7 @@ const check = (name, cond, detail = "") => results.push({ name, ok: Boolean(cond
 // marker, so "no marker AND the workspace is untouched" can only mean the driver
 // never made the call — reported as a skip, never as a pass.
 const guardEngaged = (out) => /destructive-check:/i.test(out);
-const noAttempt = ({ guarded, survived }, testCase) => !guarded && (testCase.expect === "blocked" ? survived : !survived);
+const noAttempt = ({ guarded, survived }, testCase) => !guarded && (testCase.expect === "allowed" ? !survived : survived);
 
 function reset({ mode = "medium", extraConfig = {} } = {}) {
   fs.rmSync(HOME, { recursive: true, force: true });
@@ -45,7 +48,7 @@ function reset({ mode = "medium", extraConfig = {} } = {}) {
   );
 }
 
-const env = { ...process.env, USERPROFILE: HOME, HOME, PI_CODING_AGENT_DIR: "C:\\Users\\dev\\.omp\\agent" };
+const env = { ...process.env, USERPROFILE: HOME, HOME, PI_CODING_AGENT_DIR: process.env.DC_E2E_AGENT_DIR ?? path.join(os.homedir(), ".omp", "agent") };
 delete env.OMP_DC_DISABLE;
 
 function runOmp(prompt) {
