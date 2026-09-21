@@ -202,6 +202,48 @@ const mutations = [
     from: '    nodeFs.appendFileSync(LOG_FILE, auditLine(core) + "\\n", { mode: 0o600 });',
     to: "",
   },
+  {
+    name: "a .env file is no longer a credential path",
+    suite: "tests/t-static.mjs",
+    expect: "secret write blocked: .env in the project",
+    from: '  if (base === ".env" || base.startsWith(".env.")) return true;',
+    to: "  if (false) return true;",
+  },
+  {
+    name: "the file tools skip the secret-path check",
+    suite: "tests/t-static.mjs",
+    expect: "secret write blocked: .env in the project",
+    from: "    const violations = secretViolationsFor(fileToolTargets(input, text), scope);",
+    to: "    const violations = [];\n    void fileToolTargets;",
+  },
+  {
+    name: "redirect destinations are not classified again",
+    suite: "tests/t-static.mjs",
+    expect: "write blocked: a redirect leaving the project",
+    from: '    for (const dest of redirectTargets(part)) out.push(...writeTargetViolations(dest, scope, ">"));',
+    to: '    for (const dest of []) out.push(...writeTargetViolations(dest, scope, ">"));',
+  },
+  {
+    name: "allowDirs entries are trusted as written again",
+    suite: "tests/t-static.mjs",
+    expect: "allowDirs: /dc status reports the rejected entry and the reason",
+    from: "    const reason = allowDirReject(entry);",
+    to: '    const reason = "";',
+  },
+  {
+    name: "watch mode enforces its decisions again",
+    suite: "tests/t-coverage.mjs",
+    expect: "watch: an inside delete is not enforced",
+    from: '  if (CFG.dryRun) {\n    if (action === "model") return checkThenDecide(ctx, key, violation, plan, event);',
+    to: '  if (false) {\n    if (action === "model") return checkThenDecide(ctx, key, violation, plan, event);',
+  },
+  {
+    name: "canonicalization stops resolving links",
+    suite: "tests/t-coverage.mjs",
+    expect: "realpath: a link inside the project that points outside is outside",
+    from: "  const value = canonicalizeUncached(key);",
+    to: "  const value = nodePath.resolve(key);",
+  },
 ];
 
 const rows = [];

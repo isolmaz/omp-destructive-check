@@ -18,7 +18,15 @@
  *
  * Coverage (`coverage` in the config): bash commands — including the body of the
  * scripts they run — eval code (python/js), delete/move operations issued through
- * the edit / apply_patch tools, and process launches through `hub`.
+ * the edit / apply_patch tools, and process launches through `hub`. Credential
+ * stores (`.env`, `~/.ssh`, `*.pem`, …) are a static block whatever the tool,
+ * and write effects — `>` / `>>` redirects, `cp`, `rsync`, `dd of=`, `truncate`,
+ * `tee`, `chmod`/`chown`, `ln` — are classified against the project scope.
+ *
+ * Watch mode (`dryRun` / OMP_DC_DRYRUN=1) computes and logs every decision but
+ * enforces none: the audit entry says `would-block` and the status line reads
+ * `dc: WATCH · would block: <rule>`. It is for calibrating the policy against
+ * real traffic, and session_start says out loud that it is on.
  *
  * Audit: every decision is appended to ~/.omp/logs/destructive-check.jsonl as a
  * hash-chained entry, so the record outlives the session and a silent edit to an
@@ -31,7 +39,7 @@
  *
  * Config: ~/.omp/destructive-check.json (shared by all omp profiles).
  * Env overrides: OMP_DC_DISABLE=1, OMP_DC_MODE, OMP_DC_PROVIDER, OMP_DC_MODEL,
- *   OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS.
+ *   OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS, OMP_DC_DRYRUN=1.
  */
 
 import * as nodeFs from "node:fs";
@@ -52,8 +60,10 @@ const MODES = ["simple", "medium", "hard", "custom"];
 const RULES = {
   catastrophic: "Catastrophic system commands",
   systemTarget: "System / credential paths",
+  protectSecrets: "Credential / secret files",
   outsideDelete: "Delete outside the project",
   outsideMove: "Move outside the project",
+  outsideWrite: "Write outside the project",
   insideDelete: "Delete inside the project",
   artifactDelete: "Delete build artifacts / temp",
   dynamicTargets: "Dynamic or wildcard targets",
@@ -66,8 +76,10 @@ const MODE_PRESETS = {
   simple: {
     catastrophic: "block",
     systemTarget: "block",
+    protectSecrets: "ask",
     outsideDelete: "block",
     outsideMove: "block",
+    outsideWrite: "ask",
     insideDelete: "allow",
     artifactDelete: "allow",
     dynamicTargets: "model",
@@ -78,8 +90,10 @@ const MODE_PRESETS = {
   medium: {
     catastrophic: "block",
     systemTarget: "block",
+    protectSecrets: "block",
     outsideDelete: "block",
     outsideMove: "block",
+    outsideWrite: "model",
     insideDelete: "block",
     artifactDelete: "allow",
     dynamicTargets: "model",
@@ -90,8 +104,10 @@ const MODE_PRESETS = {
   hard: {
     catastrophic: "block",
     systemTarget: "block",
+    protectSecrets: "block",
     outsideDelete: "block",
     outsideMove: "block",
+    outsideWrite: "block",
     insideDelete: "block",
     artifactDelete: "allow",
     dynamicTargets: "block",
@@ -105,8 +121,10 @@ const MODE_PRESETS = {
 const RULE_ORDER = [
   "catastrophic",
   "systemTarget",
+  "protectSecrets",
   "outsideDelete",
   "outsideMove",
+  "outsideWrite",
   "dynamicTargets",
   "gitDestructive",
   "codeDelete",
@@ -115,10 +133,16 @@ const RULE_ORDER = [
   "artifactDelete",
 ];
 
+// Rules that never get a second chance: a justification loop must not be able to
+// talk the guard out of a credential rewrite or a catastrophic signature. The
+// ids are the contract a later stage reads; keep them stable.
+const RETRY_EXEMPT_RULES = ["catastrophic", "systemTarget", "protectSecrets"];
+
 const DEFAULTS = {
   enabled: true,
   mode: "medium",
   rules: {},
+  dryRun: false, // true = watch mode: decide and log, never block or ask
   coverage: { bash: true, eval: true, fileTools: true, processes: true },
   engine: "auto", // auto | in-process | cli
   provider: "",
@@ -172,6 +196,14 @@ function clampNumber(value, fallback, min, max) {
 
 const pickBool = (value, fallback) => (typeof value === "boolean" ? value : fallback);
 
+// Watch mode is the one setting an env var may turn on for a whole session: a
+// calibration run must be possible without editing the shared config file.
+function pickDryRun(raw) {
+  const env = String(process.env.OMP_DC_DRYRUN ?? "").trim();
+  if (env) return /^(?:1|true|on|yes)$/i.test(env);
+  return pickBool(raw.dryRun, DEFAULTS.dryRun);
+}
+
 function pickAction(value, fallback) {
   return ACTIONS.includes(value) ? value : fallback;
 }
@@ -215,6 +247,7 @@ function loadConfig() {
   return {
     enabled: pickBool(raw.enabled, DEFAULTS.enabled),
     mode,
+    dryRun: pickDryRun(raw),
     storedRules,
     customRules: mode === "custom" ? { ...storedRules } : {},
     rules,
@@ -566,6 +599,96 @@ function cacheKeyFor(plan) {
 
 // ------------------------------------------------------- scope and targets --
 
+// Scope and target classification compare *real* paths: a junction or symlink
+// inside the project that points outside it must be classified where it lands,
+// not where it is spelled. `realpathSync.native` also canonicalizes case and 8.3
+// names on Windows. A path that does not exist yet is canonicalized through its
+// nearest existing ancestor, so a target that is about to be created is judged
+// at the place it would appear.
+const CANON_CACHE = new Map();
+const CANON_TTL_MS = 15_000; // short: a link created mid-session is picked up
+const CANON_MAX = 512;
+const HOME_DIR = canonicalize(nodePath.resolve(nodeOs.homedir()));
+
+function realpathOf(p) {
+  const real = nodeFs.realpathSync.native ?? nodeFs.realpathSync;
+  try {
+    return real(p);
+  } catch {
+    return "";
+  }
+}
+
+function canonicalizeUncached(abs) {
+  const direct = realpathOf(abs);
+  if (direct) return nodePath.resolve(direct);
+  const rest = [];
+  let dir = nodePath.resolve(abs);
+  for (let guard = 0; guard < 64; guard++) {
+    const parent = nodePath.dirname(dir);
+    if (parent === dir) break;
+    rest.unshift(nodePath.basename(dir));
+    dir = parent;
+    const real = realpathOf(dir);
+    if (real) return nodePath.resolve(real, ...rest);
+  }
+  return nodePath.resolve(abs);
+}
+
+// Sync I/O on the decision path is only affordable because it is cached: the
+// static layers have a +0.5 ms budget per call, and a session repeats the same
+// few roots and targets over and over.
+function canonicalize(abs) {
+  const key = String(abs ?? "");
+  if (!key) return "";
+  const now = Date.now();
+  const hit = CANON_CACHE.get(key);
+  if (hit && now - hit.at < CANON_TTL_MS) return hit.value;
+  const value = canonicalizeUncached(key);
+  if (CANON_CACHE.size >= CANON_MAX) CANON_CACHE.clear();
+  CANON_CACHE.set(key, { at: now, value });
+  return value;
+}
+
+// `allowDirs` widens the project scope, so an entry that names a filesystem
+// root, the user's home or a system tree does not widen the guard — it switches
+// it off. The entry is rejected on its literal form *and* on its canonical form,
+// because a junction is only a spelling that resolves to one of those.
+const ALLOW_DIR_SYSTEM_RE = /^[a-z]:[\\/](?:windows|program files(?: \(x86\))?|programdata|perflogs|recovery)(?:[\\/]|$)/i;
+const ALLOW_DIR_POSIX_RE = /^\/(?:etc|usr|bin|sbin|boot|dev|proc|sys|lib|lib64|opt|root|srv|var)(?:\/|$)/i;
+
+function allowDirReject(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "empty";
+  // The literal form first: `C:\` normalizes to the drive-relative `C:`, and the
+  // reason a root is refused should not read as a spelling problem.
+  if (ROOT_RE.test(text) || /^[a-z]:[\\/]?$/i.test(text)) return "the filesystem root is never project scope";
+  if (!(nodePath.isAbsolute(normalizePath(text)) || text === "~" || text.startsWith("~/"))) return "must be an absolute path or start with ~/";
+  const candidates = [...new Set([normalizePath(text), canonicalize(nodePath.resolve(normalizePath(text)))])].filter(Boolean);
+  for (const candidate of candidates) {
+    const lower = candidate.toLowerCase();
+    if (ROOT_RE.test(candidate) || /^[a-z]:[\\/]?$/i.test(candidate)) return "the filesystem root is never project scope";
+    if (lower === HOME_DIR.toLowerCase()) return "the user home is never project scope";
+    if (underDir(HOME_DIR.toLowerCase(), lower)) return "an entry that contains the user home is never project scope";
+    if (underDir(lower, nodePath.join(HOME_DIR, ".omp").toLowerCase())) return "the guard's own directory is never project scope";
+    if (ALLOW_DIR_SYSTEM_RE.test(candidate) || ALLOW_DIR_POSIX_RE.test(candidate) || POSIX_HOME_RE.test(candidate) || POSIX_WINDOWS_RE.test(candidate) || SYSTEM_SEGMENT_RE.test(candidate)) return "system directories are never project scope";
+  }
+  return "";
+}
+
+// Every configured entry, split into what actually widened the scope and what
+// was refused (with the reason the /dc menu and status show).
+function validateAllowDirs(entries) {
+  const accepted = [];
+  const rejected = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const reason = allowDirReject(entry);
+    if (reason) rejected.push({ entry: String(entry), reason });
+    else accepted.push(canonicalize(nodePath.resolve(normalizePath(String(entry).trim()))));
+  }
+  return { accepted, rejected };
+}
+
 const TEMP_SEGMENT_RE = /(^|[\\/])(node_modules|dist|build|out|coverage|__pycache__|\.cache|\.next|\.turbo|\.pytest_cache|\.mypy_cache|\.gradle|\.parcel-cache|\.svelte-kit|\.nuxt|\.output|\.venv|venv|target|tmp|temp)([\\/]|$)/i;
 const SYSTEM_SEGMENT_RE = /(^|[\\/])(\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.config|\.git|windows|program files(?: \([^)]*\))?|appdata[\\/]roaming|system32)([\\/]|$)/i;
 const ROOT_RE = /^(?:[a-zA-Z]:)?[\\/]?$|^\/$/;
@@ -579,7 +702,7 @@ const POSIX_HOME_RE = /^\/(?:home|Users)(?:\/[^/]+)?$/i;
 const POSIX_WINDOWS_RE = /^\/Windows(?:\/|$)/i;
 const DYNAMIC_RE = /\$|\*|\?|%[A-Za-z_][^%]*%|`/;
 
-const TMP_ROOT = nodePath.resolve(nodeOs.tmpdir()).toLowerCase();
+const TMP_ROOT = canonicalize(nodePath.resolve(nodeOs.tmpdir())).toLowerCase();
 
 function underDir(lowerPath, rootLower) {
   if (lowerPath === rootLower) return true;
@@ -603,9 +726,11 @@ function normalizePath(p) {
 
 // Project scope = cwd + nearest .git root + user-configured extra dirs. Anything
 // outside every root is "outside"; artifacts are only recognized inside the
-// scope or under the OS temp dir.
+// scope or under the OS temp dir. Roots are canonical, and an extra dir that
+// would not widen the guard (a root, the home, a system tree) is refused and
+// reported instead of being trusted.
 function buildScope(cwd, extraDirs = []) {
-  const cwdAbs = nodePath.resolve(cwd || ".");
+  const cwdAbs = canonicalize(nodePath.resolve(cwd || "."));
   const roots = [cwdAbs];
   for (let dir = cwdAbs, guard = 0; guard < 64; guard++) {
     if (nodeFs.existsSync(nodePath.join(dir, ".git"))) {
@@ -616,14 +741,9 @@ function buildScope(cwd, extraDirs = []) {
     if (parent === dir) break;
     dir = parent;
   }
-  for (const extra of extraDirs) {
-    try {
-      roots.push(nodePath.resolve(normalizePath(extra)));
-    } catch {
-      /* ignore malformed entries */
-    }
-  }
-  return { cwdAbs, roots: [...new Set(roots.map((r) => r.toLowerCase()))], tmpRoot: TMP_ROOT };
+  const { accepted, rejected } = validateAllowDirs(extraDirs);
+  for (const dir of accepted) roots.push(dir);
+  return { cwdAbs, roots: [...new Set(roots.map((r) => r.toLowerCase()))], tmpRoot: TMP_ROOT, rejected };
 }
 
 // `/tmp` and `/var/tmp` are the OS temp trees on POSIX (and what Git Bash means
@@ -665,7 +785,7 @@ function classify(raw, scope) {
 
 function resolveAgainst(p, scope) {
   try {
-    return nodePath.resolve(nodePath.isAbsolute(p) ? p : nodePath.join(scope.cwdAbs, p));
+    return canonicalize(nodePath.resolve(nodePath.isAbsolute(p) ? p : nodePath.join(scope.cwdAbs, p)));
   } catch {
     return "";
   }
@@ -673,7 +793,7 @@ function resolveAgainst(p, scope) {
 
 function classifyResolved(abs, raw, scope, tempish) {
   const lower = abs.toLowerCase();
-  const home = nodeOs.homedir().toLowerCase();
+  const home = HOME_DIR.toLowerCase();
   const inTemp = lower.includes("\\appdata\\local\\temp");
   if (lower === home) return { kind: "system", path: raw };
   if (/^[a-z]:[\\/]?$/i.test(abs) || PROTECTED_DIR_RE.test(abs)) return { kind: "system", path: raw };
@@ -942,6 +1062,11 @@ function runScriptTarget(rawPath, scope, depth, found, record) {
   for (const hit of catastrophicViolations(body.text)) {
     found.push({ verb: "catastrophic", detail: hit.detail, sub: rawPath, scope, script: state.script });
   }
+  // A readable body is judged by the same rules as the command line, writes
+  // included: `echo x > ../outside/f` inside a script is the same effect.
+  for (const hit of writeViolations(body.text, scope)) {
+    found.push({ verb: "write", rule: hit.rule, detail: hit.detail, sub: rawPath, scope, script: state.script });
+  }
   scanScoped(body.text, scope, depth + 1, found);
   state.script = outer;
   state.depth--;
@@ -1051,7 +1176,7 @@ function scopeAfterCd(scope, target) {
   let next = normalizePath(raw) || raw;
   if (/^[a-zA-Z]:$/.test(next)) next += nodePath.sep;
   try {
-    const resolved = nodePath.resolve(scope.cwdAbs, next);
+    const resolved = canonicalize(nodePath.resolve(scope.cwdAbs, next));
     if (nodeFs.statSync(resolved).isDirectory()) {
       // Only the directory targets resolve against moves. The authorized roots
       // do not: `cd <somewhere else>` is not a way to adopt a new project, so a
@@ -1254,12 +1379,288 @@ function classifyAll(targets, scope) {
   return targets.map((t) => classify(t, scope));
 }
 
+// ------------------------------------------------------------- secrets -----
+
+// Credential stores an agent has no reason to rewrite or delete. Static and
+// LLM-free, and exempt from any later retry loop: the decision is not a judgement
+// call. Patterns are matched on the canonical path, so a link cannot spell its
+// way around them, and the detail names the file, never the pattern.
+const SECRET_ENV_TEMPLATE_RE = /(?:^|\/)\.env\.(?:example|sample)$/;
+const SECRET_SSH_DIR_RE = /(?:^|\/)\.ssh(?:\/|$)/;
+const SECRET_AWS_RE = /(?:^|\/)\.aws\/credentials$/;
+const SECRET_KUBE_RE = /(?:^|\/)\.kube\/config$/;
+const SECRET_GIT_CRED_RE = /(?:^|\/)\.git-credentials$/;
+const SECRET_GH_HOSTS_RE = /(?:^|\/)\.config\/gh\/hosts\.yml$/;
+const SECRET_ID_RE = /^id_rsa[^/]*$/;
+const SECRET_EXT_RE = /\.(?:pem|key|p12|kdbx)$/;
+const SECRET_NAME_RE = /^(?:auth\.json|\.npmrc)$/;
+
+function isSecretPath(abs) {
+  const p = String(abs ?? "").replace(/\\/g, "/").toLowerCase();
+  if (!p) return false;
+  const base = p.slice(p.lastIndexOf("/") + 1);
+  if (!base) return false;
+  if (SECRET_ENV_TEMPLATE_RE.test(p)) return false; // `.env.example` is a template, not a credential
+  if (base === ".env" || base.startsWith(".env.")) return true;
+  if (SECRET_SSH_DIR_RE.test(p)) return true;
+  if (SECRET_AWS_RE.test(p) || SECRET_KUBE_RE.test(p) || SECRET_GIT_CRED_RE.test(p) || SECRET_GH_HOSTS_RE.test(p)) return true;
+  if (SECRET_ID_RE.test(base)) return true;
+  if (SECRET_EXT_RE.test(base)) return true;
+  return SECRET_NAME_RE.test(base);
+}
+
+// The canonical absolute path of a target, or "" when it cannot be resolved
+// statically: a variable or a glob can name anything, and the dynamicTargets
+// rule already owns that case.
+function canonicalTarget(raw, scope) {
+  const text = normalizePath(unquote(String(raw ?? "")));
+  if (!text) return "";
+  if (/[$`]|%[A-Za-z_][^%]*%/.test(text)) return "";
+  const abs = resolveAgainst(text, scope);
+  return abs ? canonicalize(abs) : "";
+}
+
+function secretViolations(raw, scope) {
+  const abs = canonicalTarget(raw, scope);
+  if (!abs || !isSecretPath(abs)) return [];
+  return [violation("protectSecrets", `"${raw}" is a credential or secret file`)];
+}
+
+function secretViolationsFor(targets, scope) {
+  const out = [];
+  for (const target of targets ?? []) out.push(...secretViolations(target, scope));
+  return out;
+}
+
+// ---------------------------------------------------------- write targets ---
+
+// A redirect or a write verb puts data where it is told to. `cp a ../out/` writes
+// outside the project while `cp ../out/a .` only reads outside it, so each verb
+// names its own argument positions. Redirects are read from the command text with
+// quoting respected, and heredoc bodies are dropped first: a body is data, and a
+// body full of `>` is not a command line.
+const WRITE_VERBS = /^(cp|mv|rsync|truncate|tee|chmod|chown|chgrp|ln)$/i;
+const OWNER_VERBS = /^(chmod|chown|chgrp)$/i;
+const NULL_SINK_RE = /^(?:\/dev\/(?:null|zero|stdout|stderr|tty)|nul|con|\$null)$/i;
+
+// `user@host:/path` and `rsync://host/mod` are not local paths: nothing about
+// them can be classified, and a target the guard cannot resolve is not a pass.
+function isRemoteTarget(text) {
+  const s = String(text ?? "").trim();
+  if (!s || /^[a-zA-Z]:[\\/]/.test(s)) return false; // C:\path is local
+  return /^(?:[a-z][\w.+-]*:\/\/|[^\/\\]*@[^\/\\]*:|[a-zA-Z][\w.-]+:)/.test(s);
+}
+
+// Heredoc delimiters of one line, read with quoting respected so `echo "a << b"`
+// is not mistaken for a here-document.
+function heredocDelimiters(line) {
+  const out = [];
+  if (!line.includes("<<")) return out;
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (ch !== "<" || line[i + 1] !== "<" || line[i + 2] === "<") continue; // `<<<` is a here-string
+    let k = i + 2;
+    if (line[k] === "-") k++;
+    while (k < line.length && /\s/.test(line[k])) k++;
+    let delim = "";
+    if (line[k] === '"' || line[k] === "'") {
+      const q = line[k++];
+      while (k < line.length && line[k] !== q) delim += line[k++];
+    } else {
+      while (k < line.length && /[A-Za-z0-9_.-]/.test(line[k])) delim += line[k++];
+    }
+    if (delim) out.push(delim);
+    i = k;
+  }
+  return out;
+}
+
+// The bodies of every here-document in the text, blanked out. The command lines
+// survive: `cat > f <<'EOF'` still writes f, and the `EOF` terminator still ends
+// the body. Only the redirect/verb scan uses this — a here-document handed to a
+// shell (`bash <<'EOF'`) is executed, and that path is judged by its own rules.
+function stripHeredocs(text) {
+  const out = [];
+  let pending = [];
+  for (const line of String(text ?? "").split("\n")) {
+    if (pending.length) {
+      if (line.trim() === pending[0]) pending.shift();
+      out.push("");
+      continue;
+    }
+    out.push(line);
+    pending = heredocDelimiters(line);
+  }
+  return out.join("\n");
+}
+
+// The destination of every `>` / `>>` in one sub-command. `2>&1` and `>&2` copy a
+// file descriptor and write no file, and a quoted `>` is data.
+function redirectTargets(sub) {
+  const out = [];
+  let quote = null;
+  for (let i = 0; i < sub.length; i++) {
+    const ch = sub[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (ch !== ">") continue;
+    if (sub[i + 1] === "&") {
+      i++;
+      continue;
+    }
+    if (sub[i - 1] === "-" || sub[i - 1] === "=") continue; // `a->b`, `a=>b`
+    let k = i + 1;
+    if (sub[k] === ">") k++;
+    while (k < sub.length && /\s/.test(sub[k])) k++;
+    if (k >= sub.length) break;
+    let token = "";
+    if (sub[k] === '"' || sub[k] === "'") {
+      const q = sub[k++];
+      while (k < sub.length && sub[k] !== q) token += sub[k++];
+    } else {
+      while (k < sub.length && !/[\s|&;<>()]/.test(sub[k])) token += sub[k++];
+    }
+    if (token) out.push(token);
+    i = k - 1;
+  }
+  return out;
+}
+
+// `dd of=<file>` writes that file; a block device is the catastrophic rule's.
+function ddWriteTargets(args) {
+  const out = [];
+  for (const t of args) {
+    const m = /^of=(.+)$/i.exec(t.text);
+    if (!m) continue;
+    const value = unquote(m[1]);
+    if (DEVICE_TARGET_RE.test(value)) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+function writeVerbTargets(cmd, args) {
+  const paths = args.filter((t) => !isFlagTok(t.text) && t.text !== "--").map((t) => t.text);
+  if (!paths.length) return [];
+  if (/^cp$/i.test(cmd)) return paths.slice(-1); // only the destination is written
+  // With --delete the source side decides what disappears at the destination.
+  if (/^rsync$/i.test(cmd)) return args.some((t) => /^--delete/i.test(t.text)) ? paths : paths.slice(-1);
+  if (OWNER_VERBS.test(cmd)) return paths.length > 1 ? paths.slice(1) : paths; // mode / owner comes first
+  return paths; // mv, truncate, tee, ln: every argument is a file
+}
+
+// The write targets of one sub-command. The first real command word decides;
+// launchers (`sudo`, `env`, `xargs`) keep the walk going, exactly like the
+// delete/move scanner does.
+function verbWriteTargetsIn(sub) {
+  const toks = tokenize(sub);
+  let loose = false;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.text === "--" || isFlagTok(t.text)) continue;
+    if (STRUCT_RE.test(t.text)) {
+      loose = true;
+      continue;
+    }
+    const cmd = cmdWord(t.word ?? t.text);
+    if (PROBE_RE.test(cmd)) return []; // a probe runs nothing
+    if (LAUNCHER_RE.test(cmd)) {
+      loose = true;
+      continue;
+    }
+    if (/^dd$/i.test(cmd)) return ddWriteTargets(toks.slice(i + 1));
+    if (WRITE_VERBS.test(cmd)) return writeVerbTargets(cmd, toks.slice(i + 1));
+    if (!loose) return [];
+  }
+  return [];
+}
+
+// `sh -c "echo x > /etc/y"` hides the redirect inside a quoted token the scan
+// above cannot see: the body is a command line of its own.
+function shellBodyOf(sub) {
+  const toks = tokenize(sub);
+  let loose = false;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.text === "--" || isFlagTok(t.text)) continue;
+    const cmd = cmdWord(t.word ?? t.text);
+    if (LAUNCHER_RE.test(cmd)) {
+      const next = toks[i + 1];
+      if (next?.quoted && PAYLOAD_LAUNCHER_RE.test(cmd)) return unwrapShellBody(next.text);
+      loose = true;
+      continue;
+    }
+    if (SHELL_RE.test(cmd)) {
+      const flag = toks[i + 1];
+      return flag && !flag.quoted && SHELL_EXEC_FLAG_RE.test(flag.text) ? unwrapShellBody(sub.slice(flag.index + flag.raw.length)) : "";
+    }
+    if (!loose) return "";
+  }
+  return "";
+}
+
+function writeTargetViolations(raw, scope, via) {
+  const text = String(raw ?? "").trim();
+  if (!text || NULL_SINK_RE.test(text)) return []; // `> /dev/null` writes nowhere
+  // A credential store is a static block wherever the write comes from: the
+  // redirect, the verb, a shell body or a script.
+  const out = secretViolations(text, scope);
+  if (isRemoteTarget(text)) return out.concat([violation("dynamicTargets", `"${text}" is not a local path`)]);
+  const c = classify(text, scope);
+  if (c.kind === "root" || c.kind === "projectRoot" || c.kind === "system") return out.concat(targetViolations(c.kind, c.path));
+  if (c.kind === "outside") return out.concat([violation("outsideWrite", `writes "${c.path}" outside the project${via ? ` (${via})` : ""}`)]);
+  if (c.kind === "dynamic") return out.concat(targetViolations("dynamic", c.path));
+  return out; // inside the project or an artifact: unchanged behavior
+}
+
+// Every write-like effect of one command line: redirect destinations, write
+// verbs, shell bodies and command substitutions. A target that cannot be
+// resolved is a dynamicTargets violation, never a clean pass. Past the nesting
+// limit the scan stops without reporting: the delete/move scanner walks the same
+// nesting and records the depth violation for the call.
+function writeViolations(command, scope, depth = 0) {
+  if (depth > MAX_SCAN_DEPTH) return [];
+  const out = [];
+  for (const part of splitSubcommands(stripHeredocs(command))) {
+    for (const body of substitutionBodies(part)) out.push(...writeViolations(body, scope, depth + 1));
+    for (const dest of redirectTargets(part)) out.push(...writeTargetViolations(dest, scope, ">"));
+    for (const target of verbWriteTargetsIn(part)) out.push(...writeTargetViolations(target, scope, ""));
+    const shell = shellBodyOf(part);
+    if (shell) out.push(...writeViolations(shell, scope, depth + 1));
+  }
+  return out;
+}
+
 // Delete/move violations for one tool call, given the command text and the
 // targets that were extracted from it.
 function violationsForCommand(command, scope) {
   const out = catastrophicViolations(command);
   const found = scanScoped(command, scope, 0, []);
-  if (!found.length) return out;
+  if (!found.length) return out.concat(writeViolations(command, scope));
   for (const call of found) {
     const callScope = call.scope ?? scope;
     const x = extractInfo(call.sub);
@@ -1280,6 +1681,10 @@ function violationsForCommand(command, scope) {
     }
     if (call.verb === "catastrophic") {
       add([violation("catastrophic", String(call.detail))]);
+      continue;
+    }
+    if (call.verb === "write") {
+      add([violation(call.rule, String(call.detail))]);
       continue;
     }
     if (call.verb === "script") {
@@ -1304,6 +1709,7 @@ function violationsForCommand(command, scope) {
         else if (dests.some((c) => c.kind === "dynamic")) add([violation("dynamicTargets", `move with an unresolved destination: ${x.sub}`)]);
         else if (!dests.length) add([violation("dynamicTargets", `move without a resolvable destination: ${x.sub}`)]);
       }
+      add(secretViolationsFor(x.targets, callScope));
       continue;
     }
     // Deletes: an all-artifact target list is the one case the artifactDelete
@@ -1316,13 +1722,16 @@ function violationsForCommand(command, scope) {
     }
     if (classes.every((c) => c.kind === "artifact")) {
       add([violation("artifactDelete", `deletes build artifacts or temp paths: ${x.targets.join(", ")}`)]);
+      add(secretViolationsFor(x.targets, callScope));
       continue;
     }
     for (const c of classes) {
       if (c.kind === "artifact") add([violation("artifactDelete", `deletes build artifacts or temp paths: ${c.path}`)]);
       else add(targetViolations(c.kind, c.path));
     }
+    add(secretViolationsFor(x.targets, callScope));
   }
+  out.push(...writeViolations(command, scope));
   return out;
 }
 
@@ -1402,6 +1811,7 @@ function violationsForCode(language, code, scope) {
     else if (call.verb === "depth") out.push(violation("dynamicTargets", `${DEPTH_DETAIL} inside ${language} code`));
     else {
       for (const c of classifyAll(x.targets, scope)) out.push(...(c.kind === "artifact" ? [] : targetViolations(c.kind, c.path)));
+      out.push(...secretViolationsFor(x.targets, scope));
     }
   }
   if (deleteApi) {
@@ -1409,13 +1819,16 @@ function violationsForCode(language, code, scope) {
     for (const target of targets) {
       const c = classify(target, scope);
       if (c.kind !== "artifact") out.push(...targetViolations(c.kind, c.path));
+      out.push(...secretViolations(target, scope));
     }
     if (dynamic) out.push(violation("codeDelete", `delete from ${language} code with a computed target`));
   }
+  out.push(...writeViolations(text, scope));
   return out;
 }
 
 const PATCH_DELETE_LINE_RE = /^\s*\*\*\*\s*Delete File:\s*(.+?)\s*$/gim;
+const PATCH_FILE_LINE_RE = /^\s*\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+?)\s*$/gim;
 const PATCH_DELETE_OP_RE = /^\s*(?:\*\*\*\s*Delete File:|DELETE\s+|REM\b)/im;
 const PATCH_MOVE_LINE_RE = /^\s*(?:\*\*\*\s*Move to:|\*\*\*\s*Move File:.*?->|MV\s+)(.+?)\s*$/gim;
 const PATCH_HEADER_RE = /^\[([^\]\n]+?)#[0-9A-Fa-f]*\]\s*$/gm;
@@ -1486,6 +1899,25 @@ function violationsForEditInput(input, scope) {
   return out;
 }
 
+// Every file a write/edit/apply_patch payload touches. A patch is a series of
+// file sections and each one names the file it rewrites: `*** Update File:`,
+// `*** Add File:`, `*** Delete File:`, `*** Move to:`, the hashline `[path#hash]`
+// header and the `MV <path>` line. The structured form (`{path, edits:[…]}`) is
+// its own schema, so `input.path` and each edit's destination are read directly.
+function fileToolTargets(input, text) {
+  const out = [];
+  const push = (value) => {
+    const path = typeof value === "string" ? value.trim() : "";
+    if (path) out.push(path);
+  };
+  push(input?.path);
+  for (const m of String(text ?? "").matchAll(PATCH_HEADER_RE)) push(unquote(m[1]));
+  for (const m of String(text ?? "").matchAll(PATCH_FILE_LINE_RE)) push(unquote(m[1]));
+  for (const m of String(text ?? "").matchAll(PATCH_MOVE_LINE_RE)) push(unquote(m[1]));
+  for (const edit of Array.isArray(input?.edits) ? input.edits : []) push(edit?.to ?? edit?.destination ?? edit?.path);
+  return out;
+}
+
 // Decide over every effect the call produced, most restrictive first: an allowed
 // target must never release a blocked one. Ties go to the higher-severity rule.
 const ACTION_RANK = { block: 0, ask: 1, model: 2, allow: 3 };
@@ -1535,12 +1967,19 @@ function analyzeCall(event, cwd) {
     const violations = violationsForCode(language, code, scope);
     return violations.length ? { scope, kind: "eval", summary: firstLine(code), identity: `${language}\u0000${code}`, violations } : null;
   }
-  if ((name === "edit" || name === "apply_patch") && CFG.coverage.fileTools) {
+  if ((name === "write" || name === "edit" || name === "apply_patch") && CFG.coverage.fileTools) {
     const text = typeof input.input === "string" ? input.input : "";
-    const violations = Array.isArray(input.edits) && !text ? violationsForEditInput(input, scope) : violationsForPatch(text || JSON.stringify(input), scope);
+    // A credential store is a static block whatever the tool and whatever the
+    // mode preset says about deletes: rewriting `.env` or `id_rsa` is how a
+    // session leaks or replaces the keys the user's other tools trust.
+    const violations = secretViolationsFor(fileToolTargets(input, text), scope);
+    if (name !== "write") {
+      violations.push(...(Array.isArray(input.edits) && !text ? violationsForEditInput(input, scope) : violationsForPatch(text || JSON.stringify(input), scope)));
+    }
     if (!violations.length) return null;
     const identity = text || JSON.stringify(input);
-    return { scope, kind: name, summary: firstLine(identity), identity: `${name}\u0000${identity}`, violations };
+    const summary = name === "write" ? `write ${typeof input.path === "string" ? input.path : "(unknown path)"}` : firstLine(identity);
+    return { scope, kind: name, summary, identity: `${name}\u0000${identity}`, violations };
   }
   // A process launched through hub used to be a fully unwatched channel: the
   // command travelled in `application` + `args`, and nothing looked at either.
@@ -1901,8 +2340,14 @@ function statusNote(ctx, text, level) {
 // states what happened and which rule caused it, and the full detail lives in
 // /dc → status and recent decisions.
 function statusText() {
-  return CFG.enabled ? `dc: ${CFG.mode}` : "dc: off";
+  if (!CFG.enabled) return "dc: off";
+  return CFG.dryRun ? `dc: WATCH · ${CFG.mode}` : `dc: ${CFG.mode}`;
 }
+
+// Watch mode says what it would have done, in the same place a decision says
+// what it did: the mode segment is replaced by WATCH, so the line can never be
+// read as an enforced block.
+const watchStatus = (rule) => `dc: WATCH · would block: ${rule}`;
 
 function statusFor(verb, rule) {
   const label = RULES[rule] ?? rule ?? "";
@@ -1957,9 +2402,11 @@ async function checkerSelfTest(ctx) {
 
 function fullStatus(ctx) {
   const p = CFG.provider;
+  const dirs = validateAllowDirs(CFG.allowDirs);
   return [
     `enabled      : ${CFG.enabled ? "yes" : "no"}`,
     `protection   : ${CFG.mode}`,
+    `watch        : ${CFG.dryRun ? "ON — dry-run: decisions are logged, nothing is blocked or asked" : "off"}`,
     `checker      : ${ctx ? effectiveEngine(ctx) : CFG.engine} · ${p.name || "(no provider)"}/${p.model || "(no model)"}`,
     `timeout      : ${CFG.timeoutMs} ms`,
     `ask on deny  : ${CFG.askOnDeny ? "yes" : "no"}`,
@@ -1967,8 +2414,10 @@ function fullStatus(ctx) {
     `coverage     : ${["bash", "eval", "fileTools", "processes"].filter((k) => CFG.coverage[k]).join(", ") || "none"}`,
     `cache        : ${CFG.cacheEnabled ? `on (${verdictCache.size} verdicts, ${sessionAllows.size} approvals)` : "off"}`,
     `intent       : ${CFG.includeIntent ? `yes (${CFG.maxIntentChars} chars)` : "no"}`,
-    `project dirs : ${[CFG.allowDirs.length ? CFG.allowDirs.join(", ") : "(cwd + git root)"]}`,
+    `project dirs : ${dirs.accepted.length ? dirs.accepted.join(", ") : "(cwd + git root)"}`,
+    ...(dirs.rejected.length ? [`rejected dirs: ${dirs.rejected.map((r) => `${r.entry} (${r.reason})`).join("; ")}`] : []),
     `rules        : ${RULE_ORDER.map((r) => `${r}=${CFG.rules[r]}`).join(" ")}`,
+    `no 2nd chance: ${RETRY_EXEMPT_RULES.join(", ")}`,
     `audit log    : ${LOG_FILE}`,
     `guard        : ${guardIntegrity().state} · ${guardLockState()}`,
     ...(lastPersistError ? [`config write : FAILED — ${lastPersistError}`] : []),
@@ -2007,6 +2456,16 @@ function decide(plan, event, ctx) {
   if (action === "allow") {
     logDecision({ tool: plan.kind, rule: violation.rule, action: "allow", detail: violation.detail, ...audit });
     statusNote(ctx, statusFor("allowed", violation.rule));
+    return undefined;
+  }
+  // Watch mode (dryRun) computes every decision and enforces none: the audit
+  // line says would-block, the status line says WATCH, and neither the user nor
+  // the model is asked. A model-action rule is still put to the checker — the
+  // point of a calibration run is to see what the policy would have caught.
+  if (CFG.dryRun) {
+    if (action === "model") return checkThenDecide(ctx, key, violation, plan, event);
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: violation.detail, ...audit });
+    statusNote(ctx, watchStatus(violation.rule));
     return undefined;
   }
   // A decision the current policy makes on its own comes first: a stored
@@ -2061,6 +2520,12 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
     statusNote(ctx, `${statusFor("checker allowed", violation.rule)} · ${took}`);
     return undefined;
   }
+  // Watch mode: the verdict is recorded, the refusal is not enforced.
+  if (CFG.dryRun) {
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: verdict.reason || violation.detail, ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs });
+    statusNote(ctx, watchStatus(violation.rule));
+    return undefined;
+  }
   logDecision({ tool: plan.kind, rule: violation.rule, action: "model:deny", detail: verdict.reason ?? "", ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs });
   const reason = verdict.reason || "no reason given";
   if (CFG.askOnDeny) {
@@ -2082,6 +2547,13 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
 // surfaced and the user is asked when a UI exists.
 async function onCheckerFailure(ctx, violation, err, plan, key) {
   const detail = `${String(err?.message ?? err).slice(0, 300)} (after ${err?.dcMs ?? 0} ms)`;
+  // Watch mode never turns a failure into an enforced block either: the failure
+  // is recorded as something the policy would have stopped on.
+  if (CFG.dryRun) {
+    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "would-block", detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
+    statusNote(ctx, watchStatus(violation.rule));
+    return undefined;
+  }
   logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "error", detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
   statusNote(ctx, statusFor("checker error", violation.rule), "warning");
   if (CFG.askOnError && ctx?.hasUI) {
@@ -2186,6 +2658,9 @@ export default function destructiveCheck(pi) {
   pi.on("session_start", (_event, ctx) => {
     lastSessionId = sessionIdOf(ctx);
     statusNote(ctx, statusText());
+    // Watch mode must never be left on by accident: it is the one setting that
+    // makes the guard silent while looking armed.
+    if (CFG.dryRun) statusNote(ctx, "destructive-check: WATCH MODE is on — decisions are logged as would-block and nothing is blocked or asked. Turn it off in /dc → watch (dry-run) or set OMP_DC_DRYRUN=0.", "warning");
   });
 
   pi.registerCommand("dc", {
@@ -2198,6 +2673,7 @@ export default function destructiveCheck(pi) {
       let open = true;
       while (open) {
         statusNote(ctx, statusText());
+        const dirs = validateAllowDirs(CFG.allowDirs);
         const choice = selLabel(
           await ctx.ui.select("destructive-check", [
             { label: `enabled: ${CFG.enabled ? "yes" : "no"}`, description: "master switch — off means no checking at all; the status line then reads dc: off" },
@@ -2207,9 +2683,10 @@ export default function destructiveCheck(pi) {
             { label: `ask on error: ${CFG.askOnError ? "on" : "off"}`, description: "when the checker fails, ask the user instead of blocking" },
             { label: `rules: ${CFG.mode === "custom" ? "custom" : "preset"}`, description: "edit each rule action (switches to custom mode)" },
             { label: `coverage: ${["bash", "eval", "fileTools", "processes"].filter((k) => CFG.coverage[k]).join("+") || "none"}`, description: "which tools the guard watches" },
+            { label: `watch (dry-run): ${CFG.dryRun ? "on" : "off"}`, description: "decide and log everything without blocking or asking — for calibration; the status line then reads dc: WATCH" },
             { label: `intent: ${CFG.includeIntent ? "on" : "off"}`, description: "send the agent's one-line intent with the check" },
             { label: `cache: ${CFG.cacheEnabled ? `on (${verdictCache.size})` : "off"}`, description: "reuse verdicts per command + workspace" },
-            { label: `allowed dirs: ${CFG.allowDirs.length}`, description: "extra directories treated as project scope" },
+            { label: `allowed dirs: ${CFG.allowDirs.length}${dirs.rejected.length ? ` · ${dirs.rejected.length} rejected` : ""}`, description: "extra directories treated as project scope" },
             { label: "test checker", description: "send one sample action and show the verdict + latency" },
             { label: "recent decisions", description: "last checks and their outcomes" },
             { label: "audit log", description: "the decisions from the log file, and a chain check on it" },
@@ -2311,6 +2788,13 @@ export default function destructiveCheck(pi) {
             const name = String(key).split(":")[0].trim();
             if (name in CFG.coverage) persistConfigChange({ coverage: { ...CFG.coverage, [name]: !CFG.coverage[name] } });
           }
+        } else if (choice.startsWith("watch")) {
+          persistConfigChange({ dryRun: !CFG.dryRun });
+          ctx.ui.notify(
+            CFG.dryRun ? "destructive-check: WATCH MODE — every decision is logged as would-block and nothing is blocked or asked" : "destructive-check: watch mode off — decisions are enforced again",
+            CFG.dryRun ? "warning" : "info",
+          );
+          statusNote(ctx, statusText());
         } else if (choice.startsWith("intent:")) {
           persistConfigChange({ includeIntent: !CFG.includeIntent });
         } else if (choice.startsWith("cache:")) {
@@ -2329,16 +2813,26 @@ export default function destructiveCheck(pi) {
             ctx.ui.notify("session approvals cleared", "info");
           }
         } else if (choice.startsWith("allowed dirs:")) {
-          const act = selLabel(await ctx.ui.select("allowed dirs — extra project scope", [
+          const rejects = validateAllowDirs(CFG.allowDirs).rejected;
+          const options = [
             { label: "add a directory", description: "treat this directory as part of the project: deletes inside it are judged as inside-project" },
             { label: `clear the list (${CFG.allowDirs.length})`, description: "drop every extra directory; only the session cwd and its git root stay in scope" },
-            { label: "cancel", description: "close this submenu" },
-          ]));
+          ];
+          // An entry that cannot widen the scope is shown instead of silently
+          // doing nothing: a root, the home or a system tree would switch the
+          // guard off, so it is refused (before and after canonicalization).
+          if (rejects.length) options.push({ label: `rejected entries: ${rejects.length}`, description: "entries that are not part of the scope — pick to see the reason for each" });
+          options.push({ label: "cancel", description: "close this submenu" });
+          const act = selLabel(await ctx.ui.select("allowed dirs — extra project scope", options));
           if (selLabel(act) === "add a directory") {
-            const dir = await ctx.ui.input("directory path", "");
-            if (dir && String(dir).trim()) persistConfigChange({ allowDirs: [...CFG.allowDirs, String(dir).trim()] });
+            const dir = String((await ctx.ui.input("directory path", "")) ?? "").trim();
+            const reason = dir ? allowDirReject(dir) : "nothing was entered";
+            if (reason) ctx.ui.notify(`destructive-check: "${dir}" was not added — ${reason}`, "warning");
+            else persistConfigChange({ allowDirs: [...CFG.allowDirs, dir] });
           } else if (selLabel(act)?.startsWith("clear the list")) {
             persistConfigChange({ allowDirs: [] });
+          } else if (selLabel(act)?.startsWith("rejected")) {
+            await ctx.ui.confirm("allowed dirs — rejected entries", rejects.map((r) => `${r.entry} — ${r.reason}`).join("\n"));
           }
         } else if (choice.startsWith("test checker")) {
           const report = await checkerSelfTest(ctx);

@@ -379,7 +379,9 @@ for (const [command, label] of [
   // back, so the lock is not a one-shot obstacle.
   const install = (argv) => {
     try {
-      const stdout = execFileSync(process.execPath, [path.join(HERE, "..", "install.mjs"), ...argv], {
+      // `--skip-tests`: this block is about lock/replace semantics, and the
+      // installer's own gate re-runs the suites (which would re-enter here).
+      const stdout = execFileSync(process.execPath, [path.join(HERE, "..", "install.mjs"), ...argv, "--skip-tests"], {
         encoding: "utf8",
         env: { ...process.env, USERPROFILE: HOME, HOME },
         stdio: ["ignore", "pipe", "pipe"],
@@ -428,6 +430,76 @@ for (const [command, label] of [
   installFetch(() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: stub" } }] }));
   const second = await callTool(ext, cmd("rm -rf " + path.join(OUTSIDE, "data")), ctx);
   check("D19: the checker-error approval is remembered for the session", first === undefined && second === undefined && checkerRequests().length === 0, `first=${first === undefined} second=${second === undefined} requests=${checkerRequests().length}`);
+}
+
+// ---------------------------------------------------- S1 security closure ---
+// The P0 findings the analysis verified in the source: credential paths were
+// outside the guard, `allowDirs` was trusted as written, links were not resolved
+// and redirects / write verbs were not classified at all.
+{
+  const env = await run({ toolName: "write", input: { path: path.join(PROJ, ".env"), content: "A=1" } });
+  check("S1.1: writing .env is blocked statically", env.blocked && env.completions === 0 && /protectSecrets/.test(env.reason), env.reason);
+  const key = await run({ toolName: "write", input: { path: path.join(PROJ, "deploy.key"), content: "k" } });
+  check("S1.1: a .key file is blocked statically", key.blocked && key.completions === 0, key.reason);
+  const template = await run({ toolName: "write", input: { path: path.join(PROJ, ".env.example"), content: "A=" } });
+  check("S1.1: .env.example is a template, not a credential", !template.blocked && template.completions === 0, JSON.stringify(template.result));
+}
+{
+  const data = path.join(OUTSIDE, "data");
+  const root = await run(cmd(`rm -rf ${data}`), { config: cfg({ mode: "simple", allowDirs: ["C:\\"] }) });
+  check("S1.2: a drive root in allowDirs does not widen the scope", root.blocked && root.completions === 0, root.reason);
+  const home = await run(cmd(`rm -rf ${data}`), { config: cfg({ mode: "simple", allowDirs: [HOME] }) });
+  check("S1.2: the user home in allowDirs does not widen the scope", home.blocked && home.completions === 0, home.reason);
+  const good = await run(cmd(`rm -rf ${path.join(OUTSIDE, "dist", "bundle.js")}`), { config: cfg({ mode: "simple", allowDirs: [OUTSIDE] }) });
+  check("S1.2: a real directory still widens the scope", !good.blocked && good.completions === 0, JSON.stringify(good.result));
+}
+{
+  // A junction (Windows) or symlink (POSIX) inside the project that points
+  // outside: the target is judged where it lands.
+  const link = path.join(PROJ, "link-out");
+  for (const clear of [() => fs.unlinkSync(link), () => fs.rmdirSync(link)]) {
+    try {
+      clear();
+    } catch {
+      /* nothing to clear */
+    }
+  }
+  fs.writeFileSync(path.join(OUTSIDE, "data", "keep.txt"), "outside data\n");
+  let linked = false;
+  for (const type of process.platform === "win32" ? ["junction", "dir"] : ["dir", undefined]) {
+    try {
+      fs.symlinkSync(path.join(OUTSIDE, "data"), link, type);
+      linked = true;
+      break;
+    } catch {
+      /* try the next flavor */
+    }
+  }
+  if (!linked) console.log("  SKIP S1.3: this platform cannot create a directory link in the scratch dir");
+  else {
+    const p = await run(cmd(`rm -rf "${path.join(link, "keep.txt")}"`), { config: cfg({ mode: "simple" }) });
+    check("S1.3: a link inside the project that points outside is outside", p.blocked && /outsideDelete/.test(p.reason), p.reason);
+  }
+}
+{
+  const redirect = await run(cmd(`echo hi > ${path.join(OUTSIDE, "leak.txt")}`));
+  check("S1.4: a redirect outside the project is blocked in hard", redirect.blocked && /outsideWrite/.test(redirect.reason), redirect.reason);
+  const inside = await run(cmd("echo hi > out.json"));
+  check("S1.4: a redirect inside the project stays silent", !inside.blocked && inside.completions === 0, JSON.stringify(inside.result));
+  const cp = await run(cmd(`cp src/app.js ${OUTSIDE}/`));
+  check("S1.4: cp writing outside is blocked", cp.blocked && /outsideWrite/.test(cp.reason), cp.reason);
+  const read = await run(cmd(`cp ${path.join(OUTSIDE, "data", "keep.txt")} src/`));
+  check("S1.4: cp reading from outside is not a write", !read.blocked && read.completions === 0, JSON.stringify(read.result));
+  const fd = await run(cmd("npm test > out.log 2>&1"));
+  check("S1.4: fd duplication is not a redirect target", !fd.blocked && fd.completions === 0, JSON.stringify(fd.result));
+}
+{
+  fs.rmSync(LOG, { force: true });
+  const p = await run(cmd(`rm -rf ${path.join(OUTSIDE, "data")}`), { config: cfg({ dryRun: true }) });
+  check("S1.5: watch mode does not enforce the block", p.result === undefined, JSON.stringify(p.result));
+  const lines = fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const last = lines.at(-1) ?? {};
+  check("S1.5: the audit entry says would-block", last.action === "would-block" && last.rule === "outsideDelete", JSON.stringify(last));
 }
 
 report("review");

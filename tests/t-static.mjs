@@ -277,7 +277,155 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
   check("coverage: file tools can be turned off", !off.blocked);
 }
 
-// ------------------------------------------------------- custom rule modes --
+// --------------------------------------------------- secret paths (P0.1) ---
+// A credential store is a static decision: no model call in any mode, and the
+// block reason names the file rather than the pattern that matched it.
+{
+  const write = (target) => ({ toolName: "write", input: { path: target, content: "x", i: "update the config" } });
+  for (const [target, expected, label] of [
+    [`${CWD}\\.env`, true, ".env in the project"],
+    [`${CWD}\\id_rsa`, true, "a private key"],
+    [`${CWD}\\certs\\server.pem`, true, "a .pem"],
+    [`${CWD}\\keystore.p12`, true, "a .p12"],
+    [`${CWD}\\.npmrc`, true, ".npmrc"],
+    [`${CWD}\\auth.json`, true, "auth.json"],
+    [`${CWD}\\.git-credentials`, true, ".git-credentials"],
+    [`~/.aws/credentials`, true, ".aws/credentials"],
+    [`~/.ssh/id_rsa`, true, ".ssh/id_rsa"],
+    [`~/.config/gh/hosts.yml`, true, "gh hosts.yml"],
+    [`${CWD}\\notes.txt`, false, "an ordinary file"],
+    [`${CWD}\\src\\app.ts`, false, "a source file"],
+    [`${CWD}\\.env.example`, false, ".env.example is a template"],
+    [`${CWD}\\.env.sample`, false, ".env.sample is a template"],
+    [`${CWD}\\src\\.envrc`, false, ".envrc is not .env"],
+  ]) {
+    const p = await run(write(target), { config: cfg({ mode: "medium" }) });
+    check(`secret write ${expected ? "blocked" : "allowed"}: ${label}`, p.blocked === expected && p.completions === 0, JSON.stringify(p.result)?.slice(0, 200));
+  }
+  const p = await run(write(`${CWD}\\.env`), { config: cfg({ mode: "medium" }) });
+  const reason = String(p.result?.reason ?? "");
+  check("secret write: the reason names the file, the rule and the mode", /^destructive-check: /.test(reason) && /rule: protectSecrets/.test(reason) && /\.env/.test(reason) && /mode: medium/.test(reason), reason);
+  check("secret write: the reason keeps the retry sentence", /another tool/.test(reason), reason);
+  check("secret write: no pattern is named instead of the file", !/\.env\.\*/.test(reason), reason);
+}
+{
+  // The same rule through every other channel: a patch section, a structured
+  // edit, a delete and a redirect.
+  const patch = await run({ toolName: "apply_patch", input: { input: "*** Begin Patch\n*** Update File: .env\n@@\n-A=1\n+A=2\n*** End Patch", i: "bump env" } }, { config: cfg({ mode: "medium" }) });
+  check("secret patch: an update section naming .env is blocked", patch.blocked && /protectSecrets/.test(String(patch.result?.reason ?? "")), JSON.stringify(patch.result)?.slice(0, 200));
+
+  const structured = await run({ toolName: "edit", input: { path: `${CWD}\\.env`, edits: [{ op: "replace", find: "A=1", replace: "A=2" }], i: "bump env" } }, { config: cfg({ mode: "hard" }) });
+  check("secret edit: the structured form's path is checked", structured.blocked && /protectSecrets/.test(String(structured.result?.reason ?? "")), JSON.stringify(structured.result)?.slice(0, 200));
+
+  const removed = await run(cmd("rm -rf .env"), { config: cfg({ mode: "medium" }) });
+  check("secret delete: rm of .env is blocked without a model call", removed.blocked && removed.completions === 0 && /protectSecrets/.test(String(removed.result?.reason ?? "")), JSON.stringify(removed.result)?.slice(0, 200));
+
+  const redirect = await run(cmd("echo A=1 > .env"), { config: cfg({ mode: "medium" }) });
+  check("secret redirect: `> .env` is blocked", redirect.blocked && /protectSecrets/.test(String(redirect.result?.reason ?? "")), JSON.stringify(redirect.result)?.slice(0, 200));
+}
+{
+  // Mode mapping: simple asks (the user can still say yes), medium and hard block.
+  const asked = await run(cmd("rm -rf .env"), { config: cfg({ mode: "simple" }), selects: ["Allow once"] });
+  check("[simple] a secret delete asks the user and can be allowed once", !asked.blocked && asked.completions === 0, JSON.stringify(asked.result)?.slice(0, 200));
+  const denied = await run(cmd("rm -rf .env"), { config: cfg({ mode: "simple" }), selects: ["Block"] });
+  check("[simple] a secret delete blocks when the user declines", denied.blocked, JSON.stringify(denied.result)?.slice(0, 200));
+  for (const mode of ["medium", "hard"]) {
+    const p = await run(cmd("rm -rf .env"), { config: cfg({ mode }) });
+    check(`[${mode}] a secret delete is blocked statically`, p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 200));
+  }
+  const custom = await run(cmd("rm -rf .env"), { config: cfg({ mode: "custom", rules: { protectSecrets: "allow", insideDelete: "allow" } }) });
+  check("custom: protectSecrets is a live rule that can be relaxed", !custom.blocked, JSON.stringify(custom.result)?.slice(0, 200));
+}
+
+// ------------------------------------------------------ allowDirs (P0.2) ---
+// An extra scope directory that names a root, the home or a system tree does not
+// widen the guard, it switches it off: those entries are refused and reported.
+{
+  const inside = (dirs) => run(cmd("rm -rf C:\\shared\\libs\\generated"), { config: cfg({ mode: "simple", allowDirs: dirs }) });
+  const baseline = await inside([]);
+  check("allowDirs: without an entry the delete is outside the project", baseline.blocked && baseline.completions === 0, JSON.stringify(baseline.result)?.slice(0, 200));
+  const good = await inside(["C:\\shared\\libs"]);
+  check("allowDirs: a real directory widens the scope", !good.blocked && good.completions === 0, JSON.stringify(good.result)?.slice(0, 200));
+
+  for (const [entry, label] of [
+    ["C:\\", "a drive root"],
+    ["/", "the posix root"],
+    [HOME, "the user home"],
+    [path.join(HOME, ".omp"), "the guard's own directory"],
+    ["C:\\Windows", "the windows tree"],
+    ["C:\\Program Files (x86)", "a program directory"],
+    ["/etc", "a posix system directory"],
+    ["/usr/local/bin", "a posix system bin"],
+    ["relative/path", "a relative path"],
+    ["~", "a bare tilde"],
+  ]) {
+    const p = await inside([entry]);
+    check(`allowDirs refuses ${label}`, p.blocked && p.completions === 0, `${entry} → ${JSON.stringify(p.result)?.slice(0, 160)}`);
+  }
+  // The refusal is not silent: /dc reports it instead of leaving the user with a
+  // setting that looks applied and is not.
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "simple", allowDirs: ["C:\\", "C:\\shared\\libs"] }), registry: REG });
+  const ctx = makeCtx({ cwd: CWD, hasUI: false, registry: REG });
+  await ext.commands.get("dc").handler("", ctx);
+  const report = ctx.notes.map((n) => n.message).join("\n");
+  check("allowDirs: /dc status reports the rejected entry and the reason", /rejected dirs/.test(report) && /C:\\ /.test(report) && /filesystem root/.test(report), report.slice(0, 300));
+  check("allowDirs: the accepted entry is reported as scope", /shared\\libs/.test(report), report.slice(0, 300));
+}
+
+// ------------------------------------------- redirects and writes (P0.4) ---
+// A redirect writes where it points; the verbs below each have their own
+// argument positions, so `cp a ../out/` writes outside while `cp ../out/a .`
+// only reads outside.
+{
+  for (const [command, expected, label] of [
+    ["echo hi > ../outside.txt", true, "a redirect leaving the project"],
+    ["echo hi >> ../outside.txt", true, "an append leaving the project"],
+    ["echo hi > out.json", false, "a redirect inside the project"],
+    ["echo hi > /tmp/dc-write.txt", false, "a redirect to the os temp dir"],
+    ["echo hi > /dev/null", false, "a redirect to the null device"],
+    ["echo hi > out.json 2>&1", false, "an fd duplication, not a file"],
+    ["echo hi 2> err.log", false, "an stderr redirect inside the project"],
+    ['echo "a > ../outside.txt"', false, "a redirect inside a quoted string"],
+    ["cp src/app.js ../outside/", true, "cp writing outside"],
+    ["cp ../outside/app.js src/", false, "cp reading from outside"],
+    ["cp -r src ../outside/", true, "recursive cp writing outside"],
+    ["mv src ../outside/", true, "mv writing outside"],
+    ["truncate -s 0 ../outside/notes.txt", true, "truncate outside"],
+    ["truncate -s 0 notes.txt", false, "truncate inside"],
+    ["dd if=/dev/zero of=../outside/blob bs=1M count=1", true, "dd of= outside"],
+    ["dd if=/dev/zero of=./zeros.bin bs=1M count=1", false, "dd of= inside"],
+    ["rsync -a src/ ../outside/", true, "rsync writing outside"],
+    ["rsync -a src/ dist/", false, "rsync inside the project"],
+    ["rsync -a --delete ../outside/src/ dist/", true, "rsync --delete from an outside source"],
+    ["chmod -R 755 ../outside/dir", true, "chmod -R outside"],
+    ["chmod 755 src/app.js", false, "chmod inside"],
+    ["ln -s ../outside/target link", true, "ln pointing outside"],
+    ["ln -s src/app.js link", false, "ln inside the project"],
+    ["npm test | tee ../outside/log.txt", true, "tee outside"],
+    ["npm test | tee out.log", false, "tee inside"],
+    ['sh -c "echo hi > ../outside.txt"', true, "a redirect inside a shell body"],
+    ["sudo cp src/app.js ../outside/", true, "a write behind a launcher"],
+  ]) {
+    const p = await run(cmd(command), { config: cfg({ mode: "hard" }) });
+    check(`write ${expected ? "blocked" : "allowed"}: ${label}`, p.blocked === expected && p.completions === 0, `${command} → ${JSON.stringify(p.result)?.slice(0, 180)}`);
+  }
+  const p = await run(cmd("cp src/app.js ../outside/"), { config: cfg({ mode: "hard" }) });
+  check("write: the reason keeps the structured shape", /^destructive-check: /.test(String(p.result?.reason ?? "")) && /rule: outsideWrite/.test(String(p.result?.reason ?? "")) && /mode: hard/.test(String(p.result?.reason ?? "")), p.result?.reason);
+}
+{
+  // Medium sends a write outside the project to the checker, simple asks; a
+  // target the guard cannot resolve is a dynamicTargets violation, never a pass.
+  const medium = await run(cmd("echo hi > ../outside.txt"), { config: cfg({ mode: "medium" }) });
+  check("[medium] a write outside is escalated to the checker", medium.completions === 1 && !medium.blocked, JSON.stringify(medium.result)?.slice(0, 160));
+  const simple = await run(cmd("echo hi > ../outside.txt"), { config: cfg({ mode: "simple" }), selects: ["Block"] });
+  check("[simple] a write outside asks the user", simple.blocked && simple.completions === 0, JSON.stringify(simple.result)?.slice(0, 160));
+  const remote = await run(cmd("rsync -a src/ user@host:/srv/app/"), { config: cfg({ mode: "medium" }) });
+  check("an unresolvable (remote) destination is not a clean pass", remote.blocked || remote.completions > 0, JSON.stringify(remote.result)?.slice(0, 160));
+  const heredoc = await run(cmd("cat <<'EOF' > out.json\ntee ../outside/x\nEOF"), { config: cfg({ mode: "hard" }) });
+  check("a heredoc body is data, not a command line", !heredoc.blocked && heredoc.completions === 0, JSON.stringify(heredoc.result)?.slice(0, 180));
+}
+
+
 {
   const custom = cfg({ mode: "custom", rules: { insideDelete: "ask" } });
   const allowed = await run(cmd("rm -rf src"), { config: custom, selects: ["Allow once"] });

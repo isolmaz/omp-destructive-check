@@ -19,6 +19,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
@@ -106,6 +107,35 @@ async function restore() {
   return 0;
 }
 
+// The guard is copied into the directory every omp profile loads, so a build
+// that fails its own suites must not get there. The gate runs the offline stub
+// suites (no network, isolated HOME); --skip-tests is the deliberate way past it.
+const SUITES = ["t-static.mjs", "t-llm.mjs", "t-menu.mjs", "t-coverage.mjs", "t-review.mjs"];
+
+function runTestGate() {
+  const dir = path.join(HERE, "tests");
+  for (const suite of SUITES) {
+    const file = path.join(dir, suite);
+    if (!fs.existsSync(file)) {
+      console.error(`install: ${short(file)} not found — refusing to install untested code (re-run with --skip-tests to override).`);
+      return false;
+    }
+    const run = spawnSync(process.execPath, [file], { cwd: HERE, encoding: "utf8" });
+    const out = `${run.stdout ?? ""}${run.stderr ?? ""}`;
+    if (run.status !== 0) {
+      const lines = out.split("\n").map((line) => line.trim()).filter(Boolean);
+      const fails = lines.filter((line) => line.includes("FAIL ")).slice(0, 5);
+      const errors = lines.filter((line) => /\bError\b|Exception|ENOENT/.test(line)).slice(0, 2);
+      const tail = fails.length ? fails : errors.length ? errors : lines.slice(-3);
+      console.error(`install: ${suite} failed (exit ${run.status ?? "?"}) — nothing was installed.`);
+      console.error(tail.map((line) => `         ${line}`).join("\n"));
+      return false;
+    }
+    console.log(`tests   : ${suite} ${(/(\d+\/\d+ passed)/.exec(out) ?? [, "ok"])[1]}`);
+  }
+  return true;
+}
+
 async function confirm(question) {
   if (!process.stdin.isTTY && !process.stdout.isTTY) return false;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -119,7 +149,7 @@ async function confirm(question) {
 
 async function main() {
   if (args.includes("--help") || args.includes("-h")) {
-    console.log("usage: node install.mjs [--force] [--unlock] [--restore]");
+    console.log("usage: node install.mjs [--force] [--unlock] [--restore] [--skip-tests]");
     return 0;
   }
 
@@ -129,6 +159,8 @@ async function main() {
     console.error(`install: ${short(SRC)} not found — run this script from the repository copy.`);
     return 1;
   }
+
+  if (!args.includes("--skip-tests") && !runTestGate()) return 1;
 
   const source = fs.readFileSync(SRC);
 

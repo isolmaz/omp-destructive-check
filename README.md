@@ -22,8 +22,10 @@ available, and otherwise blocks with the real error text so the failure is debug
 | --- | --- | --- | --- |
 | `catastrophic` — fork bombs, `mkfs`, `dd of=/dev/…`, `format C:`, `diskpart`, `shutdown`/`reboot`, `reg delete HK*`, `cipher /w` | block | block | block |
 | `systemTarget` — filesystem roots, `C:\Windows`, `/etc`, `~/.ssh`, `~/.config` | block | block | block |
+| `protectSecrets` — a mutating target that resolves to a credential store: `.env` (but not `.env.example`/`.env.sample`), `.ssh/**`, `.aws/credentials`, `.kube/config`, `.git-credentials`, `id_rsa*`, `*.pem`/`*.key`/`*.p12`/`*.kdbx`, `auth.json`, `.npmrc`, `.config/gh/hosts.yml` | ask | block | block |
 | `outsideDelete` — deletes whose target is outside the project | block | block | block |
 | `outsideMove` — moving data that lives outside the project, or moving it out | block | block | block |
+| `outsideWrite` — a write-like effect outside the project: `>`/`>>` destinations, and the write positions of `cp`, `mv`, `rsync`, `truncate`, `tee`, `dd of=`, `chmod`/`chown`/`chgrp`, `ln` | ask | model | block |
 | `insideDelete` — deletes inside the project that are not artifacts | allow | block | block |
 | `artifactDelete` — `node_modules`, `dist`, `build`, `.next`, temp dirs | allow | allow | allow |
 | `dynamicTargets` — targets that cannot be resolved statically (`$VAR`, `rm -rf *`) | model | model | block |
@@ -35,6 +37,23 @@ available, and otherwise blocks with the real error text so the failure is debug
 `model` or `block` and artifact cleanup stops being free. A call that produces several violations is
 decided by the **most restrictive** action among them (ties go to the higher-severity rule), so an
 allowed target can never release a blocked one.
+
+`protectSecrets` is the one rule that is decided without a model in every mode and never takes a
+second chance: rewriting or deleting a credential store is not a judgement call, and the block reason
+names the file (`"C:\proj\.env" is a credential or secret file`), never the pattern that matched it.
+It reaches `write`, `edit` and `apply_patch` (the `path` field, every `*** … File:` section, the
+hashline headers and the structured `{path, edits:[…]}` form), plus deletes, moves and write effects
+issued through `bash` and `eval`. `.env.example` and `.env.sample` are templates, so they stay free.
+
+`outsideWrite` reads a command the way the shell does: redirect destinations are taken from the
+command text with quoting respected, here-document bodies are dropped first (a body is data, and
+`bash <<'EOF'` still runs its own scan), and `2>&1`/`>&2` are file-descriptor copies, not files.
+`> /dev/null` (and `NUL`) writes nowhere and stays silent. Each verb names its own write positions —
+`cp` only its destination, `mv` sources and destination, `rsync` its destination (all sources with
+`--delete`), `dd` only `of=` (a block device stays `catastrophic`), `chmod`/`chown`/`chgrp` every
+argument after the mode/owner, `ln` both the target and the link path — so `cp ../outside/a .` is not
+flagged while `cp a ../outside/` is. A destination that cannot be resolved (a variable, a glob, or a
+remote `user@host:/path`) is a `dynamicTargets` violation, never a clean pass.
 
 `gitDestructive` follows what git actually does, not one spelling of it: `--force-with-lease` is
 deliberately **allowed** (it refuses to overwrite a ref that moved since the last fetch), `+HEAD:main`
@@ -56,6 +75,11 @@ Project scope = the session `cwd` + the nearest `.git` root + any directory adde
 Artifacts are only recognized **inside** that scope or under the OS temp directory: `rm -rf D:\other-project\out`
 is not treated as a build-artifact cleanup.
 
+Scope and targets are compared as **real** paths: `realpathSync` — through the nearest existing
+ancestor when the target does not exist yet — resolves junctions and symlinks, so a link inside the
+project that points outside is classified as outside, and a link that points back in is classified as
+inside. The result is cached per session, which is what keeps the static layers at 0 ms.
+
 Each rule can be set to one of four actions:
 
 - `block` — refuse the call, no model, no prompt.
@@ -63,11 +87,21 @@ Each rule can be set to one of four actions:
 - `model` — ask the checker model (bounded, cached).
 - `allow` — let it through.
 
+## Watch mode (dry-run)
+
+`dryRun: true` (or `OMP_DC_DRYRUN=1`) computes and logs **every** decision and enforces none of them:
+nothing is blocked and nothing is asked, and the audit entry says `would-block` instead of `block`. A
+`model` rule is still put to the checker — the point of a calibration run is to see what the policy
+would have caught on real traffic before you turn it on. The status line reads `dc: WATCH · <mode>` at
+rest and `dc: WATCH · would block: <rule>` after a decision, and `session_start` prints a warning, so
+it cannot be left on by accident. Toggle it in `/dc → watch (dry-run)`.
+
 ## Coverage
 
 | Tool | Covered |
 | --- | --- |
-| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking, **script bodies** (`sh ./x.sh`, `bash -x x.sh`, `./x.sh`, `cmd /c x.cmd`) up to 64 KiB and 2 files deep |
+| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking, **script bodies** (`sh ./x.sh`, `bash -x x.sh`, `./x.sh`, `cmd /c x.cmd`) up to 64 KiB and 2 files deep, **redirect destinations** (`>`, `>>`; here-document bodies stripped, `2>&1`/`>&2` skipped, `/dev/null` and `NUL` silent) and **write verbs** with their own argument positions (`cp`, `mv`, `rsync` incl. `--delete`, `dd of=`, `truncate`, `tee`, `chmod`/`chown`/`chgrp`, `ln`) |
+| `write` | the file it writes, and nothing else: a credential store (`.env`, `id_rsa`, `*.pem`, `.ssh/**`, `.aws/credentials`, …) is blocked statically in every mode, every other write is ordinary editing work and stays free |
 | `git` | destructive subcommands: `clean`/`rm`, `reset --hard`, `push --force`/`--delete`, `branch -D` (and `-d --force`), `stash drop`/`clear`, bare `restore` (but not `--staged`, which only unstages), `checkout -f` and the `checkout [ref] -- <path>` form, `switch -f`/`--discard-changes`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, `filter-branch`/`filter-repo`. Git arguments are not path-classified: the subcommand decides, so this list is the coverage. |
 | `eval` | delete APIs in Python (`shutil.rmtree`, `os.remove`, …) and JS/TS (`fs.rmSync`, `fs.unlinkSync`, `Deno.remove`, …), plus destructive shell strings and catastrophic one-liners inside the code |
 | `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` — every file section in the payload, each move paired with the section above it — and the structured form (`{path, edits: [{op: "delete"}]}`), which is its own schema and used to be read as JSON text that matched nothing |
@@ -83,7 +117,13 @@ launched through `hub` — command *strings* were the only thing the scanner eve
 node install.mjs            # copies the extension to ~/.omp/shared/ and prints the config.yml snippet
 node install.mjs --force    # overwrite without asking (a .bak copy is kept)
 node install.mjs --unlock   # allowed to replace a copy locked from /dc; the mode is restored after
+node install.mjs --skip-tests  # skip the pre-install gate (see below); --force does not skip it
 ```
+
+Before copying anything, the installer runs the five offline stub suites (`t-static`, `t-llm`,
+`t-menu`, `t-coverage`, `t-review`) and refuses to install when one of them fails: the file it writes
+is the one every omp profile loads, so a build that cannot pass its own tests must not get there.
+`--skip-tests` is the deliberate bypass; `tests/t-install.mjs` asserts both halves.
 
 Then make sure `~/.omp/agent/config.yml` references it (the installer prints the exact block):
 
@@ -125,13 +165,22 @@ disabledExtensions:
   "cacheEnabled": true,
   "askOnDeny": true,                // model denies -> ask the user instead of blocking blind
   "askOnError": true,               // checker fails  -> ask the user instead of blocking blind
-  "allowDirs": [],                  // extra directories that count as project scope
+  "allowDirs": [],                  // extra project dirs; a root, the home or a system tree is refused and reported
+  "dryRun": false,                  // watch mode: log every decision as would-block, enforce nothing
   "logSize": 25                     // entries kept for "/dc > recent decisions"
 }
 ```
 
+`allowDirs` entries must be absolute or start with `~/`. An entry that names a filesystem root
+(`C:\`, `/`), the user's home, `~/.omp` or a system tree (`C:\Windows`, `C:\Program Files*`, `/etc`,
+`/usr`, `/bin`, `/var`) is **not** added to the scope: widening the guard to those would switch it off.
+The check runs on the entry as written *and* on its canonical form, so a link that resolves into the
+home is refused too, and `/dc → allowed dirs` (and `/dc → status`) list every refused entry with the
+reason instead of leaving a setting that looks applied and is not.
+
 Environment overrides (win over the file): `OMP_DC_DISABLE=1`, `OMP_DC_MODE`, `OMP_DC_PROVIDER`,
-`OMP_DC_MODEL`, `OMP_DC_ENGINE`, `OMP_DC_TIMEOUT_MS`, `OMP_DC_BIN` (CLI engine binary).
+`OMP_DC_MODEL`, `OMP_DC_ENGINE`, `OMP_DC_TIMEOUT_MS`, `OMP_DC_DRYRUN=1` (watch mode for one session),
+`OMP_DC_BIN` (CLI engine binary).
 
 ## Status line
 
@@ -167,6 +216,7 @@ checker                     model, engine, timeout, reasoning, token cap, self-t
 ask on deny / ask on error  toggles
 rules                       per-rule action editor (switches to custom mode)
 coverage                    bash / eval / fileTools / processes on-off
+watch (dry-run)             decide and log everything, enforce nothing (status line: dc: WATCH)
 intent                      forward the agent's one-line intent
 cache                       toggle, clear verdicts, clear session approvals
 allowed dirs                extra project directories
@@ -290,7 +340,8 @@ node tests/t-menu.mjs     # /dc menu: modes, rule edits, toggles, persistence
 node tests/t-coverage.mjs # script bodies, hub launches, probes, catastrophic class, audit log
 node tests/t-review.mjs   # the external review's 19 finding groups (paths, git, eval, hub, audit, …)
 node tests/t-isolation.mjs    # deny-ACE mechanics from the README runbook (Windows)
-node tests/mutation-check.mjs  # breaks the extension in 25 places and requires the suites to fail
+node tests/t-install.mjs      # the installer's pre-install test gate and its --skip-tests bypass
+node tests/mutation-check.mjs  # breaks the extension in 31 places and requires the suites to fail
 node tests/t-e2e.mjs           # real omp sessions against a real provider (slower, needs auth)
 ```
 
@@ -306,8 +357,13 @@ is reported as a skip, never as a pass.
 
 ## Known limitations
 
-- `write` is not guarded: creating or overwriting files is normal editing work. Deletes go through
-  `bash`, `eval`, `edit` or `apply_patch`, which are covered.
+- `write` is guarded only where it must be: a credential store (`.env`, `id_rsa`, `*.pem`, `.ssh/**`,
+  `.aws/credentials`, …) is blocked statically, and a write outside the project is classified for
+  `bash` redirects and write verbs. Any other file write is ordinary editing work and stays free.
+- Paths are resolved with `realpathSync` through the nearest existing ancestor, so a junction or
+  symlink is judged where it lands. A link created *after* the check, or one whose target cannot be
+  resolved at all, is not covered by that resolution; the per-session cache holds a result for 15
+  seconds.
 - Script bodies are read up to 64 KiB and 2 files deep, and only for shells on the command line
   (`sh ./x.sh`, `./x.sh`, `cmd /c x.cmd`). Anything else — a missing file, a binary, a script over the
   limit, a chain nested deeper, a file that changed while it was being read — falls back to
@@ -327,7 +383,6 @@ is reported as a skip, never as a pass.
   ones visible as a changed hash, but the same user can clear it. Real boundaries are in "Threat B".
 - The audit chain is tamper-*evident*: an edited or reordered line is reported, a trimmed tail is not,
   and whoever can write the file can recompute the chain.
-- Symlinks are not resolved, so a link inside the project can point outside it.
 - Path handling targets Windows + Git Bash; POSIX roots are recognized but not exhaustively.
 - In an unquoted shell word, a backslash is read as an escape for the *command* position (`r\m` is
   `rm`) while the argument text keeps its literal backslashes, so a Windows path still resolves
