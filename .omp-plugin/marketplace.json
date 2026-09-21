@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-destructive-check",
+  "owner": {
+    "name": "isolmaz"
+  },
+  "metadata": {
+    "description": "marketplace for destructive-check, a guard for destructive tool calls in oh-my-pi"
+  },
+  "plugins": [
+    {
+      "name": "destructive-check",
+      "source": "./",
+      "description": "Decides destructive tool calls before they run, in three layers: static deny, static allow, then one bounded model check.",
+      "version": "2.4",
+      "category": "security",
+      "homepage": "https://github.com/isolmaz/omp-destructive-check",
+      "repository": "https://github.com/isolmaz/omp-destructive-check",
+      "keywords": ["guard", "safety", "destructive", "policy", "git", "security"]
+    }
+  ]
+}
