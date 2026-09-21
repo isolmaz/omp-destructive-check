@@ -205,18 +205,64 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
 }
 
 {
-  // The attempt row counts the times this call was put to the user, and the
-  // second look at a cached verdict says so as well.
+  // The attempt row counts the times this call has been put to the user. A repeat
+  // after an *allow* is answered from the verdict cache and names that layer; a
+  // repeat after a *block* belongs to the second-chance loop, and the block below
+  // covers that contract.
   const once = await run({
+    config: cfg({ mode: "custom", rules: { insideDelete: "model" }, askOnDeny: true, retry: { maxAttempts: 2 } }),
+    handler: () => deny("risky"),
+    overlays: [["a"]],
+  });
+  check("approval: allowing once lets the call through", !once.blocked, JSON.stringify(once.result));
+  await callTool({ toolCall: once.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [["a"]] }));
+  const second = text(overlayLog.at(-1));
+  check("approval: a repeated call is counted as attempt 2", /Attempt\s*: 2\/2/.test(second), second.slice(0, 400));
+  check("approval: a cached verdict names the cache layer", /Layer\s*: cache/.test(second), second.slice(0, 400));
+}
+
+{
+  // The second-chance contract on the pop-up surface: the first block invites a
+  // justification, and the repeat that has nothing new to say is a hard block —
+  // no second pop-up, no third chance, and the tool-hopping sentence back.
+  const before = overlayLog.length;
+  const blocked = await run({
     config: cfg({ mode: "custom", rules: { insideDelete: "model" }, askOnDeny: true, retry: { maxAttempts: 2 } }),
     handler: () => deny("risky"),
     overlays: [["d"]],
   });
-  check("approval: declining blocks the call", once.blocked, JSON.stringify(once.result));
-  await callTool({ toolCall: once.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [["d"]] }));
-  const second = text(overlayLog.at(-1));
-  check("approval: a repeated call is counted as attempt 2", /Attempt\s*: 2\/2/.test(second), second.slice(0, 400));
-  check("approval: a cached verdict names the cache layer", /Layer\s*: cache/.test(second), second.slice(0, 400));
+  check("approval: declining blocks the call", blocked.blocked, JSON.stringify(blocked.result));
+  check("approval: the block invites the justified repeat", /repeat the same call/.test(blocked.result?.reason ?? ""), blocked.result?.reason);
+  const repeat = await callTool({ toolCall: blocked.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [["a"]] }));
+  check("approval: a repeat with nothing new to say is a hard block", repeat?.block === true && /No further attempts/.test(repeat?.reason ?? ""), repeat?.reason);
+  check("approval: the hard block opens no pop-up", overlayLog.length === before + 1, `overlays=${overlayLog.length - before}`);
+}
+
+{
+  // The allowlist editor is where an approval stops applying: a human's session
+  // answer is listed with its source and time, and a model's justified allow is
+  // listed as session-only — it never reaches the permanent file.
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "custom", rules: { insideDelete: "model" }, askOnDeny: true }), registry: REG });
+  installFetch(() => deny("risky"));
+  const answered = await callTool(ext, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [["s"]] }));
+  check("allowlist: the pop-up answer was a session approval", !answered?.block && overlayLog.at(-1)?.done === "allowSession", String(overlayLog.at(-1)?.done));
+  const stillAllowed = await callTool({ toolCall: ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] }));
+  check("allowlist: the session approval is in force", stillAllowed === undefined, JSON.stringify(stillAllowed));
+  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] });
+  await ext.commands.get("dc").handler("", panelCtx);
+  const rows = overlayLog.at(-1)?.options ?? [];
+  check("allowlist: the panel has an Allowlist section", rows.some((row) => row.label === "Allowlist" && row.section), rows.map((row) => row.label).slice(0, 8).join(" | "));
+  check("allowlist: a human approval is listed with its source and time", rows.some((row) => /^human \(session\) · insideDelete · /.test(String(row.label))), rows.map((row) => row.label).join(" | "));
+  check("allowlist: every row explains itself", rows.filter((row) => !row.section).every((row) => String(row.description ?? "").trim()), "a panel row has no description");
+  const removeId = rows.find((row) => String(row.id).startsWith("allow.row:"))?.id;
+  check("allowlist: the approval row is removable", Boolean(removeId), JSON.stringify(rows.map((row) => row.id)));
+  const removeCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [() => removeId, () => "close"] });
+  await ext.commands.get("dc").handler("", removeCtx);
+  check("allowlist: removing a row reports it", removeCtx.notes.some((note) => /approval removed/.test(String(note.message))), JSON.stringify(removeCtx.notes));
+  const after = overlayLog.at(-1)?.options ?? [];
+  check("allowlist: the removed approval is gone from the editor", !after.some((row) => String(row.id).startsWith("allow.row:")), after.map((row) => row.label).join(" | "));
+  const askedAgain = await callTool({ toolCall: ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] }));
+  check("allowlist: removing the approval asks again", askedAgain?.block === true, JSON.stringify(askedAgain));
 }
 
 {

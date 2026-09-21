@@ -279,6 +279,31 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc cycles the trust erosion mode", config.erosion?.mode === "log", JSON.stringify(config.erosion));
 }
 {
+  // The exemption list is stored policy: the row adds one rule to it, and the
+  // three fixed rules are a floor, not a setting — they never reach the file.
+  const added = await menu({ selections: [pick("retry:"), pick("exempt from the loop: insideDelete"), pick("close"), pick("close")] });
+  check("/dc stores an extra exemption from the loop", (added.config.retry?.exempt ?? []).includes("insideDelete"), JSON.stringify(added.config.retry));
+  check("/dc never writes the fixed exemptions to the file", !(added.config.retry?.exempt ?? []).includes("catastrophic"), JSON.stringify(added.config.retry));
+  const removed = await menu({
+    config: cfg({ retry: { exempt: ["insideDelete"] } }),
+    selections: [pick("retry:"), pick("exempt from the loop: insideDelete"), pick("close"), pick("close")],
+  });
+  check("/dc takes a rule back out of the exemption list", !(removed.config.retry?.exempt ?? []).includes("insideDelete"), JSON.stringify(removed.config.retry));
+  const cleared = await menu({
+    config: cfg({ retry: { exempt: ["insideDelete", "scriptExec"] } }),
+    selections: [pick("retry:"), pick("always exempt"), pick("close"), pick("close")],
+  });
+  check("/dc clears the extra exemptions from the fixed row", (cleared.config.retry?.exempt ?? []).length === 0, JSON.stringify(cleared.config.retry));
+}
+{
+  // The trash directory is where a justified delete is moved instead of removed:
+  // a text row, so the value has to survive the round trip through the file.
+  const { config } = await menu({ selections: [pick("retry:"), pick("trash directory"), pick("close"), pick("close")], inputs: ["D:\\dc-trash"] });
+  check("/dc stores the trash directory", config.recovery?.dir === "D:\\dc-trash", JSON.stringify(config.recovery));
+  const blank = await menu({ selections: [pick("retry:"), pick("trash directory"), pick("close"), pick("close")], inputs: ["   "] });
+  check("/dc ignores an empty trash directory", blank.config.recovery?.dir === undefined, JSON.stringify(blank.config.recovery));
+}
+{
   // The pick-up panel is the other setting surface: it writes the same keys.
   const before = overlayLog.length;
   const { config } = await menu({ overlay: true, overlays: [["\r", "\u001b"]] });

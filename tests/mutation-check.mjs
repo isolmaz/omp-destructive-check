@@ -17,9 +17,21 @@ const original = fs.readFileSync(EXT, "utf8");
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "dc-mutation-"));
 const COPY = path.join(WORK, "destructive-check.ts");
 
-function runSuite(suite, extPath) {
+// Each gate run gets its own scratch root: two suites (or two gates) running at
+// the same time must not share ~/.omp-destructive-check-tests/<suite> state, or a
+// concurrent run's leftovers turn into phantom failures. It stays outside the OS
+// temp directory on purpose — the guard treats temp paths as disposable
+// artifacts, so a scratch HOME under %TEMP% would change what the policy cases
+// actually test.
+const ROOT = path.join(os.homedir(), ".omp-destructive-check-tests", `mutation-${process.pid}`);
+
+function runSuite(suite, extPath, label = "baseline") {
+  // One scratch root per run, not per gate: a suite that leaves state behind
+  // (an audit log, a trash directory, a config) must not be able to turn the next
+  // mutation's run into a phantom crash or a phantom pass.
+  const root = path.join(ROOT, String(label).replace(/[^a-z0-9]+/gi, "-").slice(0, 60) || "run");
   try {
-    const out = execFileSync(process.execPath, [suite], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DC_EXT: extPath } });
+    const out = execFileSync(process.execPath, [suite], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DC_EXT: extPath, DC_TEST_ROOT: root } });
     return { code: 0, out };
   } catch (err) {
     return { code: err.status ?? 1, out: `${err.stdout ?? ""}${err.stderr ?? ""}` };
@@ -301,11 +313,60 @@ const mutations = [
     to: "  if (false) return flagged.filter(Boolean);",
   },
   {
-    name: "file tools are not classified against the scope again",
-    suite: "tests/t-static.mjs",
-    expect: "write: a system file is a systemTarget",
-    from: '    for (const target of fileToolTargets(input, text)) violations.push(...writeTargetViolations(target, scope, ""));',
-    to: "    void fileToolTargets;",
+    name: "recovery rewrites a delete even when the mode is off",
+    suite: "tests/t-llm.mjs",
+    expect: "recovery: mode=off leaves the approved command alone",
+    from: "  if (plan.kind !== \"bash\" || !recoveryApplies(rule)) return null;",
+    to: "  if (plan.kind !== \"bash\") return null;",
+  },
+  {
+    name: "the policy block is dropped from the checker prompt",
+    suite: "tests/t-llm.mjs",
+    expect: "the policy block leads the prompt and survives the budget",
+    from: "  return fitPrompt(policyBlock(Math.floor(CFG.maxPromptChars * 0.6)), lines.join(\"\\n\"));",
+    to: "  return fitPrompt(\"\", lines.join(\"\\n\"));",
+  },
+  {
+    name: "authority=off still invites a justified repeat",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: authority=off offers no invitation",
+    from: "  if (retryAuthority() === \"off\") return \"the retry authority is off\";",
+    to: "  if (false) return \"\";",
+  },
+  {
+    name: "the session retry budget is ignored",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: the session budget is spent after one retry",
+    from: "  if (retriesSpent >= CFG.retry.sessionBudget) return \"the session's retry budget is used up\";",
+    to: "  if (false) return \"\";",
+  },
+  {
+    name: "the exempt floor can be emptied by the config",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: an exempt rule gets no invitation",
+    from: "  const out = new Set(RETRY_EXEMPT_RULES);",
+    to: "  const out = new Set();",
+  },
+  {
+    name: "an unjustified repeat reaches the retry checker",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: a repeat with nothing new to say is a hard block",
+    from: "  if (!justification.text) {",
+    to: "  if (false) {",
+  },
+  {
+    name: "a claim is believed without being verified",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: a false committed claim blocks",
+    from: "  if (CFG.verify.level !== \"off\" && !ok) {",
+    to: "  if (false) {",
+  },
+  {
+    name: "the retry verdict enum is not checked",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: an unknown decision value is not a verdict",
+    from: "  if (decision !== \"allow\" && decision !== \"block\") return null;",
+    to: "  if (false) return null;",
   },
 ];
 
@@ -331,7 +392,7 @@ try {
         continue;
       }
       fs.writeFileSync(COPY, mutated);
-      const { out: output } = runSuite(m.suite, COPY);
+      const { out: output } = runSuite(m.suite, COPY, m.name);
       // A suite that dies before printing its report proves nothing: without the
       // report there are no FAIL lines, and "no FAIL lines" is exactly what a
       // surviving mutation looks like. Count it as a crash, never as a catch.
@@ -350,4 +411,5 @@ try {
   }
 } finally {
   fs.rmSync(WORK, { recursive: true, force: true });
+  fs.rmSync(ROOT, { recursive: true, force: true });
 }

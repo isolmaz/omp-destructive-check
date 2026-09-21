@@ -79,6 +79,7 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
   const mod = await import(`${pathToFileURL(target).href}?v=${++seq}`);
   const handlers = new Map();
   const commands = new Map();
+  const tools = new Map();
   const execCalls = [];
   const pi = {
     on(event, handler) {
@@ -87,6 +88,13 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
     },
     registerCommand(name, def) {
       commands.set(name, def);
+    },
+    // The LLM-callable tools an extension registers (dc_justify). A host that
+    // cannot register tools is a host the guard must survive, which is why the
+    // extension calls this through `?.` — the stub offers it so the tool's own
+    // contract (record only, never decide) can be tested.
+    registerTool(def) {
+      if (def?.name) tools.set(def.name, def);
     },
     setLabel() {},
     async exec(cmd, args, opts) {
@@ -106,6 +114,7 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
     pi,
     handlers,
     commands,
+    tools,
     execCalls,
     configPath,
     toolCall: handlers.get("tool_call")?.[0],

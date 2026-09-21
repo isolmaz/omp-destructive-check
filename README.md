@@ -180,7 +180,7 @@ disabledExtensions:
   "providers": { "opencode-go": { "model": "deepseek-v4.1-flash" } },
   "timeoutMs": 20000,
   "maxCommandChars": 240,           // action text sent to the checker
-  "maxPromptChars": 700,            // hard cap on the whole checker prompt
+  "maxPromptChars": 1200,           // hard cap on the whole checker prompt, policy block included
   "maxIntentChars": 240,            // how much agent intent is forwarded
   "maxOutputTokens": 0,             // 0 = no cap; a cap truncates reasoning models mid-verdict
   "reasoning": "off",
@@ -193,16 +193,17 @@ disabledExtensions:
   "logSize": 25,                    // entries kept for "/dc > recent decisions"
 
   "preset": "balanced",             // quiet | balanced | strict — the friction preset (see below)
-  "policyNote": "",                 // free text the checker receives with every request (S3)
-  "retry": {                        // second-chance loop settings (the loop itself is the next stage)
+  "policyNote": "",                 // free text the checker receives with every request, in the policy block
+  "retry": {                        // the second-chance loop (see below)
     "authority": "model",           // model | ask | off
-    "maxAttempts": 1,               // justified repeats per action (0 = none)
+    "maxAttempts": 1,               // justified repeats per operation (0 = none)
     "sessionBudget": 3,             // justified repeats per session (0 = none)
-    "rememberApproved": "session"   // session | once | permanent (only human approvals are ever permanent)
+    "rememberApproved": "session",  // session | once | permanent (only human approvals are ever permanent)
+    "exempt": []                    // extra rules that never enter the loop (adds to the fixed three)
   },
-  "justifyTool": { "enabled": true },
+  "justifyTool": { "enabled": true }, // offer dc_justify to the agent
   "verify": { "level": "claims" },              // claims | claims+adversarial | off
-  "recovery": { "mode": "justified", "ttlHours": 72 },  // justified | high | off
+  "recovery": { "mode": "justified", "dir": "~/.omp/dc-trash", "ttlHours": 72 },  // justified | high | off
   "erosion": { "mode": "session" },             // session | log | off
 
   "ui": {
@@ -222,9 +223,129 @@ disabledExtensions:
 disagrees with the values beside it: `quiet` = allow-on-deny off, retry authority off,
 verification off; `balanced` = the defaults above; `strict` = allow-on-deny off, retry
 authority off, adversarial verification. The panel shows `custom` when the values were
-changed one by one. `retry.*`, `verify.*`, `recovery.*`, `erosion.*` and the `justifyTool`
-switch are stored and shown today; the second-chance loop that reads them is the next
-stage, and until it lands they are recorded policy.
+changed one by one.
+
+## The second chance (justification loop)
+
+A destructive call the guard refuses is not always a call the user would refuse. For rules that
+are not exempt, the block reason ends with an invitation instead of the flat refusal:
+
+```
+This action is recoverable and may be intended. If it is, explain in your next message what will
+change and why that is safe (which paths, which data), then repeat the same call. A repeat without
+a concrete justification is blocked again. Do not attempt it through another tool.
+```
+
+Exempt rules (`catastrophic`, `systemTarget`, `protectSecrets`) never get that sentence — and never
+enter the loop, whatever `retry.exempt` says: the fixed three are a floor the config can only add to.
+A repeat with nothing new to say is a hard block too (`No further attempts on this operation; ask the
+user to confirm it in /dc before repeating it.`), as is a second refusal of any kind.
+
+The loop is bounded four ways:
+
+| Bound | Setting | Effect |
+| --- | --- | --- |
+| attempts per operation | `retry.maxAttempts` (1) | justified repeats of one operation; `0` disables the loop for every operation |
+| budget per session | `retry.sessionBudget` (3) | total justified repeats in a session; `0` disables the loop |
+| second-chance request | — | exactly **one** extra checker request, inside the same `timeoutMs` budget as the first |
+| authority | `retry.authority` | `model` = the checker may allow it · `ask` = the user decides every repeat · `off` = no loop at all |
+
+An operation is `tool + workspace + the call text` (whitespace is not part of it), so the repeat has
+to be the same call — a different target or a different command is a new decision, and a retry through
+another tool is still refused.
+
+**Two ways to justify.** The agent's next message is read automatically (the text that preceded the
+first attempt is *not* a justification — it has to be new), and `dc_justify` adds a structured record:
+
+```
+dc_justify({ target: "src", intent: "src is regenerated output, the .gitignore covers it",
+             evidence: "git status --porcelain src is empty", policyClause: "…" })
+```
+
+The tool is visible, read-only, and records nothing but that record; it never changes the policy and
+never allows anything on its own. A one-line note about it is injected on every turn where the loop
+is live.
+
+**The retry verdict is JSON and nothing else** — `{"decision":"allow"|"block","confidence":"low"|"high",
+"reason":"…","claims":[…]}`. Prose, a missing reason or an unknown enum value is not a verdict: the
+repeat is blocked exactly like any other unparsable answer, and the line parser that reads the normal
+verdict is never used on this path.
+
+**Claims are checked by the guard, not by the model.** An `allow` counts only when at least one claim
+verifies:
+
+| Claim | What dc checks |
+| --- | --- |
+| `committed` | `git status --porcelain -- <path>` is empty **and** `git log -1 --format=%H -- <path>` is not |
+| `ignored` | `git check-ignore -q <path>` exits 0 |
+| `artifact` | the path classifies as a build artifact or temp path (confirmed with `check-ignore` when git can answer) |
+| `user_authorized` | the target is named in one of the last 12 user messages, collected from the `context` event |
+| `resolved_targets` | the list matches the targets the classifier resolved, exactly — a call with unresolved targets fails this |
+
+Git runs read-only, only on the retry path, through the host's own `exec` (never a process of the
+guard's own). `verify.level: claims+adversarial` adds one more request for the high-severity rules
+(`outsideDelete`, `outsideMove`, `outsideWrite` and the fixed three) that asks only for a
+counterexample: a counterexample, or an answer that is neither `COUNTEREXAMPLE:` nor `NONE`, blocks.
+`verify.level: off` skips the whole claim table — the model's own confidence is then the only signal.
+
+**The authority matrix** (a stricter signal always wins):
+
+| Verdict | `retry.authority: model` | `ask` |
+| --- | --- | --- |
+| `allow` + `high` + a verified claim | allowed, audit `authority: model` | pop-up |
+| `allow` + `low` | pop-up | pop-up |
+| `block`, unverified claim, unparsable answer | hard block | hard block |
+
+**Recovery.** With `recovery.mode: justified` (the default), a delete that a justification got
+approved is rewritten before it runs: the guard returns a revised input to the host, so the command
+that executes — and that the host's own approval gate re-resolves — is a move into the trash instead
+of a delete.
+
+```
+rm -rf src
+→ mkdir -p "C:/Users/you/.omp/dc-trash/<session>/20260922-140312" && mv -f -- "src" "…/1-src" &&
+  echo "destructive-check: moved src to …/1-src"
+```
+
+The `echo` is what makes the tool result say what actually happened to the files, and the move is a
+rename, not a copy — the bytes never pass through the guard. Entries older than `recovery.ttlHours`
+are removed on the next session start, bounded and silent. `high` limits the rewrite to the
+high-severity rules, `off` never rewrites. A delete the guard cannot express as a single move (a
+`git reset`, an eval loop, a compound command, several targets in one line) keeps its allow and runs
+unchanged: recovery covers the simple `rm`, and the audit line records whether it was applied.
+
+**Trust erosion.** The claim that was verified is the one thing a justification adds, so a claim that
+turns out to be false has to cost something. Verified `committed` claims are re-checked once, at the
+next tool call; when git now reports changes for that path, the audit gets
+`action: "erosion", justification: false` and — in `erosion.mode: session` — `retry.authority` drops
+to `ask` for the rest of the session (the panel shows `retry authority: ask (eroded by a false claim)`).
+`log` records the contradiction without the drop, `off` ignores it.
+
+## The checker knows the user's policy
+
+Every checker request — the normal one and the retry one — starts with a block generated from your own
+settings, never from agent text:
+
+```
+=== User policy (authoritative, set by the human) ===
+mode: medium · friction: balanced (the default: ask when the model denies, second chances allowed, claims verified)
+rules that do not simply block: outsideWrite=model, artifactDelete=allow, dynamicTargets=model, …
+second chance: model · 1 per action · 3 left this session
+verification: claims · recovery: justified · trust erosion: session
+note from the user (trusted, written by the human): "Bu makinede arşiv klasörüne dokunma."
+=== end policy ===
+```
+
+`quiet` adds "low-risk, recoverable work is not worth a block — still block anything suspicious or
+irreversible"; `strict` adds "block when in doubt, and do not expect a second chance". The system prompt
+names the block authoritative, it is written first, and it gets its budget before the action text is
+trimmed — a `maxPromptChars` small enough to clip the block itself is one you set on purpose. The whole
+request stays inside `maxPromptChars` (1200 by default; the retry request gets at least 1600, because it
+carries the justification).
+
+Every retry leaves an audit line with `attempt`, `authority`, `justificationHash`/`justificationLen`,
+`claims` (type, and `!` when the guard could not verify it), `recovery` (the trash path) and `erosion`
+— all inside the hash chain, so a claim or an authority cannot be edited out of a line.
 
 `allowDirs` entries must be absolute or start with `~/`. An entry that names a filesystem root
 (`C:\`, `/`), the user's home, `~/.omp` or a system tree (`C:\Windows`, `C:\Program Files*`, `/etc`,
@@ -251,14 +372,21 @@ the attempt count against `retry.maxAttempts`.
 │ ───────────────────────────────────────────────────────────────────────── │
 │ Why: Delete inside the project — "src" is inside the project              │
 │ Action: rm -rf src                                                       │
-│ Layer: static (ask)                                                      │
-│ Attempt: 1/1 · model                                                     │
+│ Layer: model (justified, low confidence) (2210 ms)                       │
+│ Attempt: 2/2 · model                                                     │
+│ Justify: "src is regenerated output and .gitignore covers it — git        │
+│           status --porcelain src is empty, the file is committed"        │
 │ ───────────────────────────────────────────────────────────────────────── │
 │ ▸ [a] Allow once        run this command now; the next one is checked …   │
 │   [s] Allow for this session                                             │
 │   [d] Deny              refuse the command; nothing is executed           │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
+
+The `Justify:` row appears only when there is a justification to show — the retry path, where the
+checker allowed the repeat with low confidence and the decision comes back to you. The `Layer:` row
+names the layer *and* the authority (`model (justified, high confidence)` never opens this pop-up
+under `retry.authority: model`; `ask` always does).
 
 - `a` / `s` / `d` answer directly; the arrow keys move the highlight and Enter takes it.
 - **Esc is Deny** — the fail-closed answer, never "close and carry on". So is a host that hands the
@@ -286,7 +414,9 @@ Simple                 friction preset · policy note · status line
 Protection             mode · every rule's action · watch (dry-run) · agent intent
 Coverage               bash · eval · fileTools · processes
 Retry & justification  authority · attempts per action / per session · remembering approvals ·
-                       justify tool · verification · recovery (+ retention) · trust erosion
+                       justify tool · verification · recovery (+ directory, retention) ·
+                       trust erosion · which rules are exempt from the loop
+Allowlist              every approval in force: session and permanent, one row per entry · clear all
 Checker                model · engine · timeout · reasoning · token cap · self-test
 UI                     pop-up mode · status line · pop-up buttons · session summary
 Advanced               allowed dirs · rejected entries · history size · cache clears · env overrides
@@ -294,17 +424,24 @@ Guard                  integrity · lock · restore the previous guard (.bak)
 History                the last decisions · explain a decision · audit entries · chain check
 ```
 
+The **Allowlist** section is the editor for the approvals the guard is holding: one row per entry with
+its source and time (`human (session) · insideDelete · rm -rf src`, `model (session only) · …`,
+`permanent · …`). Activating a row removes that approval, so the operation is checked again; `clear all`
+empties the session list and the permanent file. A model's justified allow is **never** written to
+`~/.omp/destructive-check-allow.json` — only an answer you gave yourself can become permanent
+(`retry.rememberApproved: permanent`).
+
 Cycles and toggles are applied in place and written to the config immediately. Rows that need a real
-prompt (the policy note, the checker model, allowed dirs) close the panel first, so the host's own
-input owns the keyboard. Every row carries a one-line explanation, and the tests treat a row without
-one as a defect — the same rule the plain menu has always had.
+prompt (the policy note, the checker model, the trash directory, allowed dirs) close the panel first,
+so the host's own input owns the keyboard. Every row carries a one-line explanation, and the tests
+treat a row without one as a defect — the same rule the plain menu has always had.
 
 ### Decision history and explain
 
 The History section lists the last decisions from the audit file (newest last) with their rule, layer,
 latency, directory and a short command. Activating one shows the whole trace: rule, layer, action,
-tool, mode, time, latency, cwd, target, command and session. `/dc → explain a decision` does the same
-from the plain menu.
+tool, mode, time, latency, attempt, authority, justification hash and length, claims, recovery path,
+erosion, cwd, target, command and session. `/dc → explain a decision` does the same from the plain menu.
 
 ### Session summary
 
@@ -365,6 +502,7 @@ friction preset: balanced   quiet ("do not bother me") | balanced | strict — s
 policy note: none           free text that goes with the checker request; a human wrote it, so unlike the agent's text it is trusted
 ui: bar · standard · host   pop-up mode, status line, session summary
 retry: model · 1/3          retry authority and budgets, remembering approvals, verification, recovery, erosion
+allowlist: 2 session · 0 permanent  the approvals in force — remove one, or clear them all (model approvals are session-only)
 checker                     model, engine, timeout, reasoning, token cap, self-test
 ask on deny / ask on error  toggles
 rules                       per-rule action editor (switches to custom mode)
@@ -383,7 +521,10 @@ status                      full configuration dump
 ## Audit log
 
 Every decision is appended to `~/.omp/logs/destructive-check.jsonl`, one JSON object per line
-(`ts`, `tool`, `rule`, `action`, `detail`, `command`, `cwd`, `mode`, `ms`). The in-memory list behind
+(`ts`, `tool`, `rule`, `action`, `detail`, `command`, `cwd`, `mode`, `ms`). A retry decision adds
+`attempt`, `authority` (`model` or `user`), `justification` (whether a claim backed it),
+`justificationHash` and `justificationLen`, `claims` (each type, `!` when the guard could not verify
+it), `recovery` (the trash path the delete was moved to) and `erosion`. The in-memory list behind
 `recent decisions` dies with the session; the file is what makes a decision reviewable afterwards.
 It rotates to `.1` at 5 MiB and keeps the last two files.
 
@@ -472,7 +613,8 @@ the ACLs in this list.
 - **The checker is asked for one binary answer per call**: `block` / `ask` / `model` / `allow`. When a
   call fires several rules, the most restrictive action wins (ties: higher-severity rule), so a
   "model"-action finding and a "block"-action finding on the same call end in a block.
-- The verdict prompt is bounded: action text (`maxCommandChars`), `cwd`, each fired rule with the target
+- The verdict prompt is bounded: the authoritative user-policy block, then the action text
+  (`maxCommandChars`), `cwd`, each fired rule with the target
   the classifier resolved for it, and — when `includeIntent` is on — the agent's one-line intent,
   explicitly labelled as agent-written and untrusted (it is context for the checker, never evidence,
   and the system prompt says so).
@@ -495,7 +637,7 @@ node tests/t-coverage.mjs # script bodies, hub launches, probes, catastrophic cl
 node tests/t-review.mjs   # the external review's 19 finding groups (paths, git, eval, hub, audit, …)
 node tests/t-isolation.mjs    # deny-ACE mechanics from the README runbook (Windows)
 node tests/t-install.mjs      # the installer's pre-install test gate and its --skip-tests bypass
-node tests/mutation-check.mjs  # breaks the extension in 31 places and requires the suites to fail
+node tests/mutation-check.mjs  # breaks the extension in 48 places and requires the suites to fail
 node tests/t-e2e.mjs           # real omp sessions against a real provider (slower, needs auth)
 ```
 
@@ -510,6 +652,25 @@ needs a driver model that will issue the call at all; `deepseek-v4.1-flash` ofte
 is reported as a skip, never as a pass.
 
 ## Known limitations
+
+- **Recovery covers the simple delete.** The rewrite to a trash move understands one sub-command with
+  one delete verb whose operands the classifier resolved statically, and nothing else in the line. A
+  `git reset --hard`, an `eval` loop, `rm -rf a && npm ci`, a glob or a `~` path keeps its allow and
+  runs unchanged — the audit line simply carries no `recovery` field. `mv` is a rename on the same
+  volume and a copy-plus-unlink across volumes, so a target on another drive is recovered more slowly.
+- **The loop is a judgement, not a proof.** The checker can still be talked into an `allow` by a
+  plausible-sounding justification; what the guard adds is that at least one *claim* has to survive its
+  own check, that the same operation is only repeated once, that the whole thing is bounded per
+  session, and that exempt rules never enter it at all. `verify.level: off` removes the claim check and
+  leaves the model's confidence as the only signal — it is a deliberate setting, not a default.
+- **`user_authorized` is a substring check** against the last twelve user messages. It proves the user
+  named the target, not that they authorized this call; a message that mentions the path for another
+  reason counts as well.
+- **Erosion re-checks `committed` claims only**, once, at the next tool call. A claim that becomes
+  false later in the session (or a claim that was never `committed`) leaves no trace.
+- **`dc_justify` is not a promise.** It records what the agent says; the guard decides whether the
+  record is worth anything, and a record that names a target the classifier did not resolve never
+  matches the call.
 
 - `write` is guarded by classification, not by a sandbox: a credential store, a system tree or a path
   outside the project is caught through `bash`, `eval` and the file tools, and a target the guard

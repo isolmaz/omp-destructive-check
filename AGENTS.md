@@ -80,7 +80,19 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
    `dc: <mode>` and decisions append `· blocked · <rule label>`. Integrity, lock state and the audit
    path belong in `/dc → status`, not on that line.
 14. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
-   the "do not retry this through another tool" sentence. Tests and users match on that shape.
+    the "do not retry this through another tool" sentence. Tests and users match on that shape.
+    For a rule that is not exempt the block ends with the retry invitation instead of the flat refusal —
+    that sentence *is* how the loop is announced, so it is part of the contract too.
+15. **The second chance is bounded and recorded.** `catastrophic`, `systemTarget` and `protectSecrets`
+    are a floor `retry.exempt` can only add to — no setting re-opens the loop for them, and a repeat of
+    one is an ordinary block. A repeat without a justification is a block with nothing new to say
+    (`No further attempts…`): the guard never spends a checker call on it, and the same operation is
+    only ever retried once (`retry.maxAttempts`, `retry.sessionBudget`, `0` = off). One retry means one
+    extra checker call inside the **same** `timeoutMs` budget as the first request (invariant 3) — a
+    deadline shared, never restarted. A retry verdict is JSON or it is nothing: prose, a missing reason,
+    an unknown enum value or a claim the guard cannot check are all blocks, and every retry records
+    `attempt`, `authority`, the justification hash/length, the claim verdicts, the recovery path and any
+    erosion **inside the hashed audit payload** (invariant 8), so none of it can be edited out of a line.
 
 ## Checker wiring (the parts that actually bite)
 
@@ -95,7 +107,14 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
   so it gets a generous ceiling. When a provider does truncate (`finish_reason: length`), the checker
   reports that: an empty message is an error, never a silent ALLOW.
 - **Only the assistant message is a verdict.** `reasoning_content` is dropped — a verdict parsed out of
-  a thinking trace is text the model wrote while thinking, not a decision.
+  a thinking trace is text the model wrote while thinking, not a decision. The *retry* verdict is not
+  even that: it is the JSON object `{decision, confidence, reason, claims}` or nothing, and a prose
+  reply fails closed like any other unparsable answer.
+- **The second chance is a channel the agent can see.** `dc_justify` is registered with `approval:
+  "read"` and a one-line `before_agent_start` custom message names it; the *automatic* half reads the
+  last assistant message from the branch, and the *user* half reads the `context` event (the `input`
+  event never fires in RPC/print). Both halves are agent text: they travel to the checker inside an
+  `<untrusted_justification>` block and are never evidence — the claims are what the guard checks.
 - **The CLI binary is resolved, not assumed.** `OMP_DC_BIN` / `OMP_BIN` win; otherwise
   `process.execPath` when it *is* omp (the normal case, extensions run inside omp), else `omp` from
   PATH. A test runner or editor host must not spawn its own runtime as the checker.
@@ -130,7 +149,7 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 - **A check must be able to fail.** Before adding one, name the plausible bug it catches. No
   tautologies (`x !== undefined` on a value you just built), no re-asserting the same path across
   modes, no asserting source text or mock echoes.
-- `tests/mutation-check.mjs` enforces that: it breaks the extension in 25 places and requires the
+- `tests/mutation-check.mjs` enforces that: it breaks the extension in 48 places and requires the
   suites to catch every break. **Run it after touching policy or checker code**; a "PATTERN NOT
   FOUND" line means the mutation went stale and the gate fails.
 - The harness **fails closed**: `loadExt`'s default `exec` stub returns exit code 1, so a test that

@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, dialogDefects, confirmLog, selectLog, EXT_PATH } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, dialogDefects, confirmLog, selectLog, overlayLog, EXT_PATH } from "./harness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AUDIT = path.join(HERE, "..", "tools", "dc-audit.mjs");
@@ -212,7 +212,10 @@ for (const [command, label] of [
   // Start from a known-empty log: "the file exists" would pass on a stale one
   // and assert nothing about this decision.
   fs.rmSync(LOG, { force: true });
-  const p = await run(cmd("rm -rf C:\\other\\project\\data"));
+  // The mode is pinned here, not inherited: this row asserts the mode the line
+  // records, so it has to be the config that produced this line — a run that
+  // started from a brand-new scratch root must see the same file as a reused one.
+  const p = await run(cmd("rm -rf C:\\other\\project\\data"), { config: cfg({ mode: "hard" }) });
   const lines = fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf8").split("\n").filter(Boolean) : [];
   check("audit: a blocked decision is appended to the log file", p.blocked && lines.length === 1, `${lines.length} line(s) in the log`);
   if (lines.length) {
@@ -505,6 +508,73 @@ try {
   } catch {
     /* scratch cleanup */
   }
+}
+
+// ------------------------------------------- the second chance (audit) ------
+// The loop's whole value is that it leaves a record: what the agent claimed, who
+// allowed it, what the guard verified, and where the bytes went instead.
+{
+  const home = path.join(HOME, "loop");
+  const log = path.join(home, ".omp", "logs", "destructive-check.jsonl");
+  const CWD = path.join(home, "proj");
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(path.join(CWD, "src"), { recursive: true });
+  fs.writeFileSync(path.join(CWD, "src", "keep.txt"), "untracked user work\n");
+  const config = cfg({ mode: "custom", rules: { insideDelete: "model" }, askOnDeny: false });
+  const gitArgs = { status: "", log: `${"a".repeat(40)}\n`, "check-ignore": 0 };
+  const exec = async (cmd, args) => ({ stdout: gitArgs[args[0]] ?? "", stderr: "", code: 0, killed: false });
+  const verdict = (obj) => fetchResponse(200, { choices: [{ message: { content: JSON.stringify(obj) } }] });
+  installFetch((_url, init) => (String(init.body).includes("SECOND CHANCE") ? verdict({ decision: "allow", confidence: "high", reason: "the target is committed", claims: [{ type: "committed", value: "src" }] }) : fetchResponse(200, { choices: [{ message: { content: "DENY: untracked work would be lost" } }] })));
+  const ext = await loadExt({ home, config, registry: REG, exec });
+  const said = (text) => [{ message: { role: "assistant", content: [{ type: "text", text }] } }];
+  // A missing or truncated log is an empty log here: the rows below assert what
+  // it should contain, so a build that stops appending has to *fail* them rather
+  // than take the suite down before it prints its report.
+  const readLog = () => {
+    try {
+      return fs
+        .readFileSync(log, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+    } catch {
+      return [];
+    }
+  };
+  await callTool(ext, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("first") }));
+  const second = await callTool(ext, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("src is committed, nothing untracked lives there") }));
+  check("second chance: the justified repeat is allowed", second?.block !== true, JSON.stringify(second));
+  const entry = readLog().at(-1) ?? {};
+  check("second chance: the audit line records the attempt", entry.attempt === 2, JSON.stringify(entry));
+  check("second chance: the audit line records the authority", entry.authority === "model", JSON.stringify(entry));
+  check("second chance: the audit line records the justification, not just its length", /^[0-9a-f]{31}/.test(String(entry.justificationHash)) && entry.justificationLen > 20, JSON.stringify(entry));
+  check("second chance: the audit line records the claim and its verdict", String(entry.claims).startsWith("committed") && entry.justification === true, JSON.stringify(entry));
+  check("second chance: the audit line records where the delete went", /dc-trash/.test(String(entry.recovery)), JSON.stringify(entry));
+  // The chain covers the new fields: recomputing it without them must not match.
+  const { chain, ...core } = entry;
+  check("second chance: the new fields are inside the hashed payload", createHash("sha256").update(JSON.stringify(core)).digest("hex") === chain, String(chain));
+  check("second chance: the rewritten command moves the target into the trash", /mv -f -- "src"/.test(String(second?.input?.command ?? "")), String(second?.input?.command ?? ""));
+  check("second chance: the trash directory was created on disk", fs.existsSync(path.join(home, ".omp", "dc-trash")), path.join(home, ".omp", "dc-trash"));
+
+  // A claim that was verified and then contradicted is what erosion acts on: the
+  // next tool call re-checks it, records the contradiction, and (in `session`
+  // mode) closes the loop's own authority for the rest of the session.
+  gitArgs.status = " M src/keep.txt\n";
+  await callTool(ext, bash("ls -la"), makeCtx({ cwd: CWD, hasUI: false, registry: REG }));
+  const eroded = readLog()
+    .filter((line) => line.action === "erosion")
+    .at(-1) ?? {};
+  check("erosion: a contradicted committed claim is recorded", eroded?.justification === false && /no longer holds/.test(String(eroded?.detail)), JSON.stringify(eroded));
+  check("erosion: session mode records the authority drop", eroded?.erosion === "authority → ask", JSON.stringify(eroded));
+  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] });
+  await ext.commands.get("dc").handler("", panelCtx);
+  const rows = overlayLog.at(-1)?.options ?? [];
+  check("erosion: the panel shows the eroded authority", rows.some((row) => /retry authority: ask \(eroded by a false claim\)/.test(String(row.label))), rows.map((row) => row.label).slice(0, 4).join(" | "));
+  // The re-check is a one-shot leash on the claim, not a permanent probe.
+  await callTool(ext, bash("ls -la"), makeCtx({ cwd: CWD, hasUI: false, registry: REG }));
+  const erosions = readLog().filter((line) => line.action === "erosion").length;
+  check("erosion: the claim is re-checked once, not on every call", erosions === 1, `erosions=${erosions}`);
 }
 
 const bad = report("coverage");
