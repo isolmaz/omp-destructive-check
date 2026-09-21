@@ -28,6 +28,20 @@
  * `dc: WATCH · would block: <rule>`. It is for calibrating the policy against
  * real traffic, and session_start says out loud that it is on.
  *
+ * UI: the guard asks through a pop-up (ctx.ui.custom) that carries the reason,
+ * the target, the layer that decided and the attempt on its face — with a plain
+ * select as the fallback for a host that cannot draw an overlay, and "block" for
+ * a host with no UI at all. `/dc` opens the same component as a settings panel
+ * (Simple preset, policy note and status line on top, then Protection, Coverage,
+ * Retry, Checker, UI, Advanced, Guard and History); hosts without an overlay get
+ * the original select menu. The guard speaks English: panel, pop-up,
+ * notifications, history and the block reasons it sends to the agent.
+ *
+ * Status line: `ui.statusLine.location` moves it between the host's segment
+ * (`bar`, the default), a one-line widget under or over the editor, and off;
+ * `detail` decides between `dc: <mode>`, the decision text and the running
+ * session counters. `session_stop` prints one advisory summary line.
+ *
  * Audit: every decision is appended to ~/.omp/logs/destructive-check.jsonl as a
  * hash-chained entry, so the record outlives the session and a silent edit to an
  * older line breaks the chain. `/dc > recent decisions` reads it back, and
@@ -39,7 +53,8 @@
  *
  * Config: ~/.omp/destructive-check.json (shared by all omp profiles).
  * Env overrides: OMP_DC_DISABLE=1, OMP_DC_MODE, OMP_DC_PROVIDER, OMP_DC_MODEL,
- *   OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS, OMP_DC_DRYRUN=1.
+ *   OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS, OMP_DC_DRYRUN=1, OMP_DC_UI_STATUS
+ *   (bar|belowEditor|aboveEditor|off), OMP_DC_BIN.
  */
 
 import * as nodeFs from "node:fs";
@@ -55,6 +70,21 @@ const CONFIG_FILE = nodePath.join(nodeOs.homedir(), ".omp", "destructive-check.j
 const ACTIONS = ["block", "ask", "model", "allow"];
 const ENGINES = ["auto", "in-process", "cli"];
 const MODES = ["simple", "medium", "hard", "custom"];
+
+// UI vocabulary. Every list is a closed set: an unknown value in the config
+// file falls back to the default instead of travelling on as a string the rest
+// of the code would have to defend against.
+const FRICTION_PRESETS = ["quiet", "balanced", "strict"];
+const OVERLAY_MODES = ["auto", "always", "never"];
+const STATUS_LOCATIONS = ["bar", "belowEditor", "aboveEditor", "off"];
+const STATUS_DETAILS = ["minimal", "standard", "counters"];
+const BAR_SIDES = ["host", "left", "right"];
+const POPUP_BUTTONS = ["allowOnce", "allowSession", "deny"];
+const RETRY_AUTHORITIES = ["model", "ask", "off"];
+const REMEMBER_MODES = ["session", "once", "permanent"];
+const VERIFY_LEVELS = ["claims", "claims+adversarial", "off"];
+const RECOVERY_MODES = ["justified", "high", "off"];
+const EROSION_MODES = ["session", "log", "off"];
 
 // Rule labels are user-facing (shown in /dc) and kept short for the status line.
 const RULES = {
@@ -159,6 +189,24 @@ const DEFAULTS = {
   askOnError: true,
   allowDirs: [],
   logSize: 25,
+  // Friction preset: the one knob that moves ask-on-deny / ask-on-error / the
+  // retry authority / the verification level together. `balanced` is what the
+  // settings above already describe.
+  preset: "balanced",
+  policyNote: "", // free text the human writes; goes into the checker's policy block
+  // Second-chance loop settings. The loop itself is the next stage; the schema,
+  // the panel and the persistence are here so a policy can be written down now.
+  retry: { authority: "model", maxAttempts: 1, sessionBudget: 3, rememberApproved: "session" },
+  justifyTool: { enabled: true },
+  verify: { level: "claims" },
+  recovery: { mode: "justified", ttlHours: 72 },
+  erosion: { mode: "session" },
+  ui: {
+    overlay: "auto", // auto | always | never — the pop-up vs the plain-list dialogue
+    statusLine: { location: "bar", detail: "standard", barSide: "host" },
+    popupButtons: [...POPUP_BUTTONS],
+    sessionSummary: true, // one line at session_stop
+  },
 };
 
 function readRawConfig() {
@@ -208,6 +256,27 @@ function pickAction(value, fallback) {
   return ACTIONS.includes(value) ? value : fallback;
 }
 
+// One closed-set pick for every enum in the config: an unknown value is
+// reported where the user will see it (/dc → status) and replaced by the
+// default, so a hand-edited typo can never travel on as a value the decision
+// path has to defend against.
+function pickSetting(value, allowed, fallback, label, warnings) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (allowed.includes(value)) return value;
+  warnings.push(`${label}: unknown value "${String(value).slice(0, 40)}" — using "${fallback}"`);
+  return fallback;
+}
+
+// The friction presets, spelled out. `quiet` is the one with an immediate
+// effect on the pop-up: a model denial is refused without interrupting the user.
+// `strict` refuses without a second chance. The retry/verify values are read by
+// the justification loop; they are part of the written policy from here on.
+const FRICTION_MAP = {
+  quiet: { askOnDeny: false, askOnError: true, authority: "off", verifyLevel: "off" },
+  balanced: { askOnDeny: true, askOnError: true, authority: "model", verifyLevel: "claims" },
+  strict: { askOnDeny: false, askOnError: true, authority: "off", verifyLevel: "claims+adversarial" },
+};
+
 function providerConfig(raw) {
   const name = process.env.OMP_DC_PROVIDER ?? raw.provider ?? "";
   const perProvider = raw.providers?.[name] ?? {};
@@ -244,6 +313,16 @@ function loadConfig() {
     coverage[key] = pickBool(wanted, DEFAULTS.coverage[key]);
   }
   const provider = providerConfig(raw);
+  // Env overrides come first — an empty variable means "unset", not "use the
+  // default over a config file that says otherwise".
+  const statusEnv = String(process.env.OMP_DC_UI_STATUS ?? "").trim();
+  const rawUi = raw.ui && typeof raw.ui === "object" && !Array.isArray(raw.ui) ? raw.ui : {};
+  const rawStatus = rawUi.statusLine && typeof rawUi.statusLine === "object" && !Array.isArray(rawUi.statusLine) ? rawUi.statusLine : {};
+  const rawRetry = raw.retry && typeof raw.retry === "object" ? raw.retry : {};
+  const rawVerify = raw.verify && typeof raw.verify === "object" ? raw.verify : {};
+  const rawRecovery = raw.recovery && typeof raw.recovery === "object" ? raw.recovery : {};
+  const rawErosion = raw.erosion && typeof raw.erosion === "object" ? raw.erosion : {};
+  const buttons = Array.isArray(rawUi.popupButtons) ? POPUP_BUTTONS.filter((b) => rawUi.popupButtons.includes(b)) : [];
   return {
     enabled: pickBool(raw.enabled, DEFAULTS.enabled),
     mode,
@@ -268,6 +347,36 @@ function loadConfig() {
     allowDirs: Array.isArray(raw.allowDirs) ? raw.allowDirs.filter((d) => typeof d === "string" && d.trim()).map((d) => d.trim()) : DEFAULTS.allowDirs,
     logSize: clampNumber(raw.logSize, DEFAULTS.logSize, 1, 1000),
     reasoning: provider.reasoning,
+    // Friction preset and the policy note the human writes. The preset is only
+    // a stored name; `applyFriction` is what makes it move the settings it
+    // stands for, so the file always shows exactly what is in force.
+    preset: pickSetting(raw.preset, FRICTION_PRESETS, DEFAULTS.preset, "preset", warnings),
+    policyNote: typeof raw.policyNote === "string" ? raw.policyNote.replace(/\s+/g, " ").trim().slice(0, 400) : DEFAULTS.policyNote,
+    retry: {
+      authority: pickSetting(rawRetry.authority, RETRY_AUTHORITIES, DEFAULTS.retry.authority, "retry.authority", warnings),
+      maxAttempts: clampNumber(rawRetry.maxAttempts, DEFAULTS.retry.maxAttempts, 0, 10),
+      sessionBudget: clampNumber(rawRetry.sessionBudget, DEFAULTS.retry.sessionBudget, 0, 50),
+      rememberApproved: pickSetting(rawRetry.rememberApproved, REMEMBER_MODES, DEFAULTS.retry.rememberApproved, "retry.rememberApproved", warnings),
+    },
+    justifyTool: { enabled: pickBool(raw.justifyTool?.enabled, DEFAULTS.justifyTool.enabled) },
+    verify: { level: pickSetting(rawVerify.level, VERIFY_LEVELS, DEFAULTS.verify.level, "verify.level", warnings) },
+    recovery: {
+      mode: pickSetting(rawRecovery.mode, RECOVERY_MODES, DEFAULTS.recovery.mode, "recovery.mode", warnings),
+      ttlHours: clampNumber(rawRecovery.ttlHours, DEFAULTS.recovery.ttlHours, 1, 8760),
+    },
+    erosion: { mode: pickSetting(rawErosion.mode, EROSION_MODES, DEFAULTS.erosion.mode, "erosion.mode", warnings) },
+    ui: {
+      overlay: pickSetting(rawUi.overlay, OVERLAY_MODES, DEFAULTS.ui.overlay, "ui.overlay", warnings),
+      statusLine: {
+        location: pickSetting(statusEnv || rawStatus.location, STATUS_LOCATIONS, DEFAULTS.ui.statusLine.location, "ui.statusLine.location", warnings),
+        detail: pickSetting(rawStatus.detail, STATUS_DETAILS, DEFAULTS.ui.statusLine.detail, "ui.statusLine.detail", warnings),
+        barSide: pickSetting(rawStatus.barSide, BAR_SIDES, DEFAULTS.ui.statusLine.barSide, "ui.statusLine.barSide", warnings),
+      },
+      // The deny button is not optional: a pop-up that cannot refuse is not a
+      // guard. An empty or absent list means "all three".
+      popupButtons: buttons.length && buttons.includes("deny") ? buttons : [...POPUP_BUTTONS],
+      sessionSummary: pickBool(rawUi.sessionSummary, DEFAULTS.ui.sessionSummary),
+    },
   };
 }
 
@@ -312,6 +421,36 @@ function persistConfigChange(patch) {
   }
   reloadConfig();
   return true;
+}
+
+// The nested settings (ui.*, retry.*, verify.*, recovery.*, erosion.*) are
+// written one branch at a time: a patch that replaces the whole `ui` object
+// would drop whatever the user set from the config file by hand.
+function persistNested(branch, patch) {
+  const raw = readRawConfig().raw;
+  const current = raw[branch] && typeof raw[branch] === "object" && !Array.isArray(raw[branch]) ? raw[branch] : {};
+  return persistConfigChange({ [branch]: { ...current, ...patch } });
+}
+
+// The friction preset writes the settings it stands for, so the file never
+// shows a preset name that disagrees with the values beside it.
+function applyFriction(preset) {
+  const chosen = FRICTION_MAP[preset] ?? FRICTION_MAP.balanced;
+  persistConfigChange({ preset, askOnDeny: chosen.askOnDeny, askOnError: chosen.askOnError });
+  persistNested("retry", { authority: chosen.authority });
+  persistNested("verify", { level: chosen.verifyLevel });
+  return chosen;
+}
+
+// Which preset the current values actually describe. A preset name in the file
+// is a label, not evidence: if the values were changed one by one, the panel
+// says "custom" instead of repeating a name that no longer holds.
+function effectiveFriction() {
+  for (const name of FRICTION_PRESETS) {
+    const map = FRICTION_MAP[name];
+    if (CFG.askOnDeny === map.askOnDeny && CFG.askOnError === map.askOnError && CFG.retry.authority === map.authority && CFG.verify.level === map.verifyLevel) return name;
+  }
+  return "custom";
 }
 
 // --------------------------------------------------------------- decisions --
@@ -399,6 +538,13 @@ function auditLine(entry) {
 }
 
 function logDecision(entry) {
+  // `counts` is the session-counter bucket for this decision. It is not in
+  // LOG_KEYS, so it never reaches the audit file — the file keeps the decision,
+  // the session keeps the running total.
+  if (entry.counts) countDecision(entry);
+  // The settings panel caches the audit tail; a new decision makes that cache
+  // stale before it is read again.
+  panelHistoryCache.at = 0;
   const record = { at: new Date().toISOString().slice(11, 19), ...entry };
   decisionLog.push(record);
   while (decisionLog.length > Math.max(1, CFG.logSize)) decisionLog.shift();
@@ -619,9 +765,21 @@ function realpathOf(p) {
   }
 }
 
-function canonicalizeUncached(abs) {
+function cacheCanonical(key, at, value) {
+  if (CANON_CACHE.size >= CANON_MAX) CANON_CACHE.clear();
+  CANON_CACHE.set(key, { at, value });
+}
+
+// A path the filesystem actually resolved, or the nearest existing ancestor with
+// the missing tail re-attached. Only the first is a fact, and only the first is
+// cached: a forecast for a path that does not exist yet goes stale in the unsafe
+// direction the moment a link appears above it (`mklink /J esc <outside>` after
+// one write to `esc/payload.js` used to keep the pre-link "inside" verdict for
+// the whole TTL). The directories the walk consults *are* real, and their cache
+// entries are what keep the walk cheap.
+function resolveReal(abs, now) {
   const direct = realpathOf(abs);
-  if (direct) return nodePath.resolve(direct);
+  if (direct) return { path: nodePath.resolve(direct), cache: true };
   const rest = [];
   let dir = nodePath.resolve(abs);
   for (let guard = 0; guard < 64; guard++) {
@@ -629,10 +787,16 @@ function canonicalizeUncached(abs) {
     if (parent === dir) break;
     rest.unshift(nodePath.basename(dir));
     dir = parent;
+    const hit = CANON_CACHE.get(dir);
+    if (hit && now - hit.at < CANON_TTL_MS) return { path: nodePath.resolve(hit.value, ...rest), cache: false };
     const real = realpathOf(dir);
-    if (real) return nodePath.resolve(real, ...rest);
+    if (real) {
+      const value = nodePath.resolve(real);
+      cacheCanonical(dir, now, value);
+      return { path: nodePath.resolve(value, ...rest), cache: false };
+    }
   }
-  return nodePath.resolve(abs);
+  return { path: nodePath.resolve(abs), cache: false };
 }
 
 // Sync I/O on the decision path is only affordable because it is cached: the
@@ -644,10 +808,9 @@ function canonicalize(abs) {
   const now = Date.now();
   const hit = CANON_CACHE.get(key);
   if (hit && now - hit.at < CANON_TTL_MS) return hit.value;
-  const value = canonicalizeUncached(key);
-  if (CANON_CACHE.size >= CANON_MAX) CANON_CACHE.clear();
-  CANON_CACHE.set(key, { at: now, value });
-  return value;
+  const { path, cache } = resolveReal(key, now);
+  if (cache) cacheCanonical(key, now, path);
+  return path;
 }
 
 // `allowDirs` widens the project scope, so an entry that names a filesystem
@@ -771,6 +934,10 @@ function classify(raw, scope) {
   // a pure wildcard keeps its literal directory (`node_modules/*` deletes inside
   // node_modules).
   if (/[$`]|%[A-Za-z_][^%]*%/.test(path)) return { kind: "dynamic", path };
+  // `{a,b}/x` is two words to the shell and `{1..5}` is a range: both expand
+  // before the write happens, and resolving the literal braces would place the
+  // write inside the project while the shell writes outside it.
+  if (/\{[^{}\s]*[,.]{1,2}[^{}\s]*\}/.test(path)) return { kind: "dynamic", path };
   if (/[*?[]/.test(path)) {
     const literal = path.replace(/[\\/][^\\/]*[*?[].*$/, "");
     if (literal && literal !== path) {
@@ -861,6 +1028,14 @@ function splitSubcommands(cmd) {
       continue;
     }
     if (ch === "|" || ch === "&") {
+      // `>|` (the noclobber override) and `>&`/`&>` (both streams to a file) are
+      // redirects, not separators. Splitting them here would orphan the
+      // destination in a part that no longer has a command word to classify it.
+      const redirect = (ch === "|" && cur.endsWith(">")) || (ch === "&" && (cur.endsWith(">") || cmd[i + 1] === ">"));
+      if (redirect) {
+        cur += ch;
+        continue;
+      }
       parts.push(cur);
       cur = "";
       continue;
@@ -926,7 +1101,10 @@ function substitutionBodies(text) {
   return out;
 }
 
-const isFlagTok = (w) => /^-{1,2}[\w-]+$/.test(w) || /^[A-Za-z_][\w]*=/.test(w);
+// `--opt=value` is a flag with its value attached: GNU tools permute operands,
+// so counting it as a path is how `cp a ../outside/ --backup=numbered` ends up
+// with the option as its "destination".
+const isFlagTok = (w) => /^-{1,2}[\w-]+(?:=.*)?$/.test(w) || /^[A-Za-z_][\w]*=/.test(w);
 const CMD_SWITCH_RE = /^\/[a-zA-Z]{1,3}$/;
 const CMD_SWITCH_VERBS = /^(del|erase|rd|rmdir|dir|copy|move|ren|rename|attrib|tree|type|find|findstr|robocopy|xcopy|format|icacls|takeown|reg|sc|net|taskkill|schtasks|wmic|diskpart)$/i;
 
@@ -936,6 +1114,34 @@ const LAUNCHER_RE = /^(sudo|doas|env|command|xargs|nohup|time|timeout|nice|ionic
 const SHELL_RE = /^(bash|sh|zsh|dash|ksh|fish|cmd|powershell|pwsh|wsl)$/i;
 // `cmd //c` is the standard Git Bash spelling: MSYS rewrites a single `/c`.
 const SHELL_EXEC_FLAG_RE = /^(?:\/\/c|\/\/k|\/c|\/k|-c|-lc|-ic|--command|-command|-e|-enc|-encodedcommand|-file|-f)$/i;
+// Shell flags that consume the token after them: `bash -o pipefail -c …`,
+// `powershell -ExecutionPolicy Bypass -Command …`, `wsl -d Ubuntu bash -c …`.
+// Short ones are case-sensitive (`-o` is not `-O`).
+const SHELL_VALUE_FLAG_RE = /^(?:-o|\+o|-O|--rcfile|--init-file|--profile|--exec|-[Ee]xecutionPolicy|-[Vv]ersion|-[Ww]indowStyle|-[Ii]nputFormat|-[Oo]utputFormat|-[Ss]ettingsFile|-[Cc]onfigurationName|-[Ww]orkingDirectory|-d|--distribution|-u|--user|--cd|-w|--workdir)$/;
+
+// Walk the tokens after a shell word (`toks[i]`) to the code it was handed on its
+// command line. Options come first and a flag that takes a value consumes the
+// token after it, so the idiomatic `powershell -NoProfile -Command "…"` and
+// `bash -o pipefail -c "…"` are read instead of being dismissed because the exec
+// flag was not the very next token. A shell word that names another shell
+// (`wsl bash -c …`) descends into it. Returns the unwrapped body, or "" when no
+// body is reachable — a script path or an interactive shell is not a command
+// line, and those keep their own handling.
+function execBodyAfter(toks, i, sub, depth = 0) {
+  if (depth > 4) return "";
+  for (let k = i + 1; k < toks.length; k++) {
+    const t = toks[k];
+    if (!t.quoted && SHELL_EXEC_FLAG_RE.test(t.text)) return unwrapShellBody(sub.slice(t.index + t.raw.length));
+    if (t.text === "--") continue;
+    if (isFlagTok(t.text) || CMD_SWITCH_RE.test(t.text) || /^-+$/.test(t.text)) {
+      if (!t.quoted && SHELL_VALUE_FLAG_RE.test(t.text)) k++;
+      continue;
+    }
+    if (!t.quoted && SHELL_RE.test(cmdWord(t.word ?? t.text))) return execBodyAfter(toks, k, sub, depth + 1);
+    return "";
+  }
+  return "";
+}
 const PKG_SUB_RE = /^(npm|pnpm|yarn|bun|deno)$/i;
 const PKG_RUNNER_RE = /^(npx|pnpx|bunx)$/i;
 const PKG_EXEC_SUB_RE = /^(exec|x|dlx|run)$/i;
@@ -1014,9 +1220,9 @@ function catastrophicViolations(text, depth = 0) {
     else if (/^dd$/i.test(word) && args.some((a) => /^of=/i.test(a) && DEVICE_TARGET_RE.test(a.slice(3).trim()))) out.push(violation("catastrophic", `writes directly to a block device: ${part.trim()}`));
     else if (/^cipher$/i.test(word) && args.some((a) => /^\/w(?::|$)/i.test(a))) out.push(violation("catastrophic", "wipes free space on the drive: cipher /w"));
     else if (/^reg$/i.test(word) && /^delete$/i.test(args[0] ?? "") && args.some((a) => HIVE_RE.test(unquote(a)))) out.push(violation("catastrophic", `deletes a registry hive key: ${part.trim()}`));
-    else if (SHELL_RE.test(word) && words[i + 1] && SHELL_EXEC_FLAG_RE.test(words[i + 1].text)) {
-      const flag = words[i + 1];
-      out.push(...catastrophicViolations(unwrapShellBody(part.slice(flag.index + flag.raw.length)), depth + 1));
+    else if (SHELL_RE.test(word) && words[i + 1]) {
+      const body = execBodyAfter(words, i, part);
+      if (body) out.push(...catastrophicViolations(body, depth + 1));
     }
   }
   return out;
@@ -1225,7 +1431,12 @@ function scanScoped(command, scope, depth, found) {
     return found;
   }
   let current = scope;
-  for (const part of splitSubcommands(command)) {
+  const { code, bodies } = heredocParts(command);
+  // A here-document handed to a shell is a script the shell runs: judge it as
+  // code, at one nesting level deeper, exactly like a `-c` body. A body handed
+  // to a plain reader stays data. The write scanner reads the same split.
+  for (const body of bodies) if (body.code) scanScoped(body.text, current, depth + 1, found);
+  for (const part of splitSubcommands(code)) {
     // Whatever a substitution runs happens before the command it sits in: judge
     // it on its own, at one nesting level deeper.
     for (const body of substitutionBodies(part)) scanScoped(body, current, depth + 1, found);
@@ -1295,14 +1506,20 @@ function hasDestructiveCall(sub, toks, depth = 0, found = [], scope) {
       return found;
     }
     if (SHELL_RE.test(cmd)) {
-      const flag = toks[i + 1];
-      if (flag && !flag.quoted && SHELL_EXEC_FLAG_RE.test(flag.text)) {
-        scanScoped(unwrapShellBody(sub.slice(flag.index + flag.raw.length)), scope, depth + 1, found);
+      const body = execBodyAfter(toks, i, sub);
+      if (body) {
+        scanScoped(body, scope, depth + 1, found);
         return found;
       }
       let k = i + 1;
       while (k < toks.length && isFlagTok(toks[k].text)) k++;
       const scriptArg = toks[k];
+      // A redirection is not a script path: `bash <<'EOF'` names a body, which
+      // heredocParts() hands to the scan as code.
+      if (scriptArg && /^[<>]/.test(scriptArg.text)) {
+        loose = true;
+        continue;
+      }
       // A POSIX shell treats its first non-option argument as a script path,
       // extension or not (`sh cleanup`); cmd/powershell/wsl only get that
       // treatment when the argument actually looks like a file, so `wsl ls -la`
@@ -1436,10 +1653,16 @@ function secretViolationsFor(targets, scope) {
 
 // A redirect or a write verb puts data where it is told to. `cp a ../out/` writes
 // outside the project while `cp ../out/a .` only reads outside it, so each verb
-// names its own argument positions. Redirects are read from the command text with
-// quoting respected, and heredoc bodies are dropped first: a body is data, and a
-// body full of `>` is not a command line.
-const WRITE_VERBS = /^(cp|mv|rsync|truncate|tee|chmod|chown|chgrp|ln)$/i;
+// names its own argument positions — including that verb's own options (`-t DIR`,
+// `--target-directory=DIR`, `-o FILE`). Redirects are read from the command text
+// with quoting respected, and here-document bodies are read once for both
+// scanners by heredocParts(): a body handed to a shell is code, a body handed to
+// `cat` is data.
+// Every verb whose write positions the scan knows how to read. `mklink` (cmd's
+// link creator, the Windows spelling of `ln`) writes a hard link, which
+// realpath cannot see through: `mklink /H innocent.js ~/.ssh/id_rsa` makes the
+// key readable and writable under a second name.
+const WRITE_VERBS = /^(cp|mv|rsync|truncate|tee|chmod|chown|chgrp|ln|link|mklink|curl|wget|tar|unzip|install|sed)$/i;
 const OWNER_VERBS = /^(chmod|chown|chgrp)$/i;
 const NULL_SINK_RE = /^(?:\/dev\/(?:null|zero|stdout|stderr|tty)|nul|con|\$null)$/i;
 
@@ -1488,27 +1711,64 @@ function heredocDelimiters(line) {
   return out;
 }
 
-// The bodies of every here-document in the text, blanked out. The command lines
-// survive: `cat > f <<'EOF'` still writes f, and the `EOF` terminator still ends
-// the body. Only the redirect/verb scan uses this — a here-document handed to a
-// shell (`bash <<'EOF'`) is executed, and that path is judged by its own rules.
-function stripHeredocs(text) {
+// Readers that *run* the bytes handed to them on standard input. A body fed to
+// one of these is a command line of its own; a body fed to `cat`/`tee`/`awk` is
+// data. `bash <<'EOF'` executes its body, so its redirects and its verbs are real
+// writes, and both scanners have to agree about that.
+const STDIN_CODE_READER_RE = /^(?:bash|sh|zsh|dash|ksh|fish|wsl|cmd|powershell|pwsh|python[\d.]*|node|nodejs|bun|deno|ruby|perl|php|lua|osascript|rscript)$/i;
+
+// The reader of a here-document: "code" when it executes the body, "data" when
+// it prints it, and "" when the line is not a here-document at all (`x << 2` in
+// a code cell the shell-shaped scanner is reading is a shift, not a redirect).
+function heredocReader(line) {
+  for (const t of tokenize(line)) {
+    if (t.text === "--" || t.text === "-" || CMD_SWITCH_RE.test(t.text) || isFlagTok(t.text)) continue;
+    const cmd = cmdWord(t.word ?? t.text);
+    if (LAUNCHER_RE.test(cmd)) continue; // `sudo bash <<EOF` runs bash
+    return STDIN_CODE_READER_RE.test(cmd) ? "code" : "data";
+  }
+  return "";
+}
+
+// One here-document split for the whole scanner: the command lines (with the
+// bodies blanked out) plus every body and the reader that consumes it. The
+// delete scanner and the write scanner both read this, so they cannot disagree
+// about the same bytes — a body handed to a shell is code for both, a body
+// handed to `cat` is data for both.
+function heredocParts(text) {
   const out = [];
+  const bodies = [];
   let pending = [];
   for (const line of String(text ?? "").split("\n")) {
     if (pending.length) {
-      if (line.trim() === pending[0]) pending.shift();
+      const head = pending[0];
+      if (line.trim() === head.delim) {
+        bodies.push({ text: head.lines.join("\n"), code: head.code });
+        pending.shift();
+      } else {
+        head.lines.push(line);
+        head.slots.push(out.length);
+      }
       out.push("");
       continue;
     }
     out.push(line);
-    pending = heredocDelimiters(line);
+    if (!line.includes("<<")) continue;
+    const reader = heredocReader(line);
+    if (reader) pending = heredocDelimiters(line).map((delim) => ({ delim, code: reader === "code", lines: [], slots: [] }));
   }
-  return out.join("\n");
+  // An unterminated here-document is not blanked: a `<<` that the shell would
+  // read differently must never be able to hide the lines that follow it from
+  // the scanners.
+  for (const item of pending) for (let i = 0; i < item.slots.length; i++) out[item.slots[i]] = item.lines[i];
+  return { code: out.join("\n"), bodies };
 }
 
-// The destination of every `>` / `>>` in one sub-command. `2>&1` and `>&2` copy a
-// file descriptor and write no file, and a quoted `>` is data.
+// The destination of every `>` / `>>` / `>|` / `>&file` in one sub-command.
+// `2>&1`, `>&2` and `>&-` copy (or close) a file descriptor and write no file,
+// while `>&word` with a word that is not a descriptor redirects both streams to
+// that file — and `>|word` is the noclobber override, which writes `word` just
+// like `>` does. A quoted `>` is data.
 function redirectTargets(sub) {
   const out = [];
   let quote = null;
@@ -1528,13 +1788,18 @@ function redirectTargets(sub) {
       continue;
     }
     if (ch !== ">") continue;
-    if (sub[i + 1] === "&") {
-      i++;
-      continue;
-    }
     if (sub[i - 1] === "-" || sub[i - 1] === "=") continue; // `a->b`, `a=>b`
     let k = i + 1;
     if (sub[k] === ">") k++;
+    if (sub[k] === "&") {
+      if (/^\s*(?:-|\d+)(?![\w.-])/.test(sub.slice(k + 1))) {
+        i = k;
+        continue;
+      }
+      k++;
+    } else if (sub[k] === "|") {
+      k++;
+    }
     while (k < sub.length && /\s/.test(sub[k])) k++;
     if (k >= sub.length) break;
     let token = "";
@@ -1563,14 +1828,118 @@ function ddWriteTargets(args) {
   return out;
 }
 
+// Per-verb option grammar: the flags that consume the next token (or an attached
+// `=value`). Counting an option's argument as a path is how `-t`, `-o` and a
+// trailing `--opt=value` used to hide the destination.
+const VERB_OPTIONS = {
+  cp: ["-t", "--target-directory", "-S", "--suffix"],
+  mv: ["-t", "--target-directory", "-S", "--suffix"],
+  install: ["-t", "--target-directory", "-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"],
+  rsync: ["-e", "--rsh", "--exclude", "--include", "--filter", "-f", "--files-from", "--log-file", "--password-file", "--timeout", "--port", "--temp-dir", "-T"],
+  curl: ["-o", "--output"],
+  wget: ["-o", "-O", "--output-document", "--output-file"],
+  tar: ["-C", "--directory"],
+  unzip: ["-d"],
+  sed: ["-e", "--expression", "-f", "--file"],
+};
+
+// Which of those options names the *destination* (the rest only carry a value
+// this parser has to consume, or they would land in the operand list).
+const VERB_DEST_FLAG = {
+  cp: /^(?:-t|--target-directory)$/,
+  mv: /^(?:-t|--target-directory)$/,
+  install: /^(?:-t|--target-directory)$/,
+  curl: /^(?:-o|--output)$/,
+  wget: /^(?:-o|-O|--output-document|--output-file)$/,
+  tar: /^(?:-C|--directory)$/,
+  unzip: /^-d$/,
+};
+
+// Operands and options of one verb, with that verb's own option grammar applied:
+// an option is not a path, an option's value is not an operand, and `--` ends the
+// options. `--backup=numbered` is an option even though `isFlagTok` cannot know
+// that every verb has its own flag set.
+function verbOperands(cmd, args) {
+  const values = VERB_OPTIONS[String(cmd).toLowerCase()] ?? [];
+  const operands = [];
+  const options = [];
+  for (let i = 0; i < args.length; i++) {
+    const raw = args[i].text;
+    if (raw === "--") {
+      operands.push(...args.slice(i + 1).map((t) => t.text));
+      break;
+    }
+    if (!raw.startsWith("-")) {
+      operands.push(raw);
+      continue;
+    }
+    const eq = raw.indexOf("=");
+    const name = eq > 0 ? raw.slice(0, eq) : raw;
+    const spaced = values.find((v) => v === name);
+    if (spaced) {
+      options.push({ flag: spaced, value: eq > 0 ? raw.slice(eq + 1) : (args[++i]?.text ?? "") });
+      continue;
+    }
+    // `-tDIR`, `-m644`, `-Oout.bin`: a short flag with its value attached.
+    const attached = values.find((v) => /^-[A-Za-z]$/.test(v) && raw.length > 2 && raw.startsWith(v));
+    if (attached) options.push({ flag: attached, value: raw.slice(attached.length) });
+    // Every other option is skipped: neither a path nor a destination.
+  }
+  return { operands, options };
+}
+
+// PowerShell creates links with `New-Item -ItemType HardLink -Path L -Target T`.
+// Both ends are files the call touches: a hard link to a key file is a second
+// name for that key, and realpath cannot see through it.
+const NEW_ITEM_LINK_RE = /^(?:hard|symbolic)link$|^junction$/i;
+
+function newItemLinkTargets(args) {
+  const isLink = args.some((t) => NEW_ITEM_LINK_RE.test(t.text) || NEW_ITEM_LINK_RE.test(String(t.text).split("=").at(-1) ?? ""));
+  if (!isLink) return [];
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const text = args[i].text;
+    if (/^-{1,2}(?:path|target)$/i.test(text)) {
+      const value = args[++i]?.text;
+      if (value) out.push(value);
+      continue;
+    }
+    if (text.startsWith("-")) continue;
+    out.push(text);
+  }
+  return out;
+}
+
+// `git clone <url> <dir>` writes the checkout at its final operand. With no
+// destination the checkout lands in the cwd, and a lone operand is a URL — not a
+// path this scan can classify.
+function gitCloneTargets(toks, i) {
+  let k = i + 1;
+  while (k < toks.length && !toks[k].quoted && gitOption(toks[k].text)) k += GIT_VALUE_OPT_RE.test(toks[k].text) ? 2 : 1;
+  if (String(toks[k]?.text ?? "").toLowerCase() !== "clone") return [];
+  const operands = toks.slice(k + 1).filter((t) => !t.text.startsWith("-") && t.text !== "--").map((t) => t.text);
+  return operands.length > 1 ? operands.slice(-1) : [];
+}
+
 function writeVerbTargets(cmd, args) {
-  const paths = args.filter((t) => !isFlagTok(t.text) && t.text !== "--").map((t) => t.text);
-  if (!paths.length) return [];
-  if (/^cp$/i.test(cmd)) return paths.slice(-1); // only the destination is written
+  const c = String(cmd).toLowerCase();
+  const { operands, options } = verbOperands(c, args);
+  if (!operands.length && !options.length) return [];
+  // An option that names the destination wins over the operands: with `-t DIR`
+  // (or `-o FILE`, `-C DIR`, `-d DIR`) every operand is a source or a URL.
+  const flagged = options.filter((o) => (VERB_DEST_FLAG[c] ?? /^$/).test(o.flag)).map((o) => o.value);
+  if (flagged.some(Boolean)) return flagged.filter(Boolean);
+  // Two operands are the minimum for a copy: with one, the argument is a source
+  // (`install -m 644 ../outside/app.js` writes into the cwd).
+  const lastOperand = operands.length > 1 ? operands.slice(-1) : [];
+  if (c === "cp" || c === "mv" || c === "install") return lastOperand; // only the destination is written
   // With --delete the source side decides what disappears at the destination.
-  if (/^rsync$/i.test(cmd)) return args.some((t) => /^--delete/i.test(t.text)) ? paths : paths.slice(-1);
-  if (OWNER_VERBS.test(cmd)) return paths.length > 1 ? paths.slice(1) : paths; // mode / owner comes first
-  return paths; // mv, truncate, tee, ln: every argument is a file
+  if (c === "rsync") return args.some((t) => /^--delete/i.test(t.text)) ? operands : lastOperand;
+  if (OWNER_VERBS.test(c)) return operands.length > 1 ? operands.slice(1) : operands; // mode / owner comes first
+  if (c === "curl" || c === "wget" || c === "tar" || c === "unzip") return []; // written only where their flag points
+  if (c === "sed") return args.some((t) => /^-i[\w.]*$/.test(t.text) || /^--in-place(?:=.*)?$/.test(t.text)) ? operands : [];
+  if (c === "mklink") return operands.filter((p) => !CMD_SWITCH_RE.test(p)); // /H, /J and /D are switches
+  return operands; // mv, truncate, tee, ln, link: every argument is a file
 }
 
 // The write targets of one sub-command. The first real command word decides;
@@ -1587,12 +1956,16 @@ function verbWriteTargetsIn(sub) {
       continue;
     }
     const cmd = cmdWord(t.word ?? t.text);
-    if (PROBE_RE.test(cmd)) return []; // a probe runs nothing
+    // A probe runs nothing — but only its query flags count: `command -p cp a
+    // ../outside` still runs cp, and the delete scanner checks the same way.
+    if (PROBE_RE.test(cmd) && isProbe(toks.slice(i + 1))) return [];
     if (LAUNCHER_RE.test(cmd)) {
       loose = true;
       continue;
     }
     if (/^dd$/i.test(cmd)) return ddWriteTargets(toks.slice(i + 1));
+    if (/^(?:new-item|ni)$/i.test(cmd)) return newItemLinkTargets(toks.slice(i + 1));
+    if (/^git$/i.test(cmd)) return gitCloneTargets(toks, i);
     if (WRITE_VERBS.test(cmd)) return writeVerbTargets(cmd, toks.slice(i + 1));
     if (!loose) return [];
   }
@@ -1600,7 +1973,8 @@ function verbWriteTargetsIn(sub) {
 }
 
 // `sh -c "echo x > /etc/y"` hides the redirect inside a quoted token the scan
-// above cannot see: the body is a command line of its own.
+// above cannot see: the body is a command line of its own, and so is the body of
+// `powershell -NoProfile -Command …` or `bash -o pipefail -c …`.
 function shellBodyOf(sub) {
   const toks = tokenize(sub);
   let loose = false;
@@ -1608,16 +1982,14 @@ function shellBodyOf(sub) {
     const t = toks[i];
     if (t.text === "--" || isFlagTok(t.text)) continue;
     const cmd = cmdWord(t.word ?? t.text);
+    if (PROBE_RE.test(cmd) && isProbe(toks.slice(i + 1))) return ""; // a probe runs nothing
     if (LAUNCHER_RE.test(cmd)) {
       const next = toks[i + 1];
       if (next?.quoted && PAYLOAD_LAUNCHER_RE.test(cmd)) return unwrapShellBody(next.text);
       loose = true;
       continue;
     }
-    if (SHELL_RE.test(cmd)) {
-      const flag = toks[i + 1];
-      return flag && !flag.quoted && SHELL_EXEC_FLAG_RE.test(flag.text) ? unwrapShellBody(sub.slice(flag.index + flag.raw.length)) : "";
-    }
+    if (SHELL_RE.test(cmd)) return execBodyAfter(toks, i, sub);
     if (!loose) return "";
   }
   return "";
@@ -1645,12 +2017,28 @@ function writeTargetViolations(raw, scope, via) {
 function writeViolations(command, scope, depth = 0) {
   if (depth > MAX_SCAN_DEPTH) return [];
   const out = [];
-  for (const part of splitSubcommands(stripHeredocs(command))) {
-    for (const body of substitutionBodies(part)) out.push(...writeViolations(body, scope, depth + 1));
-    for (const dest of redirectTargets(part)) out.push(...writeTargetViolations(dest, scope, ">"));
-    for (const target of verbWriteTargetsIn(part)) out.push(...writeTargetViolations(target, scope, ""));
+  const { code, bodies } = heredocParts(command);
+  // A here-document handed to a shell is a script the shell runs. The delete
+  // scanner reads the same split, so the two halves cannot disagree about the
+  // same bytes; a body handed to a plain reader stays data for both.
+  for (const body of bodies) if (body.code) out.push(...writeViolations(body.text, scope, depth + 1));
+  let current = scope;
+  for (const part of splitSubcommands(code)) {
+    for (const body of substitutionBodies(part)) out.push(...writeViolations(body, current, depth + 1));
+    // `cd ..` moves where a *relative* target lands: the delete scanner
+    // re-scopes per sub-command (`cd / && rm -rf boot`), and the write scanner
+    // has to resolve in the same directory, or `cd ..; echo pwn > target.js`
+    // looks like a write inside the project while the shell writes above it.
+    const cd = part.match(CD_RE);
+    if (cd) {
+      const moved = scopeAfterCd(current, cd[1]);
+      if (moved) current = moved;
+      continue;
+    }
+    for (const dest of redirectTargets(part)) out.push(...writeTargetViolations(dest, current, ">"));
+    for (const target of verbWriteTargetsIn(part)) out.push(...writeTargetViolations(target, current, ""));
     const shell = shellBodyOf(part);
-    if (shell) out.push(...writeViolations(shell, scope, depth + 1));
+    if (shell) out.push(...writeViolations(shell, current, depth + 1));
   }
   return out;
 }
@@ -1739,9 +2127,10 @@ function violationsForCommand(command, scope) {
 const CODE_DELETE_RE = /\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|Path\([^)]*\)\.unlink|\.rmtree|send2trash|fs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)|fsPromises\.(?:rm|unlink|rmdir)|Deno\.remove|removeSync|unlinkSync)\s*\(|[)]\s*\.remove\s*\(/;
 const CODE_CALL_RE = /\b(?:shutil\.rmtree|os\.remove|os\.unlink|os\.rmdir|Path\([^)]*\)\.unlink|\.rmtree|send2trash|fs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)|fsPromises\.(?:rm|unlink|rmdir)|Deno\.remove|removeSync|unlinkSync)\s*\(|[)]\s*\.remove\s*\(/g;
 
-// The text of the first argument of the call whose `(` sits at `open`, with
-// balanced parentheses and quoting respected.
-function firstArgument(text, open) {
+// The arguments of the call whose `(` sits at `open`, split on top-level commas
+// with nesting and quoting respected; `end` is the index of the closing paren.
+function callAt(text, open) {
+  const args = [];
   let depth = 0;
   let quote = "";
   let start = open + 1;
@@ -1756,45 +2145,86 @@ function firstArgument(text, open) {
       quote = ch;
       continue;
     }
-    if (ch === "(") {
+    if (ch === "(" || ch === "[" || ch === "{") {
       depth++;
-      if (depth === 1) start = i + 1;
       continue;
     }
-    if (ch === ")") {
+    if (ch === ")" || ch === "]" || ch === "}") {
       depth--;
-      if (depth === 0) return text.slice(start, i).trim();
+      if (depth === 0) {
+        args.push(text.slice(start, i).trim());
+        return { args, end: i };
+      }
       continue;
     }
-    if (ch === "," && depth === 1) return text.slice(start, i).trim();
+    if (ch === "," && depth === 1) {
+      args.push(text.slice(start, i).trim());
+      start = i + 1;
+    }
   }
-  return "";
+  args.push(text.slice(start).trim());
+  return { args, end: text.length };
 }
 
-// A literal answers only for the delete call it is the argument of. An unrelated
-// string in the same cell says nothing about the target (`note = "dist"` next to
-// `shutil.rmtree(target)`), and a path mentioned in passing does not make a
-// computed delete safe. A single `name = "literal"` binding is followed; anything
-// more indirect stays unresolved.
+// A literal answers only for the call it is the argument of. An unrelated string
+// in the same cell says nothing about the target (`note = "dist"` next to
+// `shutil.rmtree(target)`), and a single `name = "literal"` binding is followed;
+// anything more indirect stays unresolved.
+function literalTarget(text, arg) {
+  const literal = /^(?:"([^"\n]*)"|'([^'\n]*)')$/.exec(arg ?? "");
+  if (literal) return { value: literal[1] ?? literal[2] ?? "", resolved: true };
+  const ident = /^([A-Za-z_$][\w$]*)$/.exec(arg ?? "");
+  const bound = ident ? new RegExp(`(?:^|[\\s;])${ident[1]}\\s*=\\s*(?:"([^"\\n]*)"|'([^'\\n]*)')`, "m").exec(text) : null;
+  const value = bound?.[1] ?? bound?.[2];
+  return value ? { value, resolved: true } : { value: "", resolved: false };
+}
+
 function evalDeleteTargets(text) {
   const targets = [];
   let dynamic = false;
   for (const m of text.matchAll(CODE_CALL_RE)) {
-    const arg = firstArgument(text, m.index + m[0].length - 1);
+    const arg = callAt(text, m.index + m[0].length - 1).args[0] ?? "";
     if (!arg) {
       dynamic = true;
       continue;
     }
-    const literal = /^(?:"([^"\n]*)"|'([^'\n]*)')$/.exec(arg);
-    if (literal) {
-      targets.push(literal[1] ?? literal[2] ?? "");
-      continue;
-    }
-    const ident = /^([A-Za-z_$][\w$]*)$/.exec(arg);
-    const bound = ident ? new RegExp(`(?:^|[\\s;])${ident[1]}\\s*=\\s*(?:"([^"\\n]*)"|'([^'\\n]*)')`, "m").exec(text) : null;
-    const value = bound?.[1] ?? bound?.[2];
-    if (value) targets.push(value);
+    const hit = literalTarget(text, arg);
+    if (hit.resolved) targets.push(hit.value);
     else dynamic = true;
+  }
+  return { targets: targets.filter(Boolean), dynamic };
+}
+
+// Write-side file APIs in eval code, with the argument that names the file: a
+// single-path writer puts it first, a copy/move/link pair writes its destination,
+// and `Path('…')` names it in the constructor. `open(…)` only counts when its
+// mode says it writes — `open('.env')` is a read — and a method call
+// (`handle.open('w')`) is left alone, because the file it writes is the handle's.
+const CODE_WRITE_APIS = [
+  { re: /(?:^|[^\w.\]])((?:io\.|codecs\.)?open\s*\()/g, arg: 0, mode: true },
+  { re: /\bPath\s*\(/g, arg: 0, method: /^\s*\.\s*(?:write_text|write_bytes|touch)\s*\(/ },
+  { re: /\b(?:fs\.(?:writeFileSync|writeFile|appendFileSync)|fsPromises\.(?:writeFile|appendFile)|Deno\.(?:writeTextFile|writeFile)|writeFileSync|writeTextFile)\s*\(/g, arg: 0 },
+  { re: /\b(?:shutil\.(?:copyfile|copy2|copy|move)|os\.(?:replace|rename)|fs\.(?:renameSync|copyFileSync|linkSync|link)|fsPromises\.(?:copyFile|rename|link)|copyFileSync|renameSync|linkSync)\s*\(/g, arg: 1 },
+];
+
+function evalWriteTargets(text) {
+  const targets = [];
+  let dynamic = false;
+  for (const api of CODE_WRITE_APIS) {
+    for (const m of text.matchAll(api.re)) {
+      const open = m.index + m[0].length - 1;
+      const { args, end } = callAt(text, open);
+      if (api.mode) {
+        const modeArg = args[1];
+        if (modeArg === undefined) continue; // `open(path)`: a read
+        const mode = /["']([rawxb+t]*)["']/.exec(modeArg)?.[1];
+        if (mode !== undefined && !/[wax+]/.test(mode)) continue; // 'r' / 'rb': a read
+      }
+      if (api.method && !api.method.test(text.slice(end + 1))) continue;
+      const hit = literalTarget(text, args[api.arg]);
+      if (hit.resolved) targets.push(hit.value);
+      else dynamic = true;
+    }
   }
   return { targets: targets.filter(Boolean), dynamic };
 }
@@ -1823,6 +2253,12 @@ function violationsForCode(language, code, scope) {
     }
     if (dynamic) out.push(violation("codeDelete", `delete from ${language} code with a computed target`));
   }
+  // A file written through a language API is the same effect as `> file` in
+  // bash: judged by the same rule, with the same destination, and a computed
+  // target is unresolved rather than a pass.
+  const writes = evalWriteTargets(text);
+  for (const target of writes.targets) out.push(...writeTargetViolations(target, scope, `${language} write`));
+  if (writes.dynamic) out.push(violation("dynamicTargets", `write from ${language} code with a computed target`));
   out.push(...writeViolations(text, scope));
   return out;
 }
@@ -1969,13 +2405,18 @@ function analyzeCall(event, cwd) {
   }
   if ((name === "write" || name === "edit" || name === "apply_patch") && CFG.coverage.fileTools) {
     const text = typeof input.input === "string" ? input.input : "";
-    // A credential store is a static block whatever the tool and whatever the
-    // mode preset says about deletes: rewriting `.env` or `id_rsa` is how a
-    // session leaks or replaces the keys the user's other tools trust.
-    const violations = secretViolationsFor(fileToolTargets(input, text), scope);
-    if (name !== "write") {
-      violations.push(...(Array.isArray(input.edits) && !text ? violationsForEditInput(input, scope) : violationsForPatch(text || JSON.stringify(input), scope)));
-    }
+    // Every file the call rewrites is judged by the *write* rules — a credential
+    // store, a system file, a path outside the project, or one the guard cannot
+    // resolve (`%APPDATA%\.env`) — exactly like `echo x > …` in bash. Judging a
+    // `write` by the secret check alone let a first-class tool rewrite
+    // C:\Windows\System32\drivers\etc\hosts with no violation, no decision and no
+    // audit line, while the same effect through bash was an outsideWrite.
+    const violations = [];
+    for (const target of fileToolTargets(input, text)) violations.push(...writeTargetViolations(target, scope, ""));
+    // The patch/edit scanners run for every one of the three tools: a `write`
+    // payload is a path and a body, and the sections that make a patch
+    // destructive are read from whatever text the call carries.
+    violations.push(...(Array.isArray(input.edits) && !text ? violationsForEditInput(input, scope) : violationsForPatch(text || JSON.stringify(input), scope)));
     if (!violations.length) return null;
     const identity = text || JSON.stringify(input);
     const summary = name === "write" ? `write ${typeof input.path === "string" ? input.path : "(unknown path)"}` : firstLine(identity);
@@ -1999,9 +2440,18 @@ function analyzeCall(event, cwd) {
       };
     }
     if (op !== "start") return null;
+    // `args` arrive as separate tokens, and joining them with a space hands the
+    // scanner a different command line than the host runs: a destination holding
+    // a space ("My Docs") splits into two words and the last fragment reads as
+    // the destination. A token that is not shell-safe is quoted before it joins.
     const command = [input.application, ...(Array.isArray(input.args) ? input.args : [])]
       .filter((part) => part !== undefined && part !== null && part !== "")
-      .map((part) => String(part))
+      .map((part) => {
+        const text = String(part);
+        if (/^[\w@%+=:,./\\-]+$/.test(text)) return text;
+        if (!text.includes('"')) return `"${text}"`;
+        return text.includes("'") ? text : `'${text}'`;
+      })
       .join(" ");
     if (!command.trim()) return null;
     const violations = violationsForCommand(command, scope);
@@ -2324,34 +2774,208 @@ function parseVerdictOrThrow(text, fallbackReason) {
   throw new Error(clean ? `checker reply had no ALLOW/DENY line: ${clean.slice(0, 160)}` : `checker produced an empty reply${fallbackReason ? ` (${fallbackReason})` : ""}`);
 }
 
+// ------------------------------------------------------------- UI text -----
+
+// What the human reads: panel headings, the per-rule explanations and the
+// answers an approval offers. Plain English — the guard speaks one language,
+// and the block reasons it sends to the agent are part of that contract.
+const GROUP_TITLES = {
+  simple: "Simple",
+  protection: "Protection",
+  coverage: "Coverage",
+  retry: "Retry & justification",
+  checker: "Checker",
+  ui: "UI",
+  advanced: "Advanced",
+  guard: "Guard",
+  history: "History",
+};
+
+const RULE_NOTES = {
+  catastrophic: "fork bombs, mkfs, dd of=/dev/…, format C:, diskpart, shutdown/reboot, reg delete HK*, cipher /w — denied statically in every mode and never sent to the checker.",
+  protectSecrets:
+    "a mutating target that is a credential store: .env, id_rsa, *.pem, .ssh/**, .aws/credentials, auth.json, .npmrc. Not a judgement call and never a second chance.",
+  outsideWrite:
+    "write effects outside the project: > and >> destinations, the written positions of cp/mv/rsync, truncate, tee, dd of=, chmod/chown, ln.",
+  gitDestructive: "git clean/rm, reset --hard, push --force, branch -D, stash drop, bare restore, checkout/switch -f, reflog expire, gc --prune=now.",
+  scriptExec: "a run script whose body could not be read: missing, over 64 KiB, binary, or nested deeper than the limit.",
+  artifactDelete: "node_modules, dist, build, .next, temp directories. A rule like any other: in custom it can be set to ask, model or block.",
+  systemTarget: "filesystem roots, C:\\Windows, /etc, ~/.ssh, ~/.config.",
+  outsideDelete: "deletes whose target is outside the project scope.",
+  outsideMove: "moving data that lives outside the project, or moving data out of it.",
+  insideDelete: "deletes inside the project that are not build artifacts.",
+  dynamicTargets: "targets that cannot be resolved statically: $VAR, globs, a payload buried past the wrapper limit.",
+  codeDelete: "deletes issued through eval or the file tools with a computed target.",
+};
+
+const COVERAGE_NOTES = {
+  bash: "shell commands, wrappers, nested shells, script bodies and package runners.",
+  eval: "delete APIs and shell snippets inside eval code (python, js).",
+  fileTools: "edit REM/MV lines and apply_patch delete/move operations.",
+  processes: "process launches through the hub tool: application + args are scanned like a command line.",
+};
+
+const FRICTION_NOTES = {
+  quiet: "do not bother me: low-risk work is not blocked and a model denial does not open a pop-up",
+  strict: "block when in doubt: no pop-up on a model denial, no second chance, adversarial verification",
+  balanced: "the default: ask when the model denies, second chances allowed, claims verified",
+};
+
+const CHOICE_TEXT = {
+  allowOnce: { label: "Allow once", description: "run this command now; the next one is checked again" },
+  allowSession: { label: "Allow for this session", description: "stop asking for this exact command in this workspace until the session ends" },
+  deny: { label: "Deny", description: "refuse the command; nothing is executed" },
+};
 // ------------------------------------------------------------------ UI ------
 
-function statusNote(ctx, text, level) {
+// The status line is a glance surface and it sits right next to the model
+// segment, which already names the model: the resting text stays minimal, every
+// decision states what happened and which rule caused it, and the full detail
+// lives in /dc → status and recent decisions. `detail: counters` adds the
+// running session counts instead, and `location` decides whether it goes to the
+// host's segment (bar) or to a one-line widget under or over the editor.
+const STATUS_WIDGET_MS = 5000;
+let statusWidgetTimer = null;
+// The last ctx a status was written through. The settings panel changes the
+// location from inside an overlay, with no ctx of its own, and a stale widget
+// has to be cleared from there.
+let lastStatusCtx = null;
+
+function writeStatus(ctx, text) {
+  if (ctx) lastStatusCtx = ctx;
+  const line = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!line) return;
+  const location = CFG.ui.statusLine.location;
+  if (location === "off") return;
   try {
-    if (level) ctx?.ui?.notify?.(text.slice(0, 200), level);
-    else ctx?.ui?.setStatus?.("dc", text.slice(0, 120));
+    if (location === "bar") {
+      ctx?.ui?.setStatus?.("dc", line.slice(0, 120));
+      return;
+    }
+    ctx?.ui?.setWidget?.("dc", [line.slice(0, 200)], { placement: location });
+    clearTimeout(statusWidgetTimer);
+    // A widget is a message, not furniture: it clears itself again.
+    statusWidgetTimer = setTimeout(() => {
+      try {
+        lastStatusCtx?.ui?.setWidget?.("dc", undefined);
+      } catch {
+        /* UI is optional */
+      }
+    }, STATUS_WIDGET_MS);
+    statusWidgetTimer?.unref?.();
   } catch {
     /* UI is optional */
   }
 }
 
-// The status line is a glance surface and it sits right next to the model segment,
-// which already names the model: the resting text stays minimal, every decision
-// states what happened and which rule caused it, and the full detail lives in
-// /dc → status and recent decisions.
+function statusNote(ctx, text, level) {
+  try {
+    if (level) ctx?.ui?.notify?.(text.slice(0, 200), level);
+    // A guard notice ("WATCH MODE is on …") is a message, not the guard's
+    // status. Only a status string — they always start with `dc:` — may replace
+    // the line, which is what keeps the mode on it (AGENTS.md 13).
+    if (!level || /^dc:/.test(text)) writeStatus(ctx, text);
+  } catch {
+    /* UI is optional */
+  }
+}
+
+// The session counts behind `detail: counters`, the pop-up's attempt row and
+// the session summary read this one object.
+const sessionStats = { allowed: 0, blocked: 0, wouldBlock: 0, justified: 0, checkerAllow: 0, checkerDeny: 0, byRule: {} };
+
+function countDecision(entry) {
+  const outcome = entry.counts;
+  if (outcome === "allowed") sessionStats.allowed++;
+  else if (outcome === "blocked") sessionStats.blocked++;
+  else if (outcome === "would-block") sessionStats.wouldBlock++;
+  // The checker's own verdict is counted apart from the outcome: a model denial
+  // the human then overrode is still a denial the checker made.
+  if (entry.checker === "allow") sessionStats.checkerAllow++;
+  else if (entry.checker === "deny") sessionStats.checkerDeny++;
+  // A justification-approved call is counted whatever its outcome was; the
+  // second-chance stage writes it into the action string.
+  if (/justified/i.test(String(entry.action ?? ""))) sessionStats.justified++;
+  if (outcome && RULES[entry.rule]) sessionStats.byRule[entry.rule] = (sessionStats.byRule[entry.rule] ?? 0) + 1;
+}
+
+function statusCounters() {
+  const s = sessionStats;
+  const base = `a:${s.allowed} d:${s.blocked} ca:${s.checkerAllow} cd:${s.checkerDeny}`;
+  // Watch mode blocks nothing; its counts are kept apart instead of being
+  // reported as blocks the guard never made.
+  return s.wouldBlock ? `${base} w:${s.wouldBlock}` : base;
+}
+
 function statusText() {
   if (!CFG.enabled) return "dc: off";
-  return CFG.dryRun ? `dc: WATCH · ${CFG.mode}` : `dc: ${CFG.mode}`;
+  const base = CFG.dryRun ? `dc: WATCH · ${CFG.mode}` : `dc: ${CFG.mode}`;
+  return CFG.ui.statusLine.detail === "counters" ? `${base} ${statusCounters()}` : base;
 }
 
 // Watch mode says what it would have done, in the same place a decision says
 // what it did: the mode segment is replaced by WATCH, so the line can never be
-// read as an enforced block.
-const watchStatus = (rule) => `dc: WATCH · would block: ${rule}`;
+// read as an enforced block — including on the checker's allow path, where a
+// `dc: medium · checker allowed · …` line would look exactly like an armed run.
+function watchStatus(rule, verb = "would block") {
+  if (CFG.ui.statusLine.detail === "minimal") return "dc: WATCH";
+  if (CFG.ui.statusLine.detail === "counters") return `dc: WATCH ${statusCounters()} · ${verb}: ${rule}`;
+  return `dc: WATCH · ${verb}: ${rule}`;
+}
 
 function statusFor(verb, rule) {
+  const base = CFG.dryRun ? "dc: WATCH" : `dc: ${CFG.mode}`;
   const label = RULES[rule] ?? rule ?? "";
+  if (CFG.ui.statusLine.detail === "minimal") return base;
+  if (CFG.ui.statusLine.detail === "counters") return `${base} ${statusCounters()} · ${verb}${label ? ` · ${label}` : ""}`;
   return label ? `dc: ${CFG.mode} · ${verb} · ${label}` : `dc: ${CFG.mode} · ${verb}`;
+}
+
+// One advisory line at the end of a session: what the guard did, and which rule
+// did most of it. The counters are the same object the status line shows, so the
+// two can never disagree.
+function sessionSummaryLine() {
+  const s = sessionStats;
+  const total = s.blocked + s.allowed + s.justified + s.wouldBlock;
+  if (!total) return "";
+  const blocked = s.blocked + s.wouldBlock;
+  let top = "";
+  let topCount = 0;
+  for (const rule of RULE_ORDER) {
+    const count = sessionStats.byRule[rule] ?? 0;
+    if (count > topCount) {
+      top = rule;
+      topCount = count;
+    }
+  }
+  const head = CFG.dryRun ? "dc: WATCH · " : "dc: ";
+  return `${head}${blocked} blocked · ${s.allowed} allowed · ${s.justified} justified${top ? ` · top rule: ${top}` : ""}`;
+}
+
+// The block the README documents, generated from the settings so the panel can
+// hand the user something to paste instead of describing it.
+function statusLineSnippet() {
+  const side = CFG.ui.statusLine.barSide;
+  const left = ["pi", "vim", "model", "status", "mode", "collab", "path", "git", "pr", "context_pct", "cost"];
+  const right = ["session_name"];
+  if (side === "right") {
+    left.splice(left.indexOf("status"), 1);
+    right.unshift("status");
+  }
+  return [
+    "statusLine:",
+    "  preset: custom",
+    "  showHookStatus: false          # no duplicate line beneath the editor",
+    `  leftSegments: [${left.join(", ")}]`,
+    `  rightSegments: [${right.join(", ")}]`,
+    "  segmentOptions:",
+    "    model: { showThinkingLevel: true }",
+    "    path: { abbreviate: true, maxLength: 40, stripWorkPrefix: true }",
+    "    git: { showBranch: true, showStaged: true, showUnstaged: true, showUntracked: true }",
+    "",
+    `# The guard writes through ctx.ui.setStatus("dc", …); the segment lists above`,
+    `# decide where that text lands: ${side === "host" ? "the preset decides" : `the "status" segment is on the ${side}`}.`,
+  ].join("\n");
 }
 
 // Which engine the next check will actually use, so the menu does not claim
@@ -2414,6 +3038,13 @@ function fullStatus(ctx) {
     `coverage     : ${["bash", "eval", "fileTools", "processes"].filter((k) => CFG.coverage[k]).join(", ") || "none"}`,
     `cache        : ${CFG.cacheEnabled ? `on (${verdictCache.size} verdicts, ${sessionAllows.size} approvals)` : "off"}`,
     `intent       : ${CFG.includeIntent ? `yes (${CFG.maxIntentChars} chars)` : "no"}`,
+    `friction     : ${effectiveFriction()}${CFG.policyNote ? ` · note: "${CFG.policyNote.slice(0, 60)}"` : ""}`,
+    `retry        : ${CFG.retry.authority} · ${CFG.retry.maxAttempts}/action, ${CFG.retry.sessionBudget}/session · remember ${CFG.retry.rememberApproved} · justify tool ${CFG.justifyTool.enabled ? "on" : "off"}`,
+    `hardening    : verify ${CFG.verify.level} · recovery ${CFG.recovery.mode} (${CFG.recovery.ttlHours} h) · erosion ${CFG.erosion.mode}`,
+    `ui           : overlay ${CFG.ui.overlay} · status ${statusLineSummary()} · buttons ${CFG.ui.popupButtons.join("+")} · summary ${CFG.ui.sessionSummary ? "on" : "off"}`,
+    // Raw parse errors and rejected values are English diagnostics, like block
+    // reasons: they name the exact key a user has to fix in the file.
+    ...(CFG.warnings.length ? [`config notes : ${CFG.warnings.join("; ")}`] : []),
     `project dirs : ${dirs.accepted.length ? dirs.accepted.join(", ") : "(cwd + git root)"}`,
     ...(dirs.rejected.length ? [`rejected dirs: ${dirs.rejected.map((r) => `${r.entry} (${r.reason})`).join("; ")}`] : []),
     `rules        : ${RULE_ORDER.map((r) => `${r}=${CFG.rules[r]}`).join(" ")}`,
@@ -2424,17 +3055,33 @@ function fullStatus(ctx) {
   ].join("\n");
 }
 
-async function askUser(ctx, title, reason) {
+// The one question the guard asks: allow once, allow for the session, or refuse.
+// The pop-up shows why (rule + reason), what (target and command), which layer
+// decided and how long it took; the plain-list fallback below carries the same
+// three answers for a host that cannot draw an overlay, and a host with no UI at
+// all gets "block".
+async function askUser(ctx, reason, extra = {}) {
   if (!ctx?.hasUI || !ctx?.ui?.select) return "block";
   statusNote(ctx, reason, "warning");
+  const attempt = nextAttempt(extra.key ?? `${extra.rule ?? ""}\u0000${reason}`);
+  const answer = await uiPanel(ctx, approvalSpec(reason, { ...extra, attempt }));
+  if (answer.overlay) {
+    // Escape, a displayed "deny", or a host that answered nothing: all three are
+    // "do not run this".
+    if (answer.id === "allowOnce") return "allow-once";
+    if (answer.id === "allowSession") return "allow-session";
+    return "block";
+  }
+  // The three answers, spelled the way the plain list has always spelled them.
   const options = [
     { label: "Allow once", description: "run this command now; the next one is checked again" },
     { label: "Allow for this session", description: "stop asking for this exact command in this workspace until the session ends" },
     { label: "Block", description: "refuse the command; nothing is executed" },
   ];
-  const choice = selLabel(await ctx.ui.select(`destructive-check: ${title}`, options));
-  if (choice === "Allow once") return "allow-once";
-  if (choice === "Allow for this session") return "allow-session";
+  const heading = String(extra.heading ?? RULES[extra.rule] ?? extra.rule ?? "");
+  const choice = selLabel(await ctx.ui.select(`destructive-check: ${heading}${reason ? ` — ${reason}` : ""}`.slice(0, 200), options));
+  if (choice === options[0].label) return "allow-once";
+  if (choice === options[1].label) return "allow-session";
   return "block";
 }
 
@@ -2454,7 +3101,7 @@ function decide(plan, event, ctx) {
   const audit = { command: plan.summary, cwd: plan.scope.cwdAbs };
   const key = cacheKeyFor(plan);
   if (action === "allow") {
-    logDecision({ tool: plan.kind, rule: violation.rule, action: "allow", detail: violation.detail, ...audit });
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "allow", detail: violation.detail, ...audit, counts: "allowed" });
     statusNote(ctx, statusFor("allowed", violation.rule));
     return undefined;
   }
@@ -2464,19 +3111,19 @@ function decide(plan, event, ctx) {
   // point of a calibration run is to see what the policy would have caught.
   if (CFG.dryRun) {
     if (action === "model") return checkThenDecide(ctx, key, violation, plan, event);
-    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: violation.detail, ...audit });
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: violation.detail, ...audit, counts: "would-block" });
     statusNote(ctx, watchStatus(violation.rule));
     return undefined;
   }
   // A decision the current policy makes on its own comes first: a stored
   // approval may answer a question, never overrule a block.
   if (action === "block") {
-    logDecision({ tool: plan.kind, rule: violation.rule, action: "block", detail: violation.detail, ...audit });
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "block", detail: violation.detail, ...audit, counts: "blocked" });
     statusNote(ctx, statusFor("blocked", violation.rule), "warning");
     return blockedResult(violation.rule, violation);
   }
   if (sessionAllows.has(key)) {
-    logDecision({ tool: plan.kind, rule: violation.rule, action: "allow(session)", detail: violation.detail, ...audit });
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "allow(session)", detail: violation.detail, ...audit, counts: "allowed" });
     statusNote(ctx, statusFor("allowed", violation.rule));
     return undefined;
   }
@@ -2488,8 +3135,22 @@ function decide(plan, event, ctx) {
 }
 
 async function askThenDecide(ctx, key, rule, violation, plan) {
-  const answer = await askUser(ctx, violation.detail, `dc: needs approval · ${rule}`);
-  logDecision({ tool: plan.kind, rule, action: `ask:${answer}`, detail: violation.detail, command: plan.summary, cwd: plan.scope.cwdAbs });
+  const answer = await askUser(ctx, violation.detail, {
+    rule,
+    key,
+    target: violation.detail,
+    command: plan.summary,
+    layer: `static (${CFG.rules[rule]})`,
+  });
+  logDecision({
+    tool: plan.kind,
+    rule,
+    action: `ask:${answer}`,
+    detail: violation.detail,
+    command: plan.summary,
+    cwd: plan.scope.cwdAbs,
+    counts: answer === "block" ? "blocked" : "allowed",
+  });
   if (answer === "allow-once") return undefined;
   if (answer === "allow-session") {
     sessionAllows.add(key);
@@ -2516,23 +3177,48 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
   }
   const took = cached ? "cached" : `${verdict.ms} ms`;
   if (verdict.verdict === "allow") {
-    logDecision({ tool: plan.kind, rule: violation.rule, action: cached ? "model:allow(cached)" : "model:allow", detail: verdict.reason || violation.detail, ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs });
-    statusNote(ctx, `${statusFor("checker allowed", violation.rule)} · ${took}`);
+    logDecision({
+      tool: plan.kind,
+      rule: violation.rule,
+      action: cached ? "model:allow(cached)" : "model:allow",
+      detail: verdict.reason || violation.detail,
+      ms: verdict.ms,
+      command: plan.summary,
+      cwd: plan.scope.cwdAbs,
+      counts: "allowed",
+      checker: "allow",
+    });
+    statusNote(ctx, CFG.dryRun ? watchStatus(violation.rule, "would allow") : `${statusFor("checker allowed", violation.rule)} · ${took}`);
     return undefined;
   }
   // Watch mode: the verdict is recorded, the refusal is not enforced.
   if (CFG.dryRun) {
-    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: verdict.reason || violation.detail, ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs });
+    logDecision({ tool: plan.kind, rule: violation.rule, action: "would-block", detail: verdict.reason || violation.detail, ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs, counts: "would-block", checker: "deny" });
     statusNote(ctx, watchStatus(violation.rule));
     return undefined;
   }
-  logDecision({ tool: plan.kind, rule: violation.rule, action: "model:deny", detail: verdict.reason ?? "", ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs });
+  logDecision({ tool: plan.kind, rule: violation.rule, action: "model:deny", detail: verdict.reason ?? "", ms: verdict.ms, command: plan.summary, cwd: plan.scope.cwdAbs, checker: "deny" });
   const reason = verdict.reason || "no reason given";
   if (CFG.askOnDeny) {
-    const answer = await askUser(ctx, reason, `dc: model denied · ${reason} · ${took}`);
+    const answer = await askUser(ctx, reason, {
+      rule: violation.rule,
+      key,
+      target: violation.detail,
+      command: plan.summary,
+      layer: cached ? "cache" : "model",
+      ms: verdict.ms,
+    });
     // The human's answer is the final decision: the log has to carry it, not
     // just the model's verdict.
-    logDecision({ tool: plan.kind, rule: violation.rule, action: `model:deny:${answer}`, detail: reason, command: plan.summary, cwd: plan.scope.cwdAbs });
+    logDecision({
+      tool: plan.kind,
+      rule: violation.rule,
+      action: `model:deny:${answer}`,
+      detail: reason,
+      command: plan.summary,
+      cwd: plan.scope.cwdAbs,
+      counts: answer === "block" ? "blocked" : "allowed",
+    });
     if (answer === "allow-once") return undefined;
     if (answer === "allow-session") {
       sessionAllows.add(key);
@@ -2540,6 +3226,9 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
     }
     return blockedResult(violation.rule, violation, `the checker model denied this action: ${reason} (checker: ${took})`);
   }
+  // No pop-up: the model's denial is the outcome, and the session counters say
+  // so where the status line can show it.
+  countDecision({ counts: "blocked", rule: violation.rule, action: "model:deny" });
   return blockedResult(violation.rule, violation, `the checker model denied this action: ${reason} (checker: ${took})`);
 }
 
@@ -2547,29 +3236,863 @@ async function checkThenDecide(ctx, key, violation, plan, event) {
 // surfaced and the user is asked when a UI exists.
 async function onCheckerFailure(ctx, violation, err, plan, key) {
   const detail = `${String(err?.message ?? err).slice(0, 300)} (after ${err?.dcMs ?? 0} ms)`;
+  const command = plan?.summary;
+  const cwd = plan?.scope?.cwdAbs;
   // Watch mode never turns a failure into an enforced block either: the failure
   // is recorded as something the policy would have stopped on.
   if (CFG.dryRun) {
-    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "would-block", detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
+    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "would-block", detail, command, cwd, counts: "would-block" });
     statusNote(ctx, watchStatus(violation.rule));
     return undefined;
   }
-  logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "error", detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
+  logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: "error", detail, command, cwd });
   statusNote(ctx, statusFor("checker error", violation.rule), "warning");
   if (CFG.askOnError && ctx?.hasUI) {
-    const answer = await askUser(ctx, `checker unavailable: ${detail}`, "dc: checker failed");
-    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: `error:${answer}`, detail, command: plan?.summary, cwd: plan?.scope?.cwdAbs });
+    const answer = await askUser(ctx, detail, {
+      rule: violation.rule,
+      key,
+      heading: "checker unavailable",
+      target: violation.detail,
+      command,
+      layer: "checker error",
+      ms: err?.dcMs,
+    });
+    logDecision({ tool: plan?.kind ?? "checker", rule: violation.rule, action: `error:${answer}`, detail, command, cwd, counts: answer === "block" ? "blocked" : "allowed" });
     // "Allow for this session" has to mean what the label says on this path too.
     if (answer === "allow-once") return undefined;
     if (answer === "allow-session") {
       sessionAllows.add(key);
       return undefined;
     }
+  } else {
+    countDecision({ counts: "blocked", rule: violation.rule, action: "error" });
   }
   return {
     block: true,
     reason: `destructive-check: the checker could not produce a verdict — ${detail}. The action was not approved; fix the checker in /dc (provider, model, timeout) or run it yourself outside the agent.`,
   };
+}
+
+// ---------------------------------------------------------------- overlay ---
+
+// One component serves both pop-ups — the approval prompt and the settings
+// panel. The host contract is small (render(width) + handleInput(data) +
+// dispose()), and nothing here reaches for a theme or a keybinding table, so a
+// host that offers neither still draws the panel.
+const PANEL_PAGE_LINES = 26;
+const PANEL_MIN_WIDTH = 40;
+const PANEL_MAX_WIDTH = 104;
+
+// Raw key data first (that is what `handleInput` receives), then the names some
+// hosts hand over instead. Escape resolves in the caller (approval: deny,
+// panel: close), never to "carry on".
+const KEY_NAMES = {
+  "\u001b[A": "up",
+  "\u001b[B": "down",
+  "\u001b[C": "right",
+  "\u001b[D": "left",
+  "\u001b[5~": "pageup",
+  "\u001b[6~": "pagedown",
+  "\u001b[13u": "enter",
+  "\u001b[27u": "escape",
+  "\r": "enter",
+  "\n": "enter",
+  "\r\n": "enter",
+  "\u001b": "escape",
+};
+
+function keyName(data) {
+  const raw = String(data ?? "");
+  if (!raw) return "";
+  if (KEY_NAMES[raw]) return KEY_NAMES[raw];
+  const named = raw.toLowerCase();
+  if (named === "escape" || named === "esc") return "escape";
+  if (named === "enter" || named === "return") return "enter";
+  if (named === "space") return "space";
+  if (["up", "down", "left", "right", "pageup", "pagedown", "home", "end"].includes(named)) return named;
+  return raw.length === 1 ? raw : "";
+}
+
+function clipTo(text, width) {
+  const line = String(text ?? "");
+  return line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`;
+}
+
+function wrapTo(text, width) {
+  const out = [];
+  for (const raw of String(text ?? "").split("\n")) {
+    let line = "";
+    for (const word of raw.split(" ")) {
+      if (!line) line = word;
+      else if (line.length + 1 + word.length <= width) line += ` ${word}`;
+      else {
+        out.push(line);
+        line = word;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+function padTo(text, width) {
+  const line = String(text ?? "");
+  return line.length >= width ? line.slice(0, width) : line + " ".repeat(width - line.length);
+}
+
+function panelComponent(spec, done) {
+  let selected = 0;
+  let top = 0;
+  const rowsNow = () => (typeof spec.rows === "function" ? spec.rows() : spec.rows) ?? [];
+  // The row list can hold the same setting twice (the Simple section is a
+  // shortcut into the UI group), so the cursor is a position, not an id, and it
+  // walks past the section headings instead of landing on them.
+  const cursor = () => {
+    const rows = rowsNow();
+    if (rows[selected] && !rows[selected].section) return selected;
+    for (let index = selected; index < rows.length; index++) if (!rows[index].section) return index;
+    for (let index = rows.length - 1; index >= 0; index--) if (!rows[index].section) return index;
+    return -1;
+  };
+  const moveBy = (step) => {
+    const rows = rowsNow();
+    const from = cursor();
+    if (from < 0) return;
+    for (let index = from + step; index >= 0 && index < rows.length; index += step) {
+      if (!rows[index].section) {
+        selected = index;
+        return;
+      }
+    }
+  };
+
+  return {
+    spec,
+    render(width) {
+      const size = Math.max(PANEL_MIN_WIDTH, Math.min(Number(width) || 80, PANEL_MAX_WIDTH));
+      const inner = size - 4;
+      const rows = rowsNow();
+      const index = cursor();
+      const lines = [];
+      const marks = {};
+      for (const text of spec.body ?? []) for (const piece of wrapTo(text, inner)) lines.push(piece);
+      if (spec.body?.length) lines.push("─".repeat(inner));
+      rows.forEach((row, position) => {
+        if (row.section) {
+          lines.push(clipTo(`── ${row.label} ${"─".repeat(Math.max(0, inner - row.label.length - 4))}`, inner));
+          return;
+        }
+        marks[position] = lines.length;
+        lines.push(clipTo(`${position === index ? "▸" : " "} ${row.key ? `[${row.key}] ` : ""}${row.label}`, inner));
+        lines.push(clipTo(`    ${row.description ?? ""}`, inner));
+      });
+      const start = marks[index] ?? 0;
+      if (start < top) top = start;
+      if (start + 2 > top + PANEL_PAGE_LINES) top = start + 2 - PANEL_PAGE_LINES;
+      top = Math.max(0, Math.min(top, Math.max(0, lines.length - PANEL_PAGE_LINES)));
+      const frame = (text) => `│ ${padTo(text, inner)} │`;
+      const title = String(spec.title ?? "destructive-check — settings");
+      const heading = String(spec.heading ?? "");
+      const tag = String(spec.tag ?? "");
+      const out = [`┌─ ${title} ${"─".repeat(Math.max(0, size - title.length - 5))}┐`];
+      if (heading || tag) {
+        out.push(frame(clipTo(`${heading}${tag ? `${" ".repeat(Math.max(1, inner - heading.length - tag.length))}${tag}` : ""}`, inner)));
+        out.push(frame("─".repeat(inner)));
+      }
+      for (const line of lines.slice(top, top + PANEL_PAGE_LINES)) out.push(frame(line));
+      const position = `${Math.max(0, index) + 1}/${rows.filter((row) => !row.section).length}`;
+      out.push(frame(clipTo(`${spec.footer ?? "↑/↓ move · Enter open · Esc close"}   ${position}`, inner)));
+      out.push(`└${"─".repeat(size - 2)}┘`);
+      return out;
+    },
+    handleInput(data) {
+      const key = keyName(data);
+      if (!key) return;
+      const rows = rowsNow();
+      const index = cursor();
+      if (key === "escape") {
+        done(spec.escape ?? "close");
+        return;
+      }
+      if (index < 0) return;
+      if (key === "up" || key === "k" || key === "left") return moveBy(-1);
+      if (key === "down" || key === "j" || key === "right") return moveBy(1);
+      if (key === "pageup") {
+        for (let step = 0; step < PANEL_PAGE_LINES / 2; step++) moveBy(-1);
+        return;
+      }
+      if (key === "pagedown") {
+        for (let step = 0; step < PANEL_PAGE_LINES / 2; step++) moveBy(1);
+        return;
+      }
+      if (key === "home") {
+        selected = rows.findIndex((row) => !row.section);
+        return;
+      }
+      if (key === "end") {
+        const last = rows.filter((row) => !row.section).length ? rows.findLastIndex((row) => !row.section) : selected;
+        selected = last;
+        return;
+      }
+      if (spec.direct) {
+        // The approval prompt: the answer is one keystroke away, and Enter takes
+        // whichever answer is highlighted.
+        const hit = rows.find((row) => !row.section && row.key === key);
+        if (hit) done(hit.id);
+        else if (key === "enter" || key === "space") done(rows[index].id);
+        return;
+      }
+      if (key === "enter" || key === "space") {
+        // A cycle or a toggle is applied in place; everything that needs a
+        // dialogue closes the panel first, so the host's own prompt gets the
+        // keyboard (and the handler budget is not held by two surfaces).
+        if (spec.inline?.(rows[index].id)) return;
+        done(rows[index].id);
+      }
+    },
+    dispose() {
+      /* nothing to release: the component holds no timer and no subscription */
+    },
+  };
+}
+
+function overlayAvailable(ctx) {
+  return Boolean(ctx?.hasUI) && CFG.ui.overlay !== "never" && typeof ctx?.ui?.custom === "function";
+}
+
+// The one pop-up helper. `overlay: false` means "no pop-up here, use the plain
+// dialogue"; `overlay: true, id: null` means the pop-up was the presentation and
+// produced no answer — which every caller must treat as refuse, never as a
+// decision (`ctx.ui.custom` returns `undefined as never` on RPC/ACP).
+async function uiPanel(ctx, spec) {
+  if (!overlayAvailable(ctx)) return { overlay: false, id: null };
+  let answer;
+  try {
+    answer = await ctx.ui.custom((_tui, _theme, _keybindings, done) => panelComponent(spec, done), { overlay: true });
+  } catch {
+    // The API is there but the overlay cannot be drawn. `always` refuses instead
+    // of degrading silently; `auto` has a dialogue to fall back to.
+    return { overlay: CFG.ui.overlay === "always", id: null };
+  }
+  if (typeof answer === "string" && answer) return { overlay: true, id: answer };
+  return { overlay: CFG.ui.overlay === "always", id: null };
+}
+
+// A report (a trace, a self-test, the audit chain) is a panel too: it is read in
+// the same place the decisions are made, and it closes with Escape.
+async function showReport(ctx, title, text) {
+  const answer = await uiPanel(ctx, {
+    title: String(title),
+    heading: "",
+    tag: statusText(),
+    body: String(text ?? "").split("\n"),
+    rows: [],
+    footer: "Esc closes this panel",
+    escape: "close",
+  });
+  if (answer.overlay) return;
+  await ctx?.ui?.confirm?.(String(title), String(text ?? ""));
+}
+
+// A select that returns the row id, whatever the host hands back (the label, or
+// the option object it was built from).
+async function selectRows(ctx, title, rows) {
+  const options = rows.map((row) => ({ label: row.label, description: row.description, value: row.id }));
+  const picked = await ctx.ui.select(title, options);
+  const answer = selLabel(picked);
+  if (answer === undefined || answer === null) return undefined;
+  const hit = options.find((option) => option.label === answer);
+  return hit ? hit.value : String(answer);
+}
+
+// -------------------------------------------------------------- approvals ---
+
+const CHOICE_KEYS = { allowOnce: "a", allowSession: "s", deny: "d" };
+
+// How many times this call has been put to the user in this session: the pop-up
+// says "attempt 2/3" instead of pretending it is the first time.
+const askCounts = {};
+
+function nextAttempt(key) {
+  const identity = String(key ?? "?");
+  askCounts[identity] = (askCounts[identity] ?? 0) + 1;
+  return askCounts[identity];
+}
+
+function approvalSpec(reason, extra = {}) {
+  const rule = String(extra.rule ?? "");
+  const heading = String(extra.heading ?? RULES[rule] ?? rule ?? "");
+  const lines = [`Why: ${heading}${reason ? ` — ${reason}` : ""}`];
+  // The target is worth a row of its own only when it says something the reason
+  // does not already name.
+  if (extra.target && String(extra.target) !== String(reason ?? "")) lines.push(`Target: ${String(extra.target).slice(0, 200)}`);
+  if (extra.command) lines.push(`Action: ${String(extra.command).split("\n")[0].slice(0, 200)}`);
+  lines.push(`Layer: ${extra.layer ?? "static"}${extra.ms ? ` (${extra.ms} ms)` : ""}`);
+  const budget = Math.max(1, CFG.retry.maxAttempts);
+  const attempt = Math.max(1, Number(extra.attempt) || 1);
+  lines.push(`Attempt: ${attempt}/${budget} · ${CFG.retry.authority === "off" ? "no second chance" : CFG.retry.authority}`);
+  if (extra.justification) lines.push(`Justify: "${String(extra.justification).replace(/\s+/g, " ").slice(0, 240)}"`);
+  const rows = CFG.ui.popupButtons
+    .filter((id) => POPUP_BUTTONS.includes(id))
+    .map((id) => ({ id, key: CHOICE_KEYS[id], label: CHOICE_TEXT[id].label, description: CHOICE_TEXT[id].description }));
+  return {
+    title: "destructive-check — approval needed",
+    heading,
+    tag: statusText(),
+    body: lines,
+    rows,
+    direct: true,
+    escape: "deny",
+    footer: [...rows.map((row) => `${row.key} = ${row.label}`), `Esc = Deny`].join(" · "),
+  };
+}
+
+// --------------------------------------------------------------- settings ---
+
+const REASONING_LEVELS = ["off", "minimal", "low", "medium", "high"];
+const TIMEOUT_STEPS = [5000, 10_000, 20_000, 30_000, 60_000];
+const CAP_STEPS = [0, 512, 1024, 2048];
+const LOG_STEPS = [10, 25, 50, 100, 200];
+const ATTEMPT_STEPS = [0, 1, 2, 3, 5];
+const BUDGET_STEPS = [0, 1, 3, 5, 10];
+const TTL_STEPS = [12, 24, 72, 168, 720];
+// The pop-up keeps its deny button; these are the sets the panel cycles through.
+const BUTTON_SETS = [
+  ["allowOnce", "allowSession", "deny"],
+  ["allowOnce", "deny"],
+  ["allowSession", "deny"],
+  ["deny"],
+];
+
+function nextIn(list, value) {
+  const index = list.indexOf(value);
+  return list[(index + 1) % list.length];
+}
+
+function layerOf(action) {
+  const text = String(action ?? "");
+  if (/cached/.test(text)) return "cache";
+  if (/^model:/.test(text)) return "model";
+  if (/^error/.test(text)) return "checker error";
+  if (/^would-block/.test(text)) return "watch";
+  if (/^ask:/.test(text)) return "static (ask)";
+  if (/^block/.test(text)) return "static (block)";
+  if (/^allow/.test(text)) return "static (allow)";
+  return "unknown";
+}
+
+// The panel redraws on every keystroke, and the audit file can be megabytes:
+// the list is read once and reused while the panel is open.
+let panelHistoryCache = { at: 0, entries: [] };
+
+function panelHistory(count) {
+  const now = Date.now();
+  if (!panelHistoryCache.entries.length || now - panelHistoryCache.at > 2000) {
+    const fromFile = recentAuditEntries(count);
+    panelHistoryCache = { at: now, entries: fromFile.length ? fromFile : decisionLog.slice(-count) };
+  }
+  return panelHistoryCache.entries;
+}
+
+function historyLine(entry) {
+  const at = String(entry.ts ?? entry.at ?? "").slice(11, 19);
+  const ms = entry.ms === undefined || entry.ms === null ? "" : ` · ${entry.ms} ms`;
+  const command = String(entry.command ?? "").replace(/\s+/g, " ").slice(0, 60);
+  return `${at} · ${layerOf(entry.action)}${ms} · ${String(entry.cwd ?? "")}${command ? ` · ${command}` : ""}`;
+}
+
+// Everything a decision left behind, for one entry: the pop-up's rows and the
+// audit line's fields in one place.
+function traceText(entry) {
+  const fields = [
+    ["rule", entry.rule],
+    ["layer", layerOf(entry.action)],
+    ["action", entry.action],
+    ["tool", entry.tool],
+    ["mode", entry.mode],
+    ["time", entry.ts ?? entry.at],
+    ["latency", entry.ms === undefined || entry.ms === null ? "" : `${entry.ms} ms`],
+    ["cwd", entry.cwd],
+    ["target", entry.detail],
+    ["command", entry.command],
+    ["session", entry.session],
+  ];
+  const width = Math.max(...fields.map(([key]) => key.length));
+  return fields
+    .filter(([, value]) => value !== undefined && value !== null && String(value) !== "")
+    .map(([key, value]) => `${key.padEnd(width)} : ${String(value).replace(/\s+/g, " ")}`)
+    .join("\n");
+}
+
+function statusLineSummary() {
+  const status = CFG.ui.statusLine;
+  return `${status.location} · ${status.detail}${status.location === "bar" ? ` · ${status.barSide}` : ""}`;
+}
+
+// --- the rows ---------------------------------------------------------------
+
+function simpleRows() {
+  return [
+    { id: "preset", label: `friction preset: ${effectiveFriction()}`, description: "quiet = do not bother me: low-risk work is not blocked and a model denial does not open a pop-up · balanced = the default · strict = block when in doubt, no second chance. Sets ask-on-deny, ask-on-error, the retry authority and the verification level together." },
+    {
+      id: "policyNote",
+      label: `policy note: ${CFG.policyNote ? `"${CFG.policyNote.slice(0, 48)}"` : "(none)"}`,
+      description: "free text about your own policy (for example: never touch the archive folder). A human wrote it, so unlike the agent's text it is trusted; the justification stage sends it with every checker request.",
+    },
+    { id: "open:statusLine", label: `status line: ${statusLineSummary()}`, description: "where the guard's status shows and how much it says: bar (next to the model), below the editor, above the editor, or off." },
+  ];
+}
+
+function protectionRows() {
+  const rows = [{ id: "mode", label: `mode: ${CFG.mode}`, description: "protection mode: simple = block outside-project deletes · medium = + inside-project · hard = + git and scripts · custom = every rule set by hand." }];
+  for (const key of RULE_ORDER) rows.push({ id: `rule:${key}`, label: `rule ${key}: ${CFG.rules[key]}`, description: RULE_NOTES[key] });
+  rows.push({ id: "watch", label: `watch (dry-run): ${CFG.dryRun ? "on" : "off"}`, description: "decide and log everything without blocking or asking — for calibrating the policy against real traffic. The status line then reads dc: WATCH and the audit says would-block." });
+  rows.push({ id: "intent", label: `agent intent: ${CFG.includeIntent ? "on" : "off"}`, description: "forward the agent's one-line intent to the checker, labelled as agent-written and untrusted." });
+  return rows;
+}
+
+function coverageRows() {
+  return Object.keys(CFG.coverage).map((key) => ({
+    id: `coverage:${key}`,
+    label: `coverage ${key}: ${CFG.coverage[key] ? "on" : "off"}`,
+    description: COVERAGE_NOTES[key],
+  }));
+}
+
+function retryRows() {
+  return [
+    { id: "retry.authority", label: `retry authority: ${CFG.retry.authority}`, description: "who decides a repeated, justified call: model = the checker reads the justification · ask = you are always asked · off = no second chance." },
+    { id: "retry.maxAttempts", label: `attempts per action: ${CFG.retry.maxAttempts}`, description: "how many justified repeats one blocked action may have (0 = none)." },
+    { id: "retry.sessionBudget", label: `attempts per session: ${CFG.retry.sessionBudget}`, description: "total justified repeats allowed in one session (0 = none)." },
+    { id: "retry.rememberApproved", label: `remember approvals: ${CFG.retry.rememberApproved}`, description: "session = until the session ends · once = this call only · permanent = written to the allowlist file, and only a human approval ever is." },
+    { id: "justifyTool", label: `justify tool: ${CFG.justifyTool.enabled ? "on" : "off"}`, description: "offer dc_justify to the agent so it can hand in a structured justification before repeating a call." },
+    { id: "verify.level", label: `verification: ${CFG.verify.level}`, description: "claims = the checker must name a machine-checkable claim · claims+adversarial = a second call looks for a counter-example · off = nothing is verified." },
+    { id: "recovery.mode", label: `recovery: ${CFG.recovery.mode}`, description: "justified = approved destructive work is moved to the trash instead of deleted · high = only for high-severity rules · off = no recovery." },
+    { id: "recovery.ttlHours", label: `trash retention: ${CFG.recovery.ttlHours} h`, description: "hours a recovered path stays in the trash before cleanup; restoring is possible any time before that." },
+    { id: "erosion.mode", label: `trust erosion: ${CFG.erosion.mode}`, description: "session = a claim that failed verification drops the retry authority to ask for the rest of the session · log = only record it · off = ignore it." },
+  ];
+}
+
+function checkerRows() {
+  const model = CFG.provider.name ? `${CFG.provider.name}/${CFG.provider.model || "(none)"}` : "(none)";
+  return [
+    { id: "checker.model", label: `checker model: ${model}`, description: "provider and model the checker asks; the list shows what you are logged in to." },
+    { id: "checker.engine", label: `engine: ${CFG.engine}`, description: "auto = in-process HTTP, the CLI only when the provider's API needs it · in-process = one HTTPS request · cli = one nested omp run (slow, always works)." },
+    { id: "checker.timeout", label: `timeout: ${CFG.timeoutMs} ms`, description: "per-check request timeout in milliseconds; the whole decision stays inside it." },
+    { id: "checker.reasoning", label: `reasoning: ${CFG.reasoning}`, description: "reasoning effort sent to the checker model (off = provider default)." },
+    { id: "checker.cap", label: `token cap: ${CFG.maxOutputTokens}`, description: "0 = no cap. A tight cap truncates reasoning models mid-reply and every gray-zone call then blocks until it is fixed." },
+    { id: "checker.test", label: "test the checker", description: "send one sample action and show the engine, the latency and the verdict — nothing is executed." },
+  ];
+}
+
+function statusLineRows() {
+  const status = CFG.ui.statusLine;
+  return [
+    { id: "ui.statusLine.location", label: `status line location: ${status.location}`, description: "bar = next to the model segment · belowEditor / aboveEditor = one line under or over the editor, cleared after a few seconds · off = nothing." },
+    { id: "ui.statusLine.detail", label: `status line detail: ${status.detail}`, description: "minimal = dc: <mode> · standard = + what happened and which rule · counters = + a:allowed d:blocked ca:checker-allowed cd:checker-denied." },
+    { id: "ui.statusLine.barSide", label: `bar side: ${status.barSide}`, description: "which side the guard's segment sits on in the host's status line: host = leave the preset alone · left · right. The snippet shows the block." },
+    { id: "ui.snippet", label: "show the statusLine snippet", description: "print a copy-pasteable statusLine: block for ~/.omp/agent/config.yml." },
+  ];
+}
+
+function uiRows() {
+  return [
+    { id: "overlay", label: `pop-up mode: ${CFG.ui.overlay}`, description: "auto = the pop-up when the host offers one, the plain list otherwise · always = never fall back to the list · never = always the plain list." },
+    { id: "open:statusLine", label: `status line: ${statusLineSummary()}`, description: "where the guard's status shows and how much it says: bar (next to the model), below the editor, above the editor, or off." },
+    { id: "buttons", label: `pop-up buttons: ${CFG.ui.popupButtons.join(", ")}`, description: "which buttons the approval pop-up offers. deny is always kept — a pop-up that cannot refuse is not a guard." },
+    { id: "summary", label: `session summary: ${CFG.ui.sessionSummary ? "on" : "off"}`, description: "one advisory line when the session ends: blocked · allowed · justified · top rule." },
+  ];
+}
+
+function advancedRows() {
+  const dirs = validateAllowDirs(CFG.allowDirs);
+  return [
+    { id: "allowDirs", label: `allowed dirs: ${dirs.accepted.length}`, description: "extra directories treated as project scope: a delete inside them counts as inside-project." },
+    { id: "rejected", label: `rejected entries: ${dirs.rejected.length}`, description: "allowDirs entries that were refused, with the reason — they look applied but are not." },
+    { id: "logSize", label: `history size: ${CFG.logSize}`, description: "how many decisions the in-session list keeps; the audit file is written either way." },
+    { id: "clearVerdicts", label: `clear cached verdicts (${verdictCache.size})`, description: "forget cached verdicts; the next matching command is checked again." },
+    { id: "clearApprovals", label: `clear session approvals (${sessionAllows.size})`, description: "forget every 'allow for this session' answer you gave." },
+    { id: "env", label: "environment overrides", description: "variables that win over this file for one session: OMP_DC_DISABLE, OMP_DC_MODE, OMP_DC_DRYRUN, OMP_DC_UI_STATUS, OMP_DC_PROVIDER, OMP_DC_MODEL, OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS, OMP_DC_BIN." },
+  ];
+}
+
+function guardRows() {
+  return [
+    { id: "guard.integrity", label: `integrity: ${guardIntegrity().state}`, description: "the file that is running, hashed against the manifest install.mjs wrote next to it." },
+    { id: "guard.lock", label: `lock: ${guardLockState()}`, description: "make the guard (and optionally the config) read-only, or clear that again." },
+    { id: "guard.restore", label: "restore the previous guard (.bak)", description: "put the copy install.mjs replaced back over the installed file." },
+  ];
+}
+
+// `wide` is what the history sub-panel asks for: the same rows over a longer
+// tail, because picking the right entry is the whole point there.
+function historyRows(wide) {
+  const entries = panelHistory(wide ? 24 : 5);
+  const rows = entries.map((entry, index) => ({
+    id: `history.trace:${index}`,
+    label: `${entry.action} · ${RULES[entry.rule] ?? entry.rule ?? "?"}`,
+    description: historyLine(entry),
+  }));
+  if (!rows.length) rows.push({ id: "history.none", label: "no decisions yet", description: "the guard has not decided anything in this session and the audit file is empty." });
+  if (!wide) rows.push({ id: "history.explain", label: "explain a decision", description: "pick one decision and see the whole trace: rule, layer, action, target, command, cwd, latency." });
+  rows.push({ id: "history.audit", label: "audit log entries", description: "the last lines as they were written to the log file, command text included." });
+  rows.push({ id: "history.chain", label: "verify the audit chain", description: "re-hash every line and compare it with the one before it; an edited or reordered entry is reported." });
+  return rows;
+}
+
+const SETTINGS_GROUPS = {
+  simple: simpleRows,
+  protection: protectionRows,
+  coverage: coverageRows,
+  retry: retryRows,
+  checker: checkerRows,
+  ui: uiRows,
+  advanced: advancedRows,
+  guard: guardRows,
+  history: () => historyRows(false),
+};
+
+function settingsRows(panelId) {
+  if (panelId === "root") {
+    const rows = [];
+    for (const [id, build] of Object.entries(SETTINGS_GROUPS)) {
+      rows.push({ section: true, id: `#${id}`, label: GROUP_TITLES[id] });
+      rows.push(...build());
+    }
+    return rows;
+  }
+  if (panelId === "statusLine") return statusLineRows();
+  if (panelId === "history") return historyRows(true);
+  return SETTINGS_GROUPS[panelId]?.() ?? [];
+}
+
+// --- what a row does --------------------------------------------------------
+
+// Cycles and toggles are applied in place: the panel stays open, redraws with
+// the new value and nothing is asked twice. Everything else (a text prompt, a
+// picker, a report, a sub-panel) is returned to the caller, which closes the
+// pop-up first — the host's own prompt must own the keyboard.
+function applyInlineSetting(id) {
+  switch (id) {
+    case "preset": {
+      const current = effectiveFriction();
+      applyFriction(nextIn(FRICTION_PRESETS, current === "custom" ? FRICTION_PRESETS[2] : current));
+      return true;
+    }
+    case "overlay":
+      persistNested("ui", { overlay: nextIn(OVERLAY_MODES, CFG.ui.overlay) });
+      return true;
+    case "buttons": {
+      const index = BUTTON_SETS.findIndex((set) => set.join() === CFG.ui.popupButtons.join());
+      persistNested("ui", { popupButtons: BUTTON_SETS[(index + 1) % BUTTON_SETS.length] });
+      return true;
+    }
+    case "summary":
+      persistNested("ui", { sessionSummary: !CFG.ui.sessionSummary });
+      return true;
+    case "mode": {
+      const next = nextIn(MODES, CFG.mode);
+      saveRules(next, next === "custom" ? { ...CFG.rules } : {});
+      return true;
+    }
+    case "watch":
+      persistConfigChange({ dryRun: !CFG.dryRun });
+      return true;
+    case "intent":
+      persistConfigChange({ includeIntent: !CFG.includeIntent });
+      return true;
+    case "retry.authority":
+      persistNested("retry", { authority: nextIn(RETRY_AUTHORITIES, CFG.retry.authority) });
+      return true;
+    case "retry.maxAttempts":
+      persistNested("retry", { maxAttempts: nextIn(ATTEMPT_STEPS, CFG.retry.maxAttempts) });
+      return true;
+    case "retry.sessionBudget":
+      persistNested("retry", { sessionBudget: nextIn(BUDGET_STEPS, CFG.retry.sessionBudget) });
+      return true;
+    case "retry.rememberApproved":
+      persistNested("retry", { rememberApproved: nextIn(REMEMBER_MODES, CFG.retry.rememberApproved) });
+      return true;
+    case "justifyTool":
+      persistNested("justifyTool", { enabled: !CFG.justifyTool.enabled });
+      return true;
+    case "verify.level":
+      persistNested("verify", { level: nextIn(VERIFY_LEVELS, CFG.verify.level) });
+      return true;
+    case "recovery.mode":
+      persistNested("recovery", { mode: nextIn(RECOVERY_MODES, CFG.recovery.mode) });
+      return true;
+    case "recovery.ttlHours":
+      persistNested("recovery", { ttlHours: nextIn(TTL_STEPS, CFG.recovery.ttlHours) });
+      return true;
+    case "erosion.mode":
+      persistNested("erosion", { mode: nextIn(EROSION_MODES, CFG.erosion.mode) });
+      return true;
+    case "checker.engine":
+      persistConfigChange({ engine: nextIn(ENGINES, CFG.engine) });
+      return true;
+    case "checker.reasoning":
+      persistConfigChange({ reasoning: nextIn(REASONING_LEVELS, CFG.reasoning) });
+      return true;
+    case "checker.timeout":
+      persistConfigChange({ timeoutMs: nextIn(TIMEOUT_STEPS, CFG.timeoutMs) });
+      return true;
+    case "checker.cap":
+      persistConfigChange({ maxOutputTokens: nextIn(CAP_STEPS, CFG.maxOutputTokens) });
+      return true;
+    case "logSize":
+      persistConfigChange({ logSize: nextIn(LOG_STEPS, CFG.logSize) });
+      return true;
+    case "ui.statusLine.location": {
+      const next = nextIn(STATUS_LOCATIONS, CFG.ui.statusLine.location);
+      persistNested("ui", { statusLine: { ...CFG.ui.statusLine, location: next } });
+      // A widget is not furniture: leaving the widget placements must not leave
+      // a stale line under the editor.
+      try {
+        lastStatusCtx?.ui?.setWidget?.("dc", undefined);
+      } catch {
+        /* UI is optional */
+      }
+      writeStatus(lastStatusCtx, statusText());
+      return true;
+    }
+    case "ui.statusLine.detail":
+      persistNested("ui", { statusLine: { ...CFG.ui.statusLine, detail: nextIn(STATUS_DETAILS, CFG.ui.statusLine.detail) } });
+      writeStatus(lastStatusCtx, statusText());
+      return true;
+    case "ui.statusLine.barSide":
+      persistNested("ui", { statusLine: { ...CFG.ui.statusLine, barSide: nextIn(BAR_SIDES, CFG.ui.statusLine.barSide) } });
+      return true;
+    default:
+      break;
+  }
+  if (id.startsWith("rule:")) {
+    const key = id.slice("rule:".length);
+    saveRules("custom", { ...CFG.rules, [key]: nextIn(ACTIONS, CFG.rules[key]) });
+    return true;
+  }
+  if (id.startsWith("coverage:")) {
+    const key = id.slice("coverage:".length);
+    persistConfigChange({ coverage: { ...CFG.coverage, [key]: !CFG.coverage[key] } });
+    return true;
+  }
+  return false;
+}
+
+async function runSetting(ctx, id) {
+  if (id === "open:statusLine") {
+    // The panel can hold a sub-panel; the plain list opens a sub-menu. Both show
+    // the same rows.
+    if (overlayAvailable(ctx)) return "statusLine";
+    await subMenu(ctx, "statusLine", "status line");
+    return null;
+  }
+  if (id === "policyNote") {
+    const value = await ctx.ui.input("policy note", CFG.policyNote);
+    if (value !== undefined) persistConfigChange({ policyNote: String(value).replace(/\s+/g, " ").trim().slice(0, 400) });
+    return null;
+  }
+  if (id === "checker.model") {
+    const provider = await pickProvider(ctx, "checker provider", CFG.provider.name);
+    if (provider) {
+      const model = await pickModel(ctx, provider, CFG.provider.model);
+      if (model) {
+        const raw = readRawConfig().raw;
+        persistConfigChange({ provider, providers: { ...(raw.providers ?? {}), [provider]: { ...(raw.providers ?? {})[provider], model } } });
+        ctx.ui.notify(`checker: ${provider}/${model} (${effectiveEngine(ctx)})`, "info");
+      }
+    }
+    return null;
+  }
+  if (id === "checker.test") {
+    const report = await checkerSelfTest(ctx);
+    await showReport(ctx, "checker self-test", report);
+    if (/FAILED/.test(report)) ctx.ui.notify(report.split("\n")[3] ?? "checker self-test failed", "error");
+    return null;
+  }
+  if (id === "allowDirs") {
+    await allowDirsMenu(ctx);
+    return null;
+  }
+  if (id === "rejected") {
+    const dirs = validateAllowDirs(CFG.allowDirs);
+    await showReport(
+      ctx,
+      "allowed dirs — rejected entries",
+      dirs.rejected.length ? dirs.rejected.map((entry) => `${entry.entry} — ${entry.reason}`).join("\n") : "No allowDirs entry was refused.",
+    );
+    return null;
+  }
+  if (id === "clearVerdicts") {
+    verdictCache.clear();
+    ctx.ui.notify("verdict cache cleared", "info");
+    return null;
+  }
+  if (id === "clearApprovals") {
+    sessionAllows.clear();
+    ctx.ui.notify("session approvals cleared", "info");
+    return null;
+  }
+  if (id === "env") {
+    await showReport(ctx, "environment overrides", `variables that win over this file for one session: OMP_DC_DISABLE, OMP_DC_MODE, OMP_DC_DRYRUN, OMP_DC_UI_STATUS, OMP_DC_PROVIDER, OMP_DC_MODEL, OMP_DC_ENGINE, OMP_DC_TIMEOUT_MS, OMP_DC_BIN.\n\nOMP_DC_DISABLE=1\nOMP_DC_MODE=${CFG.mode}\nOMP_DC_DRYRUN=${CFG.dryRun ? "1" : "0"}\nOMP_DC_UI_STATUS=${CFG.ui.statusLine.location}`);
+    return null;
+  }
+  if (id === "ui.snippet") {
+    await showReport(ctx, "show the statusLine snippet", statusLineSnippet());
+    return null;
+  }
+  if (id === "guard.integrity") {
+    await showReport(ctx, "guard integrity", guardIntegrityText());
+    return null;
+  }
+  if (id === "guard.lock") {
+    await guardLockMenu(ctx);
+    return null;
+  }
+  if (id === "guard.restore") {
+    await ctx.ui.confirm("restore the previous guard", restorePreviousGuard().join("\n"));
+    return null;
+  }
+  if (id === "history.none") return null;
+  if (id === "history.explain") {
+    if (overlayAvailable(ctx)) return "history";
+    await subMenu(ctx, "history", "History");
+    return null;
+  }
+  if (id === "history.audit") {
+    await showReport(ctx, "audit log — recent entries", auditRecentText());
+    return null;
+  }
+  if (id === "history.chain") {
+    await showReport(ctx, "audit chain", auditChainText());
+    return null;
+  }
+  if (id.startsWith("history.trace:")) {
+    const entry = panelHistory(id.startsWith("history.trace:") ? 24 : 5)[Number(id.split(":")[1])];
+    await showReport(ctx, `decision trace — ${entry?.rule ?? ""}`, entry ? traceText(entry) : "the guard has not decided anything in this session and the audit file is empty.");
+    return null;
+  }
+  return null;
+}
+
+async function activateSetting(ctx, id) {
+  if (applyInlineSetting(id)) return null;
+  return runSetting(ctx, id);
+}
+
+// The plain-list rendering of one settings group — the path a host without
+// `ctx.ui.custom` takes, and what `ui.overlay: never` asks for.
+async function subMenu(ctx, panelId, title) {
+  for (let guard = 0; guard < 64; guard++) {
+    const rows = settingsRows(panelId).filter((row) => !row.section);
+    if (!rows.length) return;
+    const id = await selectRows(ctx, title ?? GROUP_TITLES[panelId], rows);
+    if (!id) return;
+    await activateSetting(ctx, id);
+  }
+}
+
+// The settings pop-up, one panel per pass: cycling a value stays in the panel,
+// opening a sub-panel (status line, history) or a dialogue re-opens it after.
+async function settingsPanel(ctx) {
+  let panelId = "root";
+  let opened = false;
+  for (let guard = 0; guard < 64; guard++) {
+    const answer = await uiPanel(ctx, {
+      title: "destructive-check — settings",
+      heading: panelId === "root" ? "Simple" : GROUP_TITLES[panelId] || panelId,
+      tag: statusText(),
+      rows: () => settingsRows(panelId),
+      inline: applyInlineSetting,
+      footer: "↑/↓ move · Enter open · Esc close",
+      escape: "close",
+    });
+    if (!answer.overlay) return opened;
+    opened = true;
+    if (!answer.id || answer.id === "close") return true;
+    if (answer.id.startsWith("open:")) {
+      panelId = answer.id.slice("open:".length);
+      continue;
+    }
+    const next = await activateSetting(ctx, answer.id);
+    if (typeof next === "string") panelId = next;
+  }
+  return true;
+}
+
+// The reports and sub-menus the /dc list and the settings panel both open. They
+// live here so the two surfaces cannot drift apart: the same text, the same
+// labels, whichever one is on screen.
+function guardIntegrityText() {
+  const status = guardIntegrity();
+  return [
+    `loaded    : ${status.loaded || "(unknown path)"}`,
+    `state     : ${status.state}`,
+    `expected  : ${status.expected || "(no manifest next to the loaded file — not installed through install.mjs)"}`,
+    `actual    : ${status.actual || "(the loaded file cannot be read)"}`,
+    "",
+    status.state === "ok"
+      ? "The file that is running is byte-identical to what install.mjs wrote."
+      : "Reinstall from the repo: node install.mjs --force — or install.mjs --restore to go back to the previous copy.",
+  ].join("\n");
+}
+
+function auditRecentText(count = 12) {
+  const entries = recentAuditEntries(count);
+  return entries.length
+    ? entries.map((d) => `${String(d.ts ?? "").slice(11, 19)} ${d.action} · ${d.rule} · ${String(d.command ?? "").slice(0, 50)} · ${String(d.detail ?? "").slice(0, 50)}`).join("\n")
+    : "(the log file is empty)";
+}
+
+function auditChainText() {
+  const verdict = verifyAuditChain();
+  if (verdict.missing) return `no audit log yet at ${LOG_FILE}`;
+  return [
+    `entries : ${verdict.entries}`,
+    `chain   : ${verdict.broken.length ? "BROKEN" : "intact"}`,
+    ...verdict.broken.slice(0, 5).map((b) => `  line ${b.index}: ${b.reason}`),
+    "",
+    "An intact chain means no line was edited after it was written. It does not prove the log is complete: a whole tail can be deleted, and anything with write access to the file can re-chain the entries.",
+  ].join("\n");
+}
+
+async function guardLockMenu(ctx) {
+  const label =
+    selLabel(
+      await ctx.ui.select("guard lock", [
+        { label: "lock the guard and the config", description: "both files become read-only: an agent edit and a /dc change both fail until this is unlocked" },
+        { label: "lock the guard only", description: "the installed extension becomes read-only; /dc can still change settings" },
+        { label: "unlock both files", description: "clear the read-only attribute so install.mjs and /dc can write again" },
+        { label: "cancel", description: "close this submenu" },
+      ]),
+    ) ?? "";
+  if (label.startsWith("lock the guard and")) await ctx.ui.confirm("guard lock", setGuardLock(true).join("\n"));
+  else if (label.startsWith("lock the guard only")) await ctx.ui.confirm("guard lock", setGuardLockOnly().join("\n"));
+  else if (label.startsWith("unlock")) await ctx.ui.confirm("guard lock", setGuardLock(false).join("\n"));
+}
+
+async function allowDirsMenu(ctx) {
+  const rejects = validateAllowDirs(CFG.allowDirs).rejected;
+  const options = [
+    { label: "add a directory", description: "treat this directory as part of the project: deletes inside it are judged as inside-project" },
+    { label: `clear the list (${CFG.allowDirs.length})`, description: "drop every extra directory; only the session cwd and its git root stay in scope" },
+  ];
+  // An entry that cannot widen the scope is shown instead of silently doing
+  // nothing: a root, the home or a system tree would switch the guard off, so it
+  // is refused (before and after canonicalization).
+  if (rejects.length) options.push({ label: `rejected entries: ${rejects.length}`, description: "entries that are not part of the scope — pick to see the reason for each" });
+  options.push({ label: "cancel", description: "close this submenu" });
+  const act = selLabel(await ctx.ui.select("allowed dirs — extra project scope", options));
+  if (selLabel(act) === "add a directory") {
+    const dir = String((await ctx.ui.input("directory path", "")) ?? "").trim();
+    const reason = dir ? allowDirReject(dir) : "nothing was entered";
+    if (reason) ctx.ui.notify(`destructive-check: "${dir}" was not added — ${reason}`, "warning");
+    else persistConfigChange({ allowDirs: [...CFG.allowDirs, dir] });
+  } else if (selLabel(act)?.startsWith("clear the list")) {
+    persistConfigChange({ allowDirs: [] });
+  } else if (selLabel(act)?.startsWith("rejected")) {
+    await ctx.ui.confirm("allowed dirs — rejected entries", rejects.map((r) => `${r.entry} — ${r.reason}`).join("\n"));
+  }
 }
 
 // ---------------------------------------------------------------- /dc -------
@@ -2657,19 +4180,39 @@ export default function destructiveCheck(pi) {
 
   pi.on("session_start", (_event, ctx) => {
     lastSessionId = sessionIdOf(ctx);
+    // A new session starts from zero: the counters behind the status line's
+    // `counters` detail and the summary line belong to this session only.
+    Object.assign(sessionStats, { allowed: 0, blocked: 0, wouldBlock: 0, justified: 0, checkerAllow: 0, checkerDeny: 0, byRule: {} });
     statusNote(ctx, statusText());
     // Watch mode must never be left on by accident: it is the one setting that
     // makes the guard silent while looking armed.
     if (CFG.dryRun) statusNote(ctx, "destructive-check: WATCH MODE is on — decisions are logged as would-block and nothing is blocked or asked. Turn it off in /dc → watch (dry-run) or set OMP_DC_DRYRUN=0.", "warning");
   });
 
+  // One advisory line at the end of the session. Advisory only: it says what the
+  // guard did, and it never asks for the session to continue.
+  pi.on("session_stop", (_event, ctx) => {
+    if (!CFG.ui.sessionSummary) return;
+    const line = sessionSummaryLine();
+    if (!line) return;
+    try {
+      ctx?.ui?.notify?.(line, "info");
+    } catch {
+      /* UI is optional */
+    }
+  });
+
   pi.registerCommand("dc", {
-    description: "destructive-check settings (protection mode, rules, checker)",
+    description: "destructive-check settings (protection mode, rules, checker, UI)",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify(fullStatus(ctx), "info");
         return;
       }
+      // The pop-up panel is the settings surface. The plain-list menu below is
+      // what a host without ctx.ui.custom gets, and what `ui.overlay: never`
+      // asks for; settingsPanel() returns false when it could not open.
+      if (await settingsPanel(ctx)) return;
       let open = true;
       while (open) {
         statusNote(ctx, statusText());
@@ -2678,6 +4221,10 @@ export default function destructiveCheck(pi) {
           await ctx.ui.select("destructive-check", [
             { label: `enabled: ${CFG.enabled ? "yes" : "no"}`, description: "master switch — off means no checking at all; the status line then reads dc: off" },
             { label: `protection: ${CFG.mode}${CFG.enabled ? "" : " (guard off)"}`, description: "simple = block outside-project deletes · medium = + inside-project · hard = + git, scripts · custom = per-rule" },
+            { label: `friction preset: ${effectiveFriction()}`, description: "quiet = do not bother me: low-risk work is not blocked and a model denial does not open a pop-up · balanced = the default · strict = block when in doubt, no second chance. Sets ask-on-deny, ask-on-error, the retry authority and the verification level together." },
+            { label: `policy note: ${CFG.policyNote ? `"${CFG.policyNote.slice(0, 40)}"` : "none"}`, description: "free text about your own policy (for example: never touch the archive folder). A human wrote it, so unlike the agent's text it is trusted; the justification stage sends it with every checker request." },
+            { label: `ui: ${statusLineSummary()}`, description: "pop-up mode, status line, session summary" },
+            { label: `retry: ${CFG.retry.authority} · ${CFG.retry.maxAttempts}/${CFG.retry.sessionBudget}`, description: "retry authority and budgets, remembering approvals, verification, recovery and trust erosion" },
             { label: `checker: ${CFG.provider.model ? `${CFG.provider.name}/${CFG.provider.model}` : "no model"}`, description: "provider, model, engine, timeout" },
             { label: `ask on deny: ${CFG.askOnDeny ? "on" : "off"}`, description: "when the model denies, ask the user instead of blocking silently" },
             { label: `ask on error: ${CFG.askOnError ? "on" : "off"}`, description: "when the checker fails, ask the user instead of blocking" },
@@ -2689,6 +4236,7 @@ export default function destructiveCheck(pi) {
             { label: `allowed dirs: ${CFG.allowDirs.length}${dirs.rejected.length ? ` · ${dirs.rejected.length} rejected` : ""}`, description: "extra directories treated as project scope" },
             { label: "test checker", description: "send one sample action and show the verdict + latency" },
             { label: "recent decisions", description: "last checks and their outcomes" },
+            { label: "explain a decision", description: "pick one decision and see the whole trace: rule, layer, action, target, command, cwd, latency." },
             { label: "audit log", description: "the decisions from the log file, and a chain check on it" },
             { label: `guard: ${guardIntegrity().state}`, description: "installed guard vs the install manifest, the file lock and the previous copy" },
             { label: "status", description: "show everything" },
@@ -2699,6 +4247,25 @@ export default function destructiveCheck(pi) {
         else if (choice.startsWith("enabled:")) {
           persistConfigChange({ enabled: !CFG.enabled });
           ctx.ui.notify(`destructive-check: ${CFG.enabled ? "on" : "off"}`, "info");
+        } else if (choice.startsWith("friction preset")) {
+          const preset = await selectRows(
+            ctx,
+            "friction preset",
+            FRICTION_PRESETS.map((name) => ({ id: name, label: name, description: FRICTION_NOTES[name] })),
+          );
+          if (preset) {
+            applyFriction(preset);
+            ctx.ui.notify(`friction preset: ${effectiveFriction()}`, "info");
+          }
+        } else if (choice.startsWith("policy note")) {
+          const value = await ctx.ui.input("policy note", CFG.policyNote);
+          if (value !== undefined) persistConfigChange({ policyNote: String(value).replace(/\s+/g, " ").trim().slice(0, 400) });
+        } else if (choice.startsWith("ui:")) {
+          await subMenu(ctx, "ui", "UI");
+        } else if (choice.startsWith("retry:")) {
+          await subMenu(ctx, "retry", "Retry & justification");
+        } else if (choice.startsWith("explain a decision")) {
+          await activateSetting(ctx, "history.explain");
         } else if (choice.startsWith("protection:")) {
           const mode = selLabel(await ctx.ui.select("protection mode", MODES.map((m) => ({ label: m, description: MODE_PRESETS[m] ? `preset: ${RULE_ORDER.filter((r) => MODE_PRESETS[m][r] !== "allow").map((r) => `${r}=${MODE_PRESETS[m][r]}`).join(" ")}` : "starts from medium, every rule editable" }))));
           if (mode) {
@@ -2813,27 +4380,7 @@ export default function destructiveCheck(pi) {
             ctx.ui.notify("session approvals cleared", "info");
           }
         } else if (choice.startsWith("allowed dirs:")) {
-          const rejects = validateAllowDirs(CFG.allowDirs).rejected;
-          const options = [
-            { label: "add a directory", description: "treat this directory as part of the project: deletes inside it are judged as inside-project" },
-            { label: `clear the list (${CFG.allowDirs.length})`, description: "drop every extra directory; only the session cwd and its git root stay in scope" },
-          ];
-          // An entry that cannot widen the scope is shown instead of silently
-          // doing nothing: a root, the home or a system tree would switch the
-          // guard off, so it is refused (before and after canonicalization).
-          if (rejects.length) options.push({ label: `rejected entries: ${rejects.length}`, description: "entries that are not part of the scope — pick to see the reason for each" });
-          options.push({ label: "cancel", description: "close this submenu" });
-          const act = selLabel(await ctx.ui.select("allowed dirs — extra project scope", options));
-          if (selLabel(act) === "add a directory") {
-            const dir = String((await ctx.ui.input("directory path", "")) ?? "").trim();
-            const reason = dir ? allowDirReject(dir) : "nothing was entered";
-            if (reason) ctx.ui.notify(`destructive-check: "${dir}" was not added — ${reason}`, "warning");
-            else persistConfigChange({ allowDirs: [...CFG.allowDirs, dir] });
-          } else if (selLabel(act)?.startsWith("clear the list")) {
-            persistConfigChange({ allowDirs: [] });
-          } else if (selLabel(act)?.startsWith("rejected")) {
-            await ctx.ui.confirm("allowed dirs — rejected entries", rejects.map((r) => `${r.entry} — ${r.reason}`).join("\n"));
-          }
+          await allowDirsMenu(ctx);
         } else if (choice.startsWith("test checker")) {
           const report = await checkerSelfTest(ctx);
           await ctx.ui.confirm("checker self-test", report);
@@ -2857,22 +4404,9 @@ export default function destructiveCheck(pi) {
             ]),
           );
           if (selLabel(act)?.startsWith("recent entries")) {
-            const text = entries.length
-              ? entries.map((d) => `${String(d.ts ?? "").slice(11, 19)} ${d.action} · ${d.rule} · ${String(d.command ?? "").slice(0, 50)} · ${String(d.detail ?? "").slice(0, 50)}`).join("\n")
-              : "(the log file is empty)";
-            await ctx.ui.confirm("audit log — recent entries", text);
+            await showReport(ctx, "audit log — recent entries", auditRecentText(12));
           } else if (selLabel(act)?.startsWith("verify")) {
-            const verdict = verifyAuditChain();
-            const text = verdict.missing
-              ? `no audit log yet at ${LOG_FILE}`
-              : [
-                  `entries : ${verdict.entries}`,
-                  `chain   : ${verdict.broken.length ? "BROKEN" : "intact"}`,
-                  ...verdict.broken.slice(0, 5).map((b) => `  line ${b.index}: ${b.reason}`),
-                  "",
-                  "An intact chain means no line was edited after it was written. It does not prove the log is complete: a whole tail can be deleted, and anything with write access to the file can re-chain the entries.",
-                ].join("\n");
-            await ctx.ui.confirm("audit chain", text);
+            await showReport(ctx, "audit chain", auditChainText());
           }
         } else if (choice.startsWith("guard:")) {
           const act = selLabel(
@@ -2884,35 +4418,9 @@ export default function destructiveCheck(pi) {
             ]),
           );
           if (selLabel(act)?.startsWith("integrity")) {
-            const status = guardIntegrity();
-            const text = [
-              `loaded    : ${status.loaded || "(unknown path)"}`,
-              `state     : ${status.state}`,
-              `expected  : ${status.expected || "(no manifest next to the loaded file — not installed through install.mjs)"}`,
-              `actual    : ${status.actual || "(the loaded file cannot be read)"}`,
-              "",
-              status.state === "ok"
-                ? "The file that is running is byte-identical to what install.mjs wrote."
-                : "Reinstall from the repo: node install.mjs --force — or install.mjs --restore to go back to the previous copy.",
-            ].join("\n");
-            await ctx.ui.confirm("guard integrity", text);
+            await showReport(ctx, "guard integrity", guardIntegrityText());
           } else if (selLabel(act)?.startsWith("lock")) {
-            const what = selLabel(
-              await ctx.ui.select("guard lock", [
-                { label: "lock the guard and the config", description: "both files become read-only: an agent edit and a /dc change both fail until this is unlocked" },
-                { label: "lock the guard only", description: "the installed extension becomes read-only; /dc can still change settings" },
-                { label: "unlock both files", description: "clear the read-only attribute so install.mjs and /dc can write again" },
-                { label: "cancel", description: "close this submenu" },
-              ]),
-            );
-            const label = selLabel(what) ?? "";
-            if (label.startsWith("lock the guard and")) {
-              await ctx.ui.confirm("guard lock", setGuardLock(true).join("\n"));
-            } else if (label.startsWith("lock the guard only")) {
-              await ctx.ui.confirm("guard lock", setGuardLockOnly().join("\n"));
-            } else if (label.startsWith("unlock")) {
-              await ctx.ui.confirm("guard lock", setGuardLock(false).join("\n"));
-            }
+            await guardLockMenu(ctx);
           } else if (selLabel(act)?.startsWith("restore")) {
             await ctx.ui.confirm("restore the previous guard", restorePreviousGuard().join("\n"));
           }
@@ -2940,12 +4448,20 @@ export default function destructiveCheck(pi) {
       // The event is the thing that just blew up: its fields may be hostile
       // objects whose String() throws, so read only what is already a string.
       const raw = event?.input?.command ?? event?.input?.code;
-      logDecision({ tool: String(event?.toolName ?? "?"), rule: "internal", action: "error", detail, command: typeof raw === "string" ? raw.slice(0, 240) : "", cwd: ctx?.cwd });
       try {
         ctx?.ui?.notify?.(`destructive-check: internal error — ${detail}`, "warning");
       } catch {
         /* ignore */
       }
+      // Watch mode enforces nothing, and that includes this path: an analysis
+      // failure is recorded as something the policy would have stopped on and
+      // the call runs. The audit line below stays the one non-watch path writes
+      // (a test breaks it in place), so the watch branch logs its own.
+      if (CFG.dryRun) {
+        logDecision({ tool: String(event?.toolName ?? "?"), rule: "internal", action: "would-block", detail, command: typeof raw === "string" ? raw.slice(0, 240) : "", cwd: ctx?.cwd, counts: "would-block" });
+        return;
+      }
+      logDecision({ tool: String(event?.toolName ?? "?"), rule: "internal", action: "error", detail, command: typeof raw === "string" ? raw.slice(0, 240) : "", cwd: ctx?.cwd });
       if (CFG.mode === "hard") {
         return {
           block: true,

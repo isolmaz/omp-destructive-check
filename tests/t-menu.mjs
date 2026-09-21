@@ -1,5 +1,5 @@
 // /dc command: protection modes, per-rule editing, toggles and persistence.
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, selectLog, dialogDefects, check, report } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, selectLog, overlayLog, dialogDefects, check, report } from "./harness.mjs";
 
 const HOME = mkHome("menu");
 const CWD = "C:\\scratch\\proj";
@@ -19,17 +19,25 @@ const cfg = (extra = {}) => ({
 const pick = (prefix) => (options) => options.map((o) => (typeof o === "string" ? o : o.label)).find((l) => l.startsWith(prefix));
 const exact = (label) => (options) => options.map((o) => (typeof o === "string" ? o : o.label)).find((l) => l === label);
 
-async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true, fetchHandler, exec } = {}) {
+async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true, fetchHandler, exec, overlay = false, overlays = [] } = {}) {
   installFetch(fetchHandler ?? (() => fetchResponse(200, { choices: [{ message: { content: "ALLOW: self-test" } }] })));
   const ext = await loadExt({ home: HOME, config, registry: REG, exec });
-  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, selects: selections, inputs });
+  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, selects: selections, inputs, overlay, overlays });
   const confirms = [];
   ctx.ui.confirm = async (title, message) => {
     confirms.push(`${title}\n${message}`);
     return true;
   };
-  await ext.commands.get("dc").handler("", ctx);
-  return { ext, ctx, confirms, config: ext.readConfig() };
+  // The handler must never take the process down with it: a suite that dies
+  // before it prints its report proves nothing (the mutation gate counts a crash
+  // as a survivor), so the throw is captured here and asserted per case.
+  let error = null;
+  try {
+    await ext.commands.get("dc").handler("", ctx);
+  } catch (err) {
+    error = err;
+  }
+  return { ext, ctx, confirms, error, config: ext.readConfig() };
 }
 
 // ----------------------------------------------------------------- status ---
@@ -187,8 +195,100 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   } catch (err) {
     threw = err;
   }
-  check("/dc survives closing the menu without choosing anything", !threw, String(threw));
+  // `menu()` swallows the throw so the suite can still print its report, so the
+  // check has to look at both: an unanswered select must leave the menu, not
+  // walk into `choice.toLowerCase()`.
+  check("/dc survives closing the menu without choosing anything", !threw && !result?.error, String(threw ?? result?.error));
   check("/dc with no selections leaves the config untouched", result && JSON.stringify(result.config) === JSON.stringify(cfg()), JSON.stringify(result?.config));
+}
+
+// --------------------------------------------------- new settings (S2) -----
+{
+  // Every new setting is a menu entry + a DEFAULTS key + a persistence check.
+  const { config } = await menu({ selections: [pick("friction preset"), "quiet", pick("close")] });
+  check("/dc stores the friction preset", config.preset === "quiet", JSON.stringify(config.preset));
+  check("/dc writes the settings the preset stands for", config.askOnDeny === false && config.retry?.authority === "off" && config.verify?.level === "off", JSON.stringify({ askOnDeny: config.askOnDeny, retry: config.retry, verify: config.verify }));
+}
+{
+  const { config } = await menu({ selections: [pick("friction preset"), "strict", pick("close")] });
+  check("/dc can select the strict preset", config.preset === "strict" && config.verify?.level === "claims+adversarial", JSON.stringify({ preset: config.preset, verify: config.verify }));
+}
+{
+  const { config } = await menu({ selections: [pick("policy note"), pick("close")], inputs: ["never touch the archive folder"] });
+  check("/dc stores the policy note", config.policyNote === "never touch the archive folder", JSON.stringify(config.policyNote));
+}
+{
+  const { config } = await menu({ selections: [pick("ui:"), pick("pop-up mode"), pick("close"), pick("close")] });
+  check("/dc cycles the pop-up mode", config.ui?.overlay === "always", JSON.stringify(config.ui));
+}
+{
+  const { config, error } = await menu({ selections: [pick("ui:"), pick("status line"), pick("status line location"), undefined, pick("close"), pick("close")] });
+  check("/dc moves the status line without leaving the menu", config.ui?.statusLine?.location === "belowEditor", JSON.stringify(config.ui?.statusLine));
+  check("/dc survives an unanswered status-line select", !error, String(error));
+}
+{
+  const { config } = await menu({ selections: [pick("ui:"), pick("status line"), pick("status line detail"), pick("close"), pick("close")] });
+  check("/dc cycles the status line detail", ["minimal", "counters"].includes(config.ui?.statusLine?.detail), JSON.stringify(config.ui?.statusLine));
+}
+{
+  const { config } = await menu({ selections: [pick("ui:"), pick("status line"), pick("bar side"), pick("close"), pick("close")] });
+  check("/dc moves the guard's segment to the other side", config.ui?.statusLine?.barSide === "left", JSON.stringify(config.ui?.statusLine));
+}
+{
+  const { config } = await menu({ selections: [pick("ui:"), pick("pop-up buttons"), pick("close"), pick("close")] });
+  check("/dc trims the pop-up buttons but keeps deny", (config.ui?.popupButtons ?? []).includes("deny") && config.ui.popupButtons.length < 3, JSON.stringify(config.ui?.popupButtons));
+}
+{
+  const { config } = await menu({ selections: [pick("ui:"), pick("session summary"), pick("close"), pick("close")] });
+  check("/dc toggles the session summary", config.ui?.sessionSummary === false, JSON.stringify(config.ui));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("retry authority"), pick("close"), pick("close")] });
+  check("/dc cycles the retry authority", config.retry?.authority === "ask", JSON.stringify(config.retry));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("attempts per action"), pick("close"), pick("close")] });
+  check("/dc cycles the per-action attempt budget", config.retry?.maxAttempts === 2, JSON.stringify(config.retry));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("attempts per session"), pick("close"), pick("close")] });
+  check("/dc cycles the per-session attempt budget", config.retry?.sessionBudget === 5, JSON.stringify(config.retry));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("remember approvals"), pick("close"), pick("close")] });
+  check("/dc cycles how approvals are remembered", config.retry?.rememberApproved === "once", JSON.stringify(config.retry));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("justify tool"), pick("close"), pick("close")] });
+  check("/dc toggles the justify tool", config.justifyTool?.enabled === false, JSON.stringify(config.justifyTool));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("verification"), pick("close"), pick("close")] });
+  check("/dc cycles the verification level", config.verify?.level === "claims+adversarial", JSON.stringify(config.verify));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("recovery:"), pick("close"), pick("close")] });
+  check("/dc cycles the recovery mode", config.recovery?.mode === "high", JSON.stringify(config.recovery));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("trash retention"), pick("close"), pick("close")] });
+  check("/dc cycles the trash retention", config.recovery?.ttlHours === 168, JSON.stringify(config.recovery));
+}
+{
+  const { config } = await menu({ selections: [pick("retry:"), pick("trust erosion"), pick("close"), pick("close")] });
+  check("/dc cycles the trust erosion mode", config.erosion?.mode === "log", JSON.stringify(config.erosion));
+}
+{
+  // The pick-up panel is the other setting surface: it writes the same keys.
+  const before = overlayLog.length;
+  const { config } = await menu({ overlay: true, overlays: [["\r", "\u001b"]] });
+  check("/dc opens the setting panel when the host draws overlays", overlayLog.length === before + 1, `overlays=${overlayLog.length - before}`);
+  check("the panel row cycles and persists the friction preset", config.preset === "strict", JSON.stringify(config.preset));
+  const rows = overlayLog.at(-1)?.options ?? [];
+  for (const group of ["Simple", "Protection", "Coverage", "Retry & justification", "Checker", "UI", "Advanced", "Guard", "History"]) {
+    check(`the panel has the ${group} section`, rows.some((row) => row.label === group), rows.slice(0, 8).map((row) => row.label).join(" | "));
+  }
+  check("the panel rows carry explanations", rows.filter((row) => !row.section).every((row) => String(row.description ?? "").trim()), "a panel row has no description");
 }
 
 // ------------------------------------------------------------- explanations --

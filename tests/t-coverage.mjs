@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, dialogDefects, confirmLog, EXT_PATH } from "./harness.mjs";
+import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, dialogDefects, confirmLog, selectLog, EXT_PATH } from "./harness.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const AUDIT = path.join(HERE, "..", "tools", "dc-audit.mjs");
@@ -156,6 +156,12 @@ fs.writeFileSync(path.join(PROJ, "blob.sh"), Buffer.from("#!/bin/sh\n\0\u0001rm 
 {
   const p = await run(hub({ op: "start", application: "sh", args: ["./loop.sh"] }));
   check("hub: a script launched through hub is read, not just named", p.blocked && /insideDelete/.test(p.reason) && /loop\.sh sha256:/.test(p.reason), p.reason);
+}
+{
+  // `args` arrive as separate tokens: joining them with a space used to split a
+  // destination that holds one ("My Docs") and read the last fragment as the path.
+  const p = await run(hub({ op: "start", application: "cp", args: [path.join(PROJ, "src", "app.js"), path.join(HOME, "My Docs") + path.sep] }));
+  check("hub: a destination containing a space is still the destination", p.blocked && /outsideWrite/.test(p.reason), p.reason);
 }
 
 // ----------------------------------------------------------------- probes ----
@@ -392,11 +398,14 @@ try {
   check("watch: the resting status line says WATCH", ctx.statuses.some((s) => /^dc: WATCH/.test(String(s.text))), JSON.stringify(ctx.statuses));
 }
 {
-  const before = confirmLog.length;
   const { defects } = await dc({ selects: [(options) => options.map((o) => o.label).find((l) => l.startsWith("watch"))], config: cfg({ mode: "hard" }) });
   const written = JSON.parse(fs.readFileSync(path.join(HOME, ".omp", "destructive-check.json"), "utf8"));
   check("/dc: watch mode toggles and persists", written.dryRun === true, JSON.stringify(written));
-  check("/dc: the watch entry explains itself", defects.length === 0 && confirmLog.length >= before, defects.join("; "));
+  // The row has to explain *what* it does, not just carry a label: read the
+  // description the menu shipped with the watch entry.
+  const watchRow = selectLog.flatMap((call) => call.options).find((option) => /watch|dry-run/i.test(String(option?.label ?? "")));
+  const description = String(watchRow?.description ?? "");
+  check("/dc: the watch entry explains itself", defects.length === 0 && /dry-run|WATCH|block|enforc/i.test(description), `${JSON.stringify(watchRow ?? null).slice(0, 160)} | ${defects.join("; ")}`);
 }
 
 // ---------------------------------------------------- realpath scope (P0.3) ---
@@ -449,6 +458,52 @@ try {
     check("allowDirs: a link that resolves to the home is refused", p.blocked && p.completions === 0, `${linkHome} → ${JSON.stringify(p.result)?.slice(0, 160)}`);
   } else {
     console.log("  SKIP allowDirs link: this platform cannot create a directory link in the scratch dir");
+  }
+}
+
+// ------------------------------------------- realpath cache (write targets) ---
+// The cache holds what the filesystem *answered*, never a forecast for a path
+// that does not exist yet: a spelling pre-resolved before a link appeared has to
+// be re-resolved after it, or a write that lands outside the project is judged
+// inside for the whole TTL. Both calls share one module instance, which is what
+// makes the second one hit the cache the first one filled.
+{
+  const OUT = path.join(HOME, "stale-outside");
+  const esc = path.join(PROJ, "esc");
+  fs.rmSync(OUT, { recursive: true, force: true });
+  fs.mkdirSync(OUT, { recursive: true });
+  for (const clear of [() => fs.unlinkSync(esc), () => fs.rmdirSync(esc)]) {
+    try {
+      clear();
+    } catch {
+      /* nothing to clear */
+    }
+  }
+  stubFetch();
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "hard" }), registry: REG });
+  const ctx = makeCtx({ cwd: PROJ, registry: REG });
+  const target = path.join(esc, "payload.js");
+  const before = await callTool(ext, { toolName: "write", input: { path: target, content: "x" } }, ctx);
+  let linked = false;
+  for (const type of process.platform === "win32" ? ["junction", "dir"] : ["dir", undefined]) {
+    try {
+      fs.symlinkSync(OUT, esc, type);
+      linked = true;
+      break;
+    } catch {
+      /* try the next flavor */
+    }
+  }
+  const after = linked ? await callTool(ext, { toolName: "write", input: { path: target, content: "x" } }, ctx) : undefined;
+  if (!linked) console.log("  SKIP realpath cache: this platform cannot create a directory link in the scratch dir");
+  else {
+    check("realpath cache: a path that does not exist yet is a clean pass", before === undefined, JSON.stringify(before));
+    check("realpath cache: the same spelling is re-resolved after a link appears", after?.block === true && /outsideWrite/.test(String(after?.reason ?? "")), JSON.stringify(after));
+  }
+  try {
+    fs.rmdirSync(esc);
+  } catch {
+    /* scratch cleanup */
   }
 }
 

@@ -32,14 +32,22 @@ export const selectLog = [];
 // through confirm, and their text is part of what the suite checks.
 export const confirmLog = [];
 
+// The pop-up surface: every ctx.ui.custom call, with the title, the rows the
+// component was built from, the keys it was driven with and what it rendered.
+export const overlayLog = [];
+
+// And the one-line widgets a status line placed under or over the editor.
+export const widgetLog = [];
+
 // Options that offer no explanation. Dialogues are the only configuration surface
 // users touch, so an unexplained choice is a defect; every suite asserts this for
-// the dialogues it exercises.
+// the dialogues it exercises — the plain lists and the pop-ups alike.
 export function dialogDefects() {
   const defects = [];
   const seen = new Set();
-  for (const call of selectLog) {
-    for (const option of call.options) {
+  const scan = (call, options) => {
+    for (const option of options) {
+      if (option?.section) continue;
       const label = typeof option === "string" ? option : option?.label;
       const description = typeof option === "string" ? "" : option?.description;
       const key = `${call.title}|${label}`;
@@ -47,7 +55,9 @@ export function dialogDefects() {
       seen.add(key);
       if (!label || !String(description ?? "").trim()) defects.push(`${call.title} → ${label ?? JSON.stringify(option)}`);
     }
-  }
+  };
+  for (const call of selectLog) scan(call, call.options);
+  for (const call of overlayLog) scan(call, call.options);
   return defects;
 }
 
@@ -120,12 +130,13 @@ export function fakeRegistry(entries) {
   };
 }
 
-export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "" } = {}) {
+export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "", overlay = false, overlays = [], custom = null } = {}) {
   const notes = [];
   const statuses = [];
   const ui = {
     notify: (message, level) => notes.push({ message, level }),
     setStatus: (key, text) => statuses.push({ key, text }),
+    setWidget: (key, content, options) => widgetLog.push({ key, content, options }),
     select: async (_title, options) => {
       selectLog.push({ title: String(_title), options: Array.isArray(options) ? options : [] });
       if (!selects.length) return undefined;
@@ -138,6 +149,46 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
       return true;
     },
   };
+  if (custom) ui.custom = custom;
+  // The overlay surface is opt-in: a ctx without it exercises the plain-list
+  // fallback, which is what most hosts and every other suite see.
+  if (overlay) {
+    ui.custom = async (factory, options) => {
+      const entry = { title: "", options: [], keys: [], lines: [], hostOptions: options ?? null };
+      overlayLog.push(entry);
+      let settle;
+      const decided = new Promise((resolve) => (settle = resolve));
+      const component = factory({ requestRender() {} }, undefined, undefined, (value) => {
+        entry.done = value;
+        settle(value);
+      });
+      const spec = component?.spec ?? {};
+      entry.title = String(spec.title ?? "");
+      // Section headings are rows too, marked `section` so dialogDefects knows
+      // they are headings and not choices.
+      entry.options = (typeof spec.rows === "function" ? spec.rows() : spec.rows) ?? [];
+      entry.lines = component?.render?.(80) ?? [];
+      const script = overlays.length ? overlays.shift() : undefined;
+      if (typeof script === "function") {
+        const value = await script(component, entry);
+        if (entry.done === undefined && value !== undefined) entry.done = value;
+      } else {
+        // A string or an array of strings is fed to handleInput in order; the
+        // loop stops as soon as the component decides.
+        for (const key of Array.isArray(script) ? script : script ? [script] : []) {
+          entry.keys.push(key);
+          component?.handleInput?.(key);
+          entry.lines = component?.render?.(80) ?? entry.lines;
+          if (entry.done !== undefined) break;
+        }
+      }
+      // No script, or a script that never decided: the host hands back
+      // `undefined as never` here (RPC/ACP), and that is never a decision.
+      await Promise.race([decided, Promise.resolve(null)]);
+      component?.dispose?.();
+      return entry.done;
+    };
+  }
   return {
     ui,
     notes,

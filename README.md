@@ -25,7 +25,7 @@ available, and otherwise blocks with the real error text so the failure is debug
 | `protectSecrets` — a mutating target that resolves to a credential store: `.env` (but not `.env.example`/`.env.sample`), `.ssh/**`, `.aws/credentials`, `.kube/config`, `.git-credentials`, `id_rsa*`, `*.pem`/`*.key`/`*.p12`/`*.kdbx`, `auth.json`, `.npmrc`, `.config/gh/hosts.yml` | ask | block | block |
 | `outsideDelete` — deletes whose target is outside the project | block | block | block |
 | `outsideMove` — moving data that lives outside the project, or moving it out | block | block | block |
-| `outsideWrite` — a write-like effect outside the project: `>`/`>>` destinations, and the write positions of `cp`, `mv`, `rsync`, `truncate`, `tee`, `dd of=`, `chmod`/`chown`/`chgrp`, `ln` | ask | model | block |
+| `outsideWrite` — a write-like effect outside the project: `>`/`>>`/`>|`/`>&file` destinations, the write positions of `cp`/`mv` (including `-t DIR`/`--target-directory=DIR`), `rsync`, `truncate`, `tee`, `dd of=`, `chmod`/`chown`/`chgrp`, `ln`/`mklink`, `install`, `sed -i`, `curl -o`/`wget -O`, `tar -C`, `unzip -d` and `git clone`'s destination, plus every file a `write`/`edit`/`apply_patch` call rewrites | ask | model | block |
 | `insideDelete` — deletes inside the project that are not artifacts | allow | block | block |
 | `artifactDelete` — `node_modules`, `dist`, `build`, `.next`, temp dirs | allow | allow | allow |
 | `dynamicTargets` — targets that cannot be resolved statically (`$VAR`, `rm -rf *`) | model | model | block |
@@ -43,17 +43,38 @@ second chance: rewriting or deleting a credential store is not a judgement call,
 names the file (`"C:\proj\.env" is a credential or secret file`), never the pattern that matched it.
 It reaches `write`, `edit` and `apply_patch` (the `path` field, every `*** … File:` section, the
 hashline headers and the structured `{path, edits:[…]}` form), plus deletes, moves and write effects
-issued through `bash` and `eval`. `.env.example` and `.env.sample` are templates, so they stay free.
+issued through `bash` and `eval` — including the write APIs in eval code (`open(path, 'w')`,
+`Path(p).write_text(…)`, `writeFileSync`, `shutil.copy/move`, `os.replace/rename`, `fs.linkSync`),
+whose destination is read from the first argument (or the second one for a copy/move/link pair).
+`.env.example` and `.env.sample` are templates, so they stay free.
 
-`outsideWrite` reads a command the way the shell does: redirect destinations are taken from the
-command text with quoting respected, here-document bodies are dropped first (a body is data, and
-`bash <<'EOF'` still runs its own scan), and `2>&1`/`>&2` are file-descriptor copies, not files.
-`> /dev/null` (and `NUL`) writes nowhere and stays silent. Each verb names its own write positions —
-`cp` only its destination, `mv` sources and destination, `rsync` its destination (all sources with
-`--delete`), `dd` only `of=` (a block device stays `catastrophic`), `chmod`/`chown`/`chgrp` every
-argument after the mode/owner, `ln` both the target and the link path — so `cp ../outside/a .` is not
-flagged while `cp a ../outside/` is. A destination that cannot be resolved (a variable, a glob, or a
-remote `user@host:/path`) is a `dynamicTargets` violation, never a clean pass.
+`outsideWrite` reads a command the way the shell does. Redirect destinations come from the command
+text with quoting respected: `>`, `>>`, the noclobber override `>|` and `>&file` (both streams to a
+file) all write their target, while `2>&1`, `>&2` and `>&-` are file-descriptor copies, not files.
+Here-document bodies are read once for the whole scanner and both halves use that one decision: a body
+handed to a shell or an interpreter (`bash <<'EOF'`, `python <<'EOF'`) runs as code — its redirects,
+verbs and deletes are judged at one nesting level deeper — while a body handed to a plain reader
+(`cat`, `tee`, `awk`) is data and is not scanned. An *unterminated* here-document is never blanked, so
+a `<<` that the shell would read as something else cannot hide the lines after it. `> /dev/null` (and
+`NUL`) writes nowhere and stays silent. Each verb names its own write positions, with its own option
+grammar: `cp`/`mv`/`install` their destination (or the `-t DIR`/`--target-directory=DIR` they were
+given — with that flag every operand is a source, and a lone operand is a source too), `rsync` its
+destination (all sources with `--delete`), `dd` only `of=` (a block device stays `catastrophic`),
+`chmod`/`chown`/`chgrp` every argument after the mode/owner, `ln`/`mklink` both the target and the link
+path, `sed -i` every operand (without `-i` sed writes nothing), `curl -o`/`wget -O`, `tar -C`,
+`unzip -d` and `git clone`'s final operand. `--opt=value` is an option, not a path, so a trailing
+`--backup=numbered` is not mistaken for the destination. So `cp ../outside/a .` is not flagged while
+`cp a ../outside/` is, and `cp -t ../outside a b` is. An inline `cd`/`pushd` moves where the *relative*
+targets of the rest of the line resolve, in the write scan exactly as in the delete scan
+(`cd ..; echo pwn > target.js` is an outside write). A destination that cannot be resolved — a
+variable, a glob, a brace expansion like `{../outside,../tmp2}/x.txt`, or a remote
+`user@host:/path` — is a `dynamicTargets` violation, never a clean pass.
+
+The file tools are judged by the same write rules as the shell channel: every path a `write`, `edit`
+or `apply_patch` call rewrites is classified, so rewriting a system file or a file outside the project
+is a `systemTarget`/`outsideWrite` (it used to be judged by the secret check alone and stayed free),
+and a target the guard cannot resolve (`%APPDATA%\.env`) is a `dynamicTargets` violation. Ordinary
+editing inside the project stays free.
 
 `gitDestructive` follows what git actually does, not one spelling of it: `--force-with-lease` is
 deliberately **allowed** (it refuses to overwrite a ref that moved since the last fetch), `+HEAD:main`
@@ -78,7 +99,9 @@ is not treated as a build-artifact cleanup.
 Scope and targets are compared as **real** paths: `realpathSync` — through the nearest existing
 ancestor when the target does not exist yet — resolves junctions and symlinks, so a link inside the
 project that points outside is classified as outside, and a link that points back in is classified as
-inside. The result is cached per session, which is what keeps the static layers at 0 ms.
+inside. Only paths the filesystem actually resolved are cached (15 s, per session), which is what
+keeps the static layers at 0 ms; the ancestor walk for a path that does not exist yet is recomputed on
+every call, so a link created after the first check is picked up by the next one.
 
 Each rule can be set to one of four actions:
 
@@ -100,12 +123,12 @@ it cannot be left on by accident. Toggle it in `/dc → watch (dry-run)`.
 
 | Tool | Covered |
 | --- | --- |
-| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -Command`, `wsl`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking, **script bodies** (`sh ./x.sh`, `bash -x x.sh`, `./x.sh`, `cmd /c x.cmd`) up to 64 KiB and 2 files deep, **redirect destinations** (`>`, `>>`; here-document bodies stripped, `2>&1`/`>&2` skipped, `/dev/null` and `NUL` silent) and **write verbs** with their own argument positions (`cp`, `mv`, `rsync` incl. `--delete`, `dd of=`, `truncate`, `tee`, `chmod`/`chown`/`chgrp`, `ln`) |
-| `write` | the file it writes, and nothing else: a credential store (`.env`, `id_rsa`, `*.pem`, `.ssh/**`, `.aws/credentials`, …) is blocked statically in every mode, every other write is ordinary editing work and stays free |
+| `bash` | delete/move verbs, wrappers (`sudo`, `xargs`, `env`, `timeout`), shells (`bash -c`, `cmd //c`, `powershell -NoProfile -Command`, `bash -o pipefail -c`, `wsl bash -c`), nested wrappers (up to 3 levels, deeper ones escalate), `find -delete`/`-exec`/`-execdir`, package runners (`npx rimraf`, `yarn run rimraf`), compound commands (`&&`, `\|`, `;`, `for … do`), inline `cd` tracking (deletes **and** writes), **script bodies** (`sh ./x.sh`, `bash -x x.sh`, `./x.sh`, `cmd /c x.cmd`) up to 64 KiB and 2 files deep, **redirect destinations** (`>`, `>>`, `>|`, `>&file`; here-document bodies scanned as code when the reader is a shell, dropped when it is `cat`/`tee`/`awk`, `2>&1`/`>&2`/`>&-` skipped, `/dev/null` and `NUL` silent) and **write verbs** with their own option grammar (`cp`/`mv`/`install` incl. `-t DIR`, `rsync` incl. `--delete`, `dd of=`, `truncate`, `tee`, `chmod`/`chown`/`chgrp`, `ln`/`mklink`, `sed -i`, `curl -o`/`wget -O`, `tar -C`, `unzip -d`, `git clone`) |
+| `write` | every path it names is classified: a credential store (`.env`, `id_rsa`, `*.pem`, `.ssh/**`, `.aws/credentials`, …) is `protectSecrets`, a system file is `systemTarget`, a path outside the project is `outsideWrite`, and a target the guard cannot resolve (`%APPDATA%\.env`) is `dynamicTargets`. Editing inside the project is ordinary work and stays free |
 | `git` | destructive subcommands: `clean`/`rm`, `reset --hard`, `push --force`/`--delete`, `branch -D` (and `-d --force`), `stash drop`/`clear`, bare `restore` (but not `--staged`, which only unstages), `checkout -f` and the `checkout [ref] -- <path>` form, `switch -f`/`--discard-changes`, `worktree remove --force`, `reflog expire --expire=now`, `gc --prune=now`, `filter-branch`/`filter-repo`. Git arguments are not path-classified: the subcommand decides, so this list is the coverage. |
-| `eval` | delete APIs in Python (`shutil.rmtree`, `os.remove`, …) and JS/TS (`fs.rmSync`, `fs.unlinkSync`, `Deno.remove`, …), plus destructive shell strings and catastrophic one-liners inside the code |
-| `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` — every file section in the payload, each move paired with the section above it — and the structured form (`{path, edits: [{op: "delete"}]}`), which is its own schema and used to be read as JSON text that matched nothing |
-| `hub` | `start` / `restart`: `application` + `args` are scanned like a command line; `detached` / `persist` add a `dynamicTargets` violation because the process outlives the session. Disable with `coverage.processes: false`. |
+| `eval` | delete APIs in Python (`shutil.rmtree`, `os.remove`, …) and JS/TS (`fs.rmSync`, `fs.unlinkSync`, `Deno.remove`, …) and write APIs (`open(p, 'w')`, `Path(p).write_text(…)`, `writeFileSync`, `shutil.copy/move`, `os.replace/rename`, `fs.linkSync`), with a literal or single-binding target classified and a computed one recorded as `dynamicTargets`, plus destructive shell strings and catastrophic one-liners inside the code |
+| `edit`, `apply_patch` | hashline `REM` / `MV`, `*** Delete File:`, `*** Move to:` — every file section in the payload, each move paired with the section above it — and the structured form (`{path, edits: [{op: "delete"}]}`), which is its own schema and used to be read as JSON text that matched nothing. Every path the payload names is also classified like a shell write target, so an `*** Add File:`/`*** Update File:` section outside the project or in a system tree is caught |
+| `hub` | `start` / `restart`: `application` + `args` are scanned like a command line — each argument is quoted before it joins, so a destination holding a space stays one path; `detached` / `persist` add a `dynamicTargets` violation because the process outlives the session. Disable with `coverage.processes: false`. |
 
 Deleting a project directory through `eval` was a real bypass in earlier versions; it is covered now.
 So was the pair this release closes: a delete loop moved into a script file, and the same payload
@@ -167,9 +190,41 @@ disabledExtensions:
   "askOnError": true,               // checker fails  -> ask the user instead of blocking blind
   "allowDirs": [],                  // extra project dirs; a root, the home or a system tree is refused and reported
   "dryRun": false,                  // watch mode: log every decision as would-block, enforce nothing
-  "logSize": 25                     // entries kept for "/dc > recent decisions"
+  "logSize": 25,                    // entries kept for "/dc > recent decisions"
+
+  "preset": "balanced",             // quiet | balanced | strict — the friction preset (see below)
+  "policyNote": "",                 // free text the checker receives with every request (S3)
+  "retry": {                        // second-chance loop settings (the loop itself is the next stage)
+    "authority": "model",           // model | ask | off
+    "maxAttempts": 1,               // justified repeats per action (0 = none)
+    "sessionBudget": 3,             // justified repeats per session (0 = none)
+    "rememberApproved": "session"   // session | once | permanent (only human approvals are ever permanent)
+  },
+  "justifyTool": { "enabled": true },
+  "verify": { "level": "claims" },              // claims | claims+adversarial | off
+  "recovery": { "mode": "justified", "ttlHours": 72 },  // justified | high | off
+  "erosion": { "mode": "session" },             // session | log | off
+
+  "ui": {
+    "overlay": "auto",              // auto | always | never — the pop-up vs the plain-list dialogue
+    "statusLine": {
+      "location": "bar",            // bar | belowEditor | aboveEditor | off
+      "detail": "standard",         // minimal | standard | counters
+      "barSide": "host"             // host | left | right — where the guard's segment sits in the footer
+    },
+    "popupButtons": ["allowOnce", "allowSession", "deny"],
+    "sessionSummary": true          // one advisory line when the session ends
+  }
 }
 ```
+
+`preset` writes the settings it stands for, so the file never shows a preset name that
+disagrees with the values beside it: `quiet` = allow-on-deny off, retry authority off,
+verification off; `balanced` = the defaults above; `strict` = allow-on-deny off, retry
+authority off, adversarial verification. The panel shows `custom` when the values were
+changed one by one. `retry.*`, `verify.*`, `recovery.*`, `erosion.*` and the `justifyTool`
+switch are stored and shown today; the second-chance loop that reads them is the next
+stage, and until it lands they are recorded policy.
 
 `allowDirs` entries must be absolute or start with `~/`. An entry that names a filesystem root
 (`C:\`, `/`), the user's home, `~/.omp` or a system tree (`C:\Windows`, `C:\Program Files*`, `/etc`,
@@ -180,13 +235,107 @@ reason instead of leaving a setting that looks applied and is not.
 
 Environment overrides (win over the file): `OMP_DC_DISABLE=1`, `OMP_DC_MODE`, `OMP_DC_PROVIDER`,
 `OMP_DC_MODEL`, `OMP_DC_ENGINE`, `OMP_DC_TIMEOUT_MS`, `OMP_DC_DRYRUN=1` (watch mode for one session),
-`OMP_DC_BIN` (CLI engine binary).
+`OMP_DC_UI_STATUS` (`bar` / `belowEditor` / `aboveEditor` / `off` — where the status line goes for one
+session), `OMP_DC_BIN` (CLI engine binary).
+
+## Approval pop-up
+
+When the guard has to ask, it asks in a pop-up (`ctx.ui.custom`) instead of a bare list, and the
+reason is on the panel itself — no extra key press: the rule and what it decided, the target, the
+command, the layer that decided (`static` / `model` / `cache` / `checker error`) with its latency, and
+the attempt count against `retry.maxAttempts`.
+
+```
+┌─ destructive-check — approval needed ─────────────────────────────────────┐
+│ Delete inside the project                                       dc: medium │
+│ ───────────────────────────────────────────────────────────────────────── │
+│ Why: Delete inside the project — "src" is inside the project              │
+│ Action: rm -rf src                                                       │
+│ Layer: static (ask)                                                      │
+│ Attempt: 1/1 · model                                                     │
+│ ───────────────────────────────────────────────────────────────────────── │
+│ ▸ [a] Allow once        run this command now; the next one is checked …   │
+│   [s] Allow for this session                                             │
+│   [d] Deny              refuse the command; nothing is executed           │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+- `a` / `s` / `d` answer directly; the arrow keys move the highlight and Enter takes it.
+- **Esc is Deny** — the fail-closed answer, never "close and carry on". So is a host that hands the
+  pop-up back without an answer.
+- `ui.popupButtons` trims the answers the pop-up offers. The deny button always stays: a pop-up that
+  cannot refuse is not a guard.
+- `ui.overlay` picks the surface: `auto` (the pop-up when the host offers `ctx.ui.custom`, the plain
+  `select` list otherwise — RPC and ACP return `undefined` from `custom`, which is never a decision),
+  `always` (no silent degradation: an overlay that cannot be drawn or an unanswered prompt is a
+  refusal), `never` (never call `ctx.ui.custom` and always use the list).
+- The session counters behind the status line's `counters` detail and the end-of-session summary come
+  from the same place, so the line and the summary can never disagree.
+- Waiting for an answer does not consume the host's handler budget (dialogs and overlays pause it).
+  The guard's own `timeoutMs` plus one retry stays well inside the default
+  `extensionHandlers.toolCallTimeoutMs` (30 s).
+
+## Settings panel
+
+`/dc` opens the same component as a settings panel when the host can draw one, and the original
+select-based menu when it cannot. The panel is one scrolling list — `↑`/`↓` move, `PgUp`/`PgDn` page,
+Enter opens or cycles the highlighted row, Esc closes:
+
+```
+Simple                 friction preset · policy note · status line
+Protection             mode · every rule's action · watch (dry-run) · agent intent
+Coverage               bash · eval · fileTools · processes
+Retry & justification  authority · attempts per action / per session · remembering approvals ·
+                       justify tool · verification · recovery (+ retention) · trust erosion
+Checker                model · engine · timeout · reasoning · token cap · self-test
+UI                     pop-up mode · status line · pop-up buttons · session summary
+Advanced               allowed dirs · rejected entries · history size · cache clears · env overrides
+Guard                  integrity · lock · restore the previous guard (.bak)
+History                the last decisions · explain a decision · audit entries · chain check
+```
+
+Cycles and toggles are applied in place and written to the config immediately. Rows that need a real
+prompt (the policy note, the checker model, allowed dirs) close the panel first, so the host's own
+input owns the keyboard. Every row carries a one-line explanation, and the tests treat a row without
+one as a defect — the same rule the plain menu has always had.
+
+### Decision history and explain
+
+The History section lists the last decisions from the audit file (newest last) with their rule, layer,
+latency, directory and a short command. Activating one shows the whole trace: rule, layer, action,
+tool, mode, time, latency, cwd, target, command and session. `/dc → explain a decision` does the same
+from the plain menu.
+
+### Session summary
+
+At `session_stop` the guard prints one advisory line and stops there (it never asks for the session to
+continue):
+
+```
+dc: 3 blocked · 2 allowed · 0 justified · top rule: outsideDelete
+```
+
+It only appears when something was decided, and only while `ui.sessionSummary` is on. In watch mode it
+is prefixed `dc: WATCH ·` and the counts are what the policy would have done.
 
 ## Status line
 
 The guard keeps one short status next to the model segment — `dc: medium` while it is protecting,
 `dc: medium · blocked · Destructive git commands` after a decision — instead of a line under the
-editor:
+editor. `ui.statusLine` moves it and decides how much it says:
+
+| Setting | Values | Effect |
+| --- | --- | --- |
+| `location` | `bar` (default) | `ctx.ui.setStatus("dc", …)` — the host's own segment |
+| | `belowEditor` / `aboveEditor` | a one-line widget under (or over) the editor, cleared again after a few seconds |
+| | `off` | nothing is written |
+| `detail` | `minimal` | `dc: medium` — the mode and nothing else |
+| | `standard` (default) | `dc: medium · blocked · Destructive git commands` |
+| | `counters` | `dc: medium a:12 d:2 ca:5 cd:1` — allowed, blocked, checker-allowed, checker-denied (plus `w:` for watch-mode would-blocks) |
+| `barSide` | `host` (default) / `left` / `right` | which side the guard's segment sits on in the footer |
+
+`/dc → ui → show the statusLine snippet` prints a copy-pasteable block for
+`~/.omp/agent/config.yml`:
 
 ```yaml
 statusLine:
@@ -212,6 +361,10 @@ without one is treated as a defect by the tests.
 ```
 enabled: yes                master switch — off means no checking at all (status line: dc: off)
 protection: medium          simple | medium | hard | custom
+friction preset: balanced   quiet ("do not bother me") | balanced | strict — sets ask-on-deny, ask-on-error, the retry authority and the verification level together
+policy note: none           free text that goes with the checker request; a human wrote it, so unlike the agent's text it is trusted
+ui: bar · standard · host   pop-up mode, status line, session summary
+retry: model · 1/3          retry authority and budgets, remembering approvals, verification, recovery, erosion
 checker                     model, engine, timeout, reasoning, token cap, self-test
 ask on deny / ask on error  toggles
 rules                       per-rule action editor (switches to custom mode)
@@ -337,6 +490,7 @@ the ACLs in this list.
 node tests/t-static.mjs   # policy layers: modes, rules, coverage, path classification
 node tests/t-llm.mjs      # checker: HTTP verdicts, fallback, failure policy, cache, prompt
 node tests/t-menu.mjs     # /dc menu: modes, rule edits, toggles, persistence
+node tests/t-ui.mjs       # pop-up UI: approval, panel, status line, fallback, fail-closed, summary
 node tests/t-coverage.mjs # script bodies, hub launches, probes, catastrophic class, audit log
 node tests/t-review.mjs   # the external review's 19 finding groups (paths, git, eval, hub, audit, …)
 node tests/t-isolation.mjs    # deny-ACE mechanics from the README runbook (Windows)
@@ -357,13 +511,23 @@ is reported as a skip, never as a pass.
 
 ## Known limitations
 
-- `write` is guarded only where it must be: a credential store (`.env`, `id_rsa`, `*.pem`, `.ssh/**`,
-  `.aws/credentials`, …) is blocked statically, and a write outside the project is classified for
-  `bash` redirects and write verbs. Any other file write is ordinary editing work and stays free.
+- `write` is guarded by classification, not by a sandbox: a credential store, a system tree or a path
+  outside the project is caught through `bash`, `eval` and the file tools, and a target the guard
+  cannot resolve is a `dynamicTargets` violation. An ordinary edit inside the project stays free.
+- The write-verb list is a whitelist, not a proof of completeness. Everything outside it is invisible
+  as a *write*: PowerShell cmdlets (`Set-Content`, `Out-File`, `Copy-Item`), `mkdir`/`touch`,
+  `python -c "open(…,'w')"` and `node -e`, `find … -exec <writer> {} \;`, `cpio`/`pax`/`7z x -o`,
+  `git checkout` writing a worktree, and any script whose reader is not a shell. A shell body is read
+  (`powershell -NoProfile -Command "…"`), so a redirect inside it is judged, but the verb inside it
+  still has to be one the list knows. Adding a verb means adding a row to the write tests with it.
+- A hard link is a second name for one file and `realpath` cannot see through it: `mklink /H` and
+  `New-Item -ItemType HardLink` are covered as *link creation* (both ends are classified), but a link
+  that already exists when the session starts is judged as the ordinary file it is spelled as.
 - Paths are resolved with `realpathSync` through the nearest existing ancestor, so a junction or
-  symlink is judged where it lands. A link created *after* the check, or one whose target cannot be
-  resolved at all, is not covered by that resolution; the per-session cache holds a result for 15
-  seconds.
+  symlink is judged where it lands. Only paths the filesystem resolved are cached (15 s); the
+  ancestor walk for a path that does not exist yet runs again on every call, and a link created
+  between two calls is picked up by the second one. A link swapped in *after* a path was resolved
+  keeps the earlier verdict for up to the TTL.
 - Script bodies are read up to 64 KiB and 2 files deep, and only for shells on the command line
   (`sh ./x.sh`, `./x.sh`, `cmd /c x.cmd`). Anything else — a missing file, a binary, a script over the
   limit, a chain nested deeper, a file that changed while it was being read — falls back to

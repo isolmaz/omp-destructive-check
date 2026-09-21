@@ -1,5 +1,6 @@
 // Policy layers: protection modes, rule actions, coverage, target classification.
 // Every probe loads a fresh module instance (verdict caches are module-global).
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadExt, makeCtx, callTool, bash, mkHome, fakeRegistry, installFetch, fetchResponse, checkerRequests, check, report, results } from "./harness.mjs";
@@ -255,6 +256,24 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
   const ignored = await run(evalEvent(incident), { config: cfg({ mode: "hard", coverage: { eval: false } }) });
   check("coverage: eval can be turned off", !ignored.blocked, JSON.stringify(ignored.result)?.slice(0, 160));
 }
+{
+  // A file written through a language API is a write effect like any other: the
+  // same classification, the same rules, and a computed target is unresolved
+  // instead of a pass (`print(open('.env').read())` stays a read).
+  const write = (code) => run(evalEvent(code), { config: cfg({ mode: "hard" }) });
+  const env = await write("open('.env','w').write('A=1')");
+  check("eval write: open('.env','w') is a protectSecrets block", env.blocked && /rule: protectSecrets/.test(String(env.result?.reason ?? "")) && env.completions === 0, JSON.stringify(env.result)?.slice(0, 200));
+  const read = await write("print(open('.env').read())");
+  check("eval write: open('.env') is a read and stays silent", !read.blocked && read.completions === 0, JSON.stringify(read.result)?.slice(0, 200));
+  const outside = await write("shutil.copy('src/app.js','../outside/f')");
+  check("eval write: a copy with an outside destination is an outsideWrite", outside.blocked && /rule: outsideWrite/.test(String(outside.result?.reason ?? "")) && outside.completions === 0, JSON.stringify(outside.result)?.slice(0, 200));
+  const structured = await write("Path('.env').write_text('A=1')");
+  check("eval write: Path(...).write_text names the file it rewrites", structured.blocked && /rule: protectSecrets/.test(String(structured.result?.reason ?? "")), JSON.stringify(structured.result)?.slice(0, 200));
+  const computed = await write("open(target, 'w')");
+  check("eval write: a computed write target is not a clean pass", computed.blocked && /rule: dynamicTargets/.test(String(computed.result?.reason ?? "")) && computed.completions === 0, JSON.stringify(computed.result)?.slice(0, 200));
+  const method = await write("handle.write('x')");
+  check("eval write: a method on an open handle is not a path this scan owns", !method.blocked && method.completions === 0, JSON.stringify(method.result)?.slice(0, 200));
+}
 
 // -------------------------------------------------------------- file tools --
 {
@@ -275,6 +294,16 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
 
   const off = await run({ toolName: "edit", input: { input: "[src/app.ts#1A2B]\nREM" } }, { config: cfg({ mode: "hard", coverage: { fileTools: false } }) });
   check("coverage: file tools can be turned off", !off.blocked);
+
+  // A first-class tool writes where its path points, exactly like `echo x > …`:
+  // a system file, a path outside the project, and a target the guard cannot
+  // resolve are all judged, not just the credential stores.
+  const hosts = await run({ toolName: "write", input: { path: "C:\\Windows\\System32\\drivers\\etc\\hosts", content: "127.0.0.1 x" } }, { config: cfg({ mode: "hard" }) });
+  check("write: a system file is a systemTarget, not ordinary editing", hosts.blocked && /rule: systemTarget/.test(String(hosts.result?.reason ?? "")) && hosts.completions === 0, JSON.stringify(hosts.result)?.slice(0, 200));
+  const outsidePatch = await run({ toolName: "apply_patch", input: { input: "*** Begin Patch\n*** Add File: C:\\other-project\\src\\evil.js\n+x\n*** End Patch" } }, { config: cfg({ mode: "hard" }) });
+  check("apply_patch: an Add section outside the project is blocked", outsidePatch.blocked && /rule: outsideWrite/.test(String(outsidePatch.result?.reason ?? "")), JSON.stringify(outsidePatch.result)?.slice(0, 200));
+  const unresolved = await run({ toolName: "write", input: { path: "%APPDATA%\\.env", content: "A=1" } }, { config: cfg({ mode: "hard" }) });
+  check("write: a target the guard cannot resolve is a dynamicTargets violation", unresolved.blocked && /rule: dynamicTargets/.test(String(unresolved.result?.reason ?? "")) && unresolved.completions === 0, JSON.stringify(unresolved.result)?.slice(0, 200));
 }
 
 // --------------------------------------------------- secret paths (P0.1) ---
@@ -341,34 +370,45 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
 // An extra scope directory that names a root, the home or a system tree does not
 // widen the guard, it switches it off: those entries are refused and reported.
 {
-  const inside = (dirs) => run(cmd("rm -rf C:\\shared\\libs\\generated"), { config: cfg({ mode: "simple", allowDirs: dirs }) });
-  const baseline = await inside([]);
+  const inside = (dirs, target) => run(cmd(`rm -rf ${target}`), { config: cfg({ mode: "simple", allowDirs: dirs }) });
+  const baseline = await inside([], "C:\\shared\\libs\\generated");
   check("allowDirs: without an entry the delete is outside the project", baseline.blocked && baseline.completions === 0, JSON.stringify(baseline.result)?.slice(0, 200));
-  const good = await inside(["C:\\shared\\libs"]);
+  const good = await inside(["C:\\shared\\libs"], "C:\\shared\\libs\\generated");
   check("allowDirs: a real directory widens the scope", !good.blocked && good.completions === 0, JSON.stringify(good.result)?.slice(0, 200));
 
-  for (const [entry, label] of [
-    ["C:\\", "a drive root"],
-    ["/", "the posix root"],
-    [HOME, "the user home"],
-    [path.join(HOME, ".omp"), "the guard's own directory"],
-    ["C:\\Windows", "the windows tree"],
-    ["C:\\Program Files (x86)", "a program directory"],
-    ["/etc", "a posix system directory"],
-    ["/usr/local/bin", "a posix system bin"],
-    ["relative/path", "a relative path"],
-    ["~", "a bare tilde"],
-  ]) {
-    const p = await inside([entry]);
-    check(`allowDirs refuses ${label}`, p.blocked && p.completions === 0, `${entry} → ${JSON.stringify(p.result)?.slice(0, 160)}`);
+  // Each row names a target *under* the entry, so the assertion fails when the
+  // refusal is removed: an accepted entry would make the target inside the
+  // project and `simple` would allow the delete. Where the classifier refuses the
+  // target for an independent reason — a system segment is a system target
+  // however wide the scope is — the /dc refusal report below carries the check.
+  const rows = [
+    ["C:\\", "a drive root", "C:\\shared\\libs\\generated", "filesystem root"],
+    ["/", "the posix root", "C:\\shared\\libs\\generated", "filesystem root"],
+    [HOME, "the user home", path.join(HOME, "notes", "draft.txt"), "user home"],
+    [path.join(HOME, ".omp"), "the guard's own directory", path.join(HOME, ".omp", "logs", "old.jsonl"), "guard's own directory"],
+    ["C:\\Windows", "the windows tree", "C:\\Windows\\System32\\config\\SAM", "system directories"],
+    ["C:\\Program Files (x86)", "a program directory", "C:\\Program Files (x86)\\SomeApp\\data.bin", "system directories"],
+    ["/etc", "a posix system directory", "/etc/nginx/nginx.conf", "system directories"],
+    ["/usr/local/bin", "a posix system bin", "/usr/local/bin/old-tool", "system directories"],
+    ["relative/path", "a relative path", "", "absolute path"],
+    ["~", "a bare tilde", path.join(HOME, "notes", "draft.txt"), "user home"],
+  ];
+  for (const [entry, label, target] of rows) {
+    if (!target) continue; // nothing exists under a relative entry to point at
+    const p = await inside([entry], target);
+    check(`allowDirs refuses ${label} (target ${target})`, p.blocked && p.completions === 0, `${entry} → ${JSON.stringify(p.result)?.slice(0, 160)}`);
   }
-  // The refusal is not silent: /dc reports it instead of leaving the user with a
-  // setting that looks applied and is not.
-  const ext = await loadExt({ home: HOME, config: cfg({ mode: "simple", allowDirs: ["C:\\", "C:\\shared\\libs"] }), registry: REG });
+  // The refusal is not silent: /dc reports every entry it refused, with the
+  // reason, instead of leaving the user with a setting that looks applied.
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "simple", allowDirs: [...rows.map((r) => r[0]), "C:\\shared\\libs"] }), registry: REG });
   const ctx = makeCtx({ cwd: CWD, hasUI: false, registry: REG });
   await ext.commands.get("dc").handler("", ctx);
   const report = ctx.notes.map((n) => n.message).join("\n");
-  check("allowDirs: /dc status reports the rejected entry and the reason", /rejected dirs/.test(report) && /C:\\ /.test(report) && /filesystem root/.test(report), report.slice(0, 300));
+  const rejectedLine = report.split("\n").find((line) => /rejected dirs/.test(line)) ?? "";
+  for (const [entry, label, , reason] of rows) {
+    check(`allowDirs reports refusing ${label}`, rejectedLine.includes(entry) && rejectedLine.includes(reason), rejectedLine.slice(0, 400));
+  }
+  check("allowDirs: /dc status reports the rejected entry and the reason", /rejected dirs/.test(report) && /C:\\ /.test(rejectedLine) && /filesystem root/.test(rejectedLine), report.slice(0, 300));
   check("allowDirs: the accepted entry is reported as scope", /shared\\libs/.test(report), report.slice(0, 300));
 }
 
@@ -404,6 +444,38 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
     ["npm test | tee ../outside/log.txt", true, "tee outside"],
     ["npm test | tee out.log", false, "tee inside"],
     ['sh -c "echo hi > ../outside.txt"', true, "a redirect inside a shell body"],
+    ["echo hi >| ../outside.txt", true, "a noclobber redirect leaving the project"],
+    ["echo hi >| out.json", false, "a noclobber redirect inside the project"],
+    ["echo hi >& ../outside.txt", true, "both streams redirected to a file outside"],
+    ["echo hi &> ../outside.txt", true, "&> to a file outside"],
+    ["echo hi >&2", false, "stderr is a descriptor copy, not a file"],
+    ["cp -t ../outside src/app.js", true, "cp -t writing outside"],
+    ["cp -t src src/app.js", false, "cp -t writing inside"],
+    ["cp src/app.js ../outside/ --backup=numbered", true, "a trailing option is not the destination"],
+    ["cp -S .bak src/app.js ../outside/", true, "an option value is consumed, the destination is still read"],
+    ["cp -S ../outside/suffix src/app.js src/app.js.copy", false, "an option value is not a write target"],
+    ["install -m 644 src/app.js ../outside/", true, "install writing outside"],
+    ["install -m 644 ../outside/app.js", false, "install with a single operand only reads"],
+    ["curl -o ../outside/f https://example.com/x", true, "curl -o outside"],
+    ["curl -O https://example.com/x", false, "curl -O writes the remote name into the cwd"],
+    ["wget -O ../outside/f https://example.com/x", true, "wget -O outside"],
+    ["wget -O out.bin https://example.com/x", false, "wget -O inside"],
+    ["tar -xf a.tgz -C ../outside", true, "tar -C outside"],
+    ["tar -xf a.tgz", false, "tar without -C extracts into the cwd"],
+    ["unzip a.zip -d ../outside", true, "unzip -d outside"],
+    ["sed -i s/a/b/ ../outside/f", true, "sed -i writes every operand"],
+    ["sed s/a/b/ ../outside/f", false, "sed without -i only prints"],
+    ["git clone https://example.com/r.git ../outside/repo", true, "git clone into an outside directory"],
+    ["git clone https://example.com/r.git", false, "git clone without a destination"],
+    ["cmd /c mklink /H innocent.js C:\\Users\\me\\.ssh\\id_rsa", true, "mklink /H naming a private key"],
+    ["cmd /c mklink /J ../outside/link target", true, "mklink /J outside the project"],
+    ["command cp src/app.js ../outside/", true, "a write behind `command`"],
+    ["command tee ../outside/log", true, "a write behind `command` (tee)"],
+    ["echo hi > {../outside,../tmp2}/x.txt", true, "a brace expansion is an unresolved target"],
+    ["powershell -NoProfile -Command \"echo x > ../outside/f\"", true, "powershell flags before -Command"],
+    ["bash -o pipefail -c 'echo x > ../outside/f'", true, "bash options before -c"],
+    ["cmd /d /c \"echo x > ../outside/f\"", true, "cmd switches before /c"],
+    ["wsl bash -c 'echo x > ../outside/f'", true, "wsl followed by another shell"],
     ["sudo cp src/app.js ../outside/", true, "a write behind a launcher"],
   ]) {
     const p = await run(cmd(command), { config: cfg({ mode: "hard" }) });
@@ -412,6 +484,39 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
   const p = await run(cmd("cp src/app.js ../outside/"), { config: cfg({ mode: "hard" }) });
   check("write: the reason keeps the structured shape", /^destructive-check: /.test(String(p.result?.reason ?? "")) && /rule: outsideWrite/.test(String(p.result?.reason ?? "")) && /mode: hard/.test(String(p.result?.reason ?? "")), p.result?.reason);
 }
+
+// --------------------------------------------- inline cd (the write scan) ---
+// The delete/move scanner re-scopes per sub-command; the write scan has to resolve
+// relative targets in the same directory, or `cd ..; echo pwn > target.js` looks
+// like a write inside the project while the shell writes above it.
+{
+  const CD_PROJ = path.join(HOME, "cdproj");
+  fs.rmSync(CD_PROJ, { recursive: true, force: true });
+  fs.mkdirSync(path.join(CD_PROJ, ".git"), { recursive: true });
+  const at = (command) => run(cmd(command), { config: cfg({ mode: "hard" }), cwd: CD_PROJ });
+  const up = await at("echo warm; cd ..; echo pwn > target.js");
+  check("the write scan follows an inline cd", up.blocked && /rule: outsideWrite/.test(String(up.result?.reason ?? "")) && up.completions === 0, JSON.stringify(up.result)?.slice(0, 200));
+  const body = await at("bash -c 'cd .. && echo pwn > target.js'");
+  check("the write scan follows a cd inside a shell body", body.blocked && /rule: outsideWrite/.test(String(body.result?.reason ?? "")) && body.completions === 0, JSON.stringify(body.result)?.slice(0, 200));
+  const back = await at("echo warm; cd ..; echo pwn > cdproj/inside.js");
+  check("a redirect that comes back into the project after a cd stays silent", !back.blocked && back.completions === 0, JSON.stringify(back.result)?.slice(0, 200));
+}
+
+// -------------------------------------------------------- here-documents ---
+// A here-document is data for `cat` and code for a shell: `bash <<'EOF'` runs the
+// body, so a `.env` rewrite inside it is a write and an `rm` inside it is a
+// delete. Both scanners read one shared split, so they cannot disagree.
+{
+  const at = (command) => run(cmd(command), { config: cfg({ mode: "hard" }) });
+  const env = await at("bash <<'EOF'\nprintf pwn > .env\nEOF");
+  check("a shell-fed here-document body is scanned for writes", env.blocked && /rule: protectSecrets/.test(String(env.result?.reason ?? "")) && env.completions === 0, JSON.stringify(env.result)?.slice(0, 200));
+  const del = await at("bash <<'EOF'\nrm -rf C:\\other\\project\nEOF");
+  check("a shell-fed here-document body is scanned for deletes", del.blocked && /rule: outsideDelete/.test(String(del.result?.reason ?? "")) && del.completions === 0, JSON.stringify(del.result)?.slice(0, 200));
+  const data = await at("cat <<'EOF'\nrm -rf ../outside\nEOF");
+  check("a here-document fed to cat stays data for both scanners", !data.blocked && data.completions === 0, JSON.stringify(data.result)?.slice(0, 200));
+  const unterminated = await at("cat <<'EOF' > out.json\nrm -rf ../outside\n");
+  check("a misread `<<` cannot hide the lines after it", unterminated.blocked && /rule: outsideDelete/.test(String(unterminated.result?.reason ?? "")) && unterminated.completions === 0, JSON.stringify(unterminated.result)?.slice(0, 200));
+}
 {
   // Medium sends a write outside the project to the checker, simple asks; a
   // target the guard cannot resolve is a dynamicTargets violation, never a pass.
@@ -419,8 +524,10 @@ const evalEvent = (code, language = "py") => ({ toolName: "eval", input: { langu
   check("[medium] a write outside is escalated to the checker", medium.completions === 1 && !medium.blocked, JSON.stringify(medium.result)?.slice(0, 160));
   const simple = await run(cmd("echo hi > ../outside.txt"), { config: cfg({ mode: "simple" }), selects: ["Block"] });
   check("[simple] a write outside asks the user", simple.blocked && simple.completions === 0, JSON.stringify(simple.result)?.slice(0, 160));
-  const remote = await run(cmd("rsync -a src/ user@host:/srv/app/"), { config: cfg({ mode: "medium" }) });
-  check("an unresolvable (remote) destination is not a clean pass", remote.blocked || remote.completions > 0, JSON.stringify(remote.result)?.slice(0, 160));
+  const remote = await run(cmd("rsync -a src/ user@host:/srv/app/"), { config: cfg({ mode: "hard" }) });
+  check("hard: an unresolvable (remote) destination is blocked as dynamicTargets", remote.blocked && remote.completions === 0 && /rule: dynamicTargets/.test(String(remote.result?.reason ?? "")), JSON.stringify(remote.result)?.slice(0, 180));
+  const remoteMedium = await run(cmd("rsync -a src/ user@host:/srv/app/"), { config: cfg({ mode: "medium" }) });
+  check("medium: an unresolvable (remote) destination reaches the checker", remoteMedium.completions === 1 && !remoteMedium.blocked, JSON.stringify(remoteMedium.result)?.slice(0, 180));
   const heredoc = await run(cmd("cat <<'EOF' > out.json\ntee ../outside/x\nEOF"), { config: cfg({ mode: "hard" }) });
   check("a heredoc body is data, not a command line", !heredoc.blocked && heredoc.completions === 0, JSON.stringify(heredoc.result)?.slice(0, 180));
 }
