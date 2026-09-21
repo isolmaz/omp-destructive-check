@@ -114,6 +114,7 @@ node tests/t-menu.mjs          # /dc menu: every setting persists, self-test, es
 node tests/t-coverage.mjs      # script bodies, hub launches, probes, catastrophic class, audit log
 node tests/t-review.mjs        # the external review's findings D01–D23, one block per finding
 node tests/t-isolation.mjs     # deny-ACE mechanics from the README runbook (Windows only)
+node tests/t-install.mjs       # the installer's pre-install gate and its --skip-tests bypass
 node tests/mutation-check.mjs  # test-quality gate (see below)
 node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cases skip
 ```
@@ -148,6 +149,11 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 node install.mjs --force     # sync ~/.omp/shared/destructive-check.ts (keeps a .bak)
 git add -A && git commit && git push
 ```
+
+`install.mjs` refuses to install a guard that fails its own suites: it runs `t-static`, `t-llm`,
+`t-menu`, `t-coverage` and `t-review` first and stops before copying when one of them fails
+(`--skip-tests` is the deliberate bypass, and `--force` does not skip the gate). `tests/t-install.mjs`
+asserts both halves, so a change to the installer or to the suite list has to keep that contract.
 
 `README.md` documents user-visible behavior; change it in the same commit as the behavior.
 The `/dc` menu is the only configuration UI users are expected to touch — a new setting needs a menu
