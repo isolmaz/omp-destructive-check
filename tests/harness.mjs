@@ -96,6 +96,11 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
     registerTool(def) {
       if (def?.name) tools.set(def.name, def);
     },
+    // The real host lists its registered tools; the guard compares what the
+    // registry holds with the definition its own factory built.
+    getAllTools() {
+      return [...tools.values()];
+    },
     setLabel() {},
     async exec(cmd, args, opts) {
       execCalls.push({ cmd, args, opts });

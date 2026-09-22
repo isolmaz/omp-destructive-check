@@ -601,6 +601,85 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
   check("internal error reaches the decision log", /internal/.test(confirmText), confirmText.slice(0, 200));
 }
 
+
+// ------------------------------------------------- the read-only class (S4) --
+// A line every one of whose sub-commands cannot change anything passes without a
+// model call; a spelling that *can* change something with the same verb does not.
+{
+  const cleanDry = await run(cmd("git clean -n"), { config: cfg({ mode: "medium" }) });
+  check("read-only class: `git clean -n` only prints and passes without a model", !cleanDry.blocked && cleanDry.completions === 0, JSON.stringify(cleanDry.result)?.slice(0, 200));
+  const cleanForced = await run(cmd("git clean -fdx"), { config: cfg({ mode: "hard" }) });
+  check("read-only class: `git clean -fdx` is still a destructive git command", cleanForced.blocked && /rule: gitDestructive/.test(String(cleanForced.result?.reason ?? "")) && cleanForced.completions === 0, String(cleanForced.result?.reason ?? "").slice(0, 200));
+  const status = await run(cmd("git status --short"), { config: cfg({ mode: "hard" }) });
+  check("read-only class: `git status` is allowed in the strictest mode", !status.blocked && status.completions === 0, JSON.stringify(status.result)?.slice(0, 160));
+  // The class is an allow, not a release: the same line with a real write verb in
+  // it is judged by the ordinary scanners.
+  const mixed = await run(cmd("git status && rm -rf ../outside"), { config: cfg({ mode: "medium" }) });
+  check("read-only class: a destructive sub-command in the same line is not covered", mixed.blocked && mixed.completions === 0, String(mixed.result?.reason ?? "").slice(0, 200));
+  const redirect = await run(cmd("echo hi > C:\\other\\note.txt"), { config: cfg({ mode: "hard" }) });
+  check("read-only class: a redirect never enters the class", redirect.blocked && /rule: outsideWrite/.test(String(redirect.result?.reason ?? "")), String(redirect.result?.reason ?? "").slice(0, 200));
+  for (const [command, label] of [["python -c \"import os\"", "python -c"], ["node -e \"1\"", "node -e"], ["bun run build", "bun run"], ["bash -c \"rm -rf /etc\"", "bash -c with a system delete"]]) {
+    const p = await run(cmd(command), { config: cfg({ mode: "hard" }) });
+    check(`read-only class: never an interpreter or runner (${label})`, command.startsWith("bash") ? p.blocked : !p.blocked, `${JSON.stringify(p.result)?.slice(0, 120)}`);
+  }
+}
+
+// ---------------------------------------------------------- readonly mode ---
+// Parking state: only a command the read-only class can vouch for runs, whatever
+// the target. It only ever tightens, so the artifact and inside-project allows are
+// closed too.
+{
+  const ro = (command) => run(cmd(command), { config: cfg({ mode: "readonly" }) });
+  for (const [command, label] of [["ls -la", "a listing"], ["git status", "a git query"], ["grep -rn todo src", "a search"], ["cat package.json", "a read"]]) {
+    const p = await ro(command);
+    check(`readonly: ${label} passes without a model`, !p.blocked && p.completions === 0, JSON.stringify(p.result)?.slice(0, 160));
+  }
+  {
+    const artifact = await ro("rm -rf node_modules");
+    check("readonly: an artifact delete blocks without a model call", artifact.blocked && artifact.completions === 0, String(artifact.result?.reason ?? "").slice(0, 200));
+  }
+  for (const [command, label] of [
+    ["mkdir newdir", "a directory create"],
+    ["npm install left-pad", "a package install"],
+    ["git commit -m x", "a commit"],
+    ["echo hi > src/a.txt", "an inside-project write"],
+    ["mv src/app.js src/old.js", "an inside-project move"],
+  ]) {
+    const p = await ro(command);
+    check(`readonly: ${label} blocks without a model call`, p.blocked && p.completions === 0 && /rule: readonlyMutation/.test(String(p.result?.reason ?? "")), String(p.result?.reason ?? "").slice(0, 200));
+  }
+  const write = await run({ toolName: "write", input: { path: `${CWD}\\src\\new.ts`, content: "export {}" } }, { config: cfg({ mode: "readonly" }) });
+  check("readonly: a first-class file write blocks", write.blocked && /rule: readonlyMutation/.test(String(write.result?.reason ?? "")), String(write.result?.reason ?? "").slice(0, 200));
+  const evalRead = await run({ toolName: "eval", input: { language: "py", code: "print(1)" } }, { config: cfg({ mode: "readonly" }) });
+  check("readonly: an eval body is a mutation whatever it contains", evalRead.blocked && /rule: readonlyMutation/.test(String(evalRead.result?.reason ?? "")), String(evalRead.result?.reason ?? "").slice(0, 200));
+}
+
+// ------------------------------------------------------------- guard self ---
+// The guard's own controls: its config, its code, the approval list, the project
+// policy file, and the host config when the edit touches the extension lists.
+{
+  const guardCfg = `${HOME}\\.omp\\destructive-check.json`;
+  const onConfig = await run({ toolName: "write", input: { path: guardCfg, content: '{"mode":"simple"}' } }, { config: cfg({ mode: "medium" }) });
+  check("guardSelf: writing the guard's config is blocked", onConfig.blocked && /rule: guardSelf/.test(String(onConfig.result?.reason ?? "")) && onConfig.completions === 0, String(onConfig.result?.reason ?? "").slice(0, 240));
+  const redirect = await run(cmd(`echo {} > "${guardCfg}"`), { config: cfg({ mode: "medium" }) });
+  check("guardSelf: a redirect into the guard's config is blocked", redirect.blocked && /rule: guardSelf/.test(String(redirect.result?.reason ?? "")), String(redirect.result?.reason ?? "").slice(0, 240));
+  const holder = await run(cmd(`rm -rf "${HOME}\\.omp"`), { config: cfg({ mode: "medium" }) });
+  check("guardSelf: deleting a directory that holds a control file is blocked", holder.blocked && /rule: guardSelf/.test(String(holder.result?.reason ?? "")), String(holder.result?.reason ?? "").slice(0, 240));
+  const allowFile = await run({ toolName: "write", input: { path: `${HOME}\\.omp\\destructive-check-allow.json`, content: "[]" } }, { config: cfg({ mode: "medium" }) });
+  check("guardSelf: the approval list is a control file too", allowFile.blocked && /rule: guardSelf/.test(String(allowFile.result?.reason ?? "")), String(allowFile.result?.reason ?? "").slice(0, 240));
+  const hostConfig = `${HOME}\\.omp\\agent\\config.yml`;
+  const extensions = await run({ toolName: "edit", input: { input: `[${hostConfig}#1A2B]\n+extensions: []` } }, { config: cfg({ mode: "medium" }) });
+  check("guardSelf: the host config is a control file when the edit touches extensions", extensions.blocked && /rule: guardSelf/.test(String(extensions.result?.reason ?? "")), String(extensions.result?.reason ?? "").slice(0, 240));
+  // The same file for an unrelated setting is not this rule's business: the
+  // negative half is what keeps the rule from blocking ordinary configuration.
+  const unrelated = await run({ toolName: "edit", input: { path: hostConfig, edits: [{ op: "replace", find: "theme: dark", replace: "theme: light" }] } }, { config: cfg({ mode: "medium" }) });
+  check("guardSelf: an unrelated host-config edit is not the guard's business", !/rule: guardSelf/.test(String(unrelated.result?.reason ?? "")), String(unrelated.result?.reason ?? "").slice(0, 240));
+  const floored = await run({ toolName: "write", input: { path: guardCfg, content: "{}" } }, { config: cfg({ mode: "custom", rules: { guardSelf: "allow", unreadTarget: "allow" } }) });
+  check("guardSelf: `allow` in the file does not open the rule (RULE_FLOORS)", floored.blocked && /rule: guardSelf/.test(String(floored.result?.reason ?? "")), String(floored.result?.reason ?? "").slice(0, 240));
+  const other = await run(cmd(`rm -rf "${HOME}\\.omp\\logs"`), { config: cfg({ mode: "medium" }) });
+  check("guardSelf: the audit log directory is not claimed by the rule", !/rule: guardSelf/.test(String(other.result?.reason ?? "")), String(other.result?.reason ?? "").slice(0, 200));
+}
+
 const bad = report("policy modes");
 process.exitCode = bad ? 1 : 0;
 void results;

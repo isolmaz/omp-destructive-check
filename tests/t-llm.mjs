@@ -493,5 +493,30 @@ const retry = (pattern, base = retryCfg()) => ({ retry: { ...base.retry, ...patt
   check("every approval option carries an explanation", defects.length === 0, defects.join(" | "));
 }
 
+// ------------------------------------------------------------ two stages ---
+// The one-digit pre-filter: `0` answers without the detailed request, `1` pays for
+// it, and anything that is not a digit is a checker failure — never an allow.
+{
+  const staged = async (fast) => {
+    installFetch((_url, init) => (String(init.body).includes("FAST STAGE") ? ok(fast) : ok("ALLOW: the detailed answer")));
+    const ext = await loadExt({ home: HOME, config: cfg({ checker: { twoStage: true } }), registry: REG });
+    const ctx = makeCtx({ cwd: CWD, registry: REG, selects: ["Block"] });
+    const result = await callTool(ext, bash("rm -rf src", "cleanup"), ctx);
+    const bodies = checkerRequests().map((call) => JSON.parse(call.init.body));
+    return { result, bodies, fast: bodies.filter((body) => String(body.messages?.at(-1)?.content ?? "").includes("FAST STAGE")) };
+  };
+  const zero = await staged("0");
+  check("two-stage: a 0 answers without the detailed request", !zero.result?.block && zero.bodies.length === 1 && zero.fast.length === 1, JSON.stringify({ calls: zero.bodies.length, result: zero.result }));
+  check("two-stage: the fast request carries its own small cap", zero.fast[0]?.max_completion_tokens === 512, JSON.stringify(zero.fast[0]?.max_completion_tokens));
+  check("two-stage: the fast request still carries the user policy block", /User policy/.test(String(zero.fast[0]?.messages?.at(-1)?.content ?? "")), String(zero.fast[0]?.messages?.at(-1)?.content ?? "").slice(0, 120));
+  const one = await staged("1");
+  check("two-stage: a 1 buys the detailed request", !one.result?.block && one.bodies.length === 2 && one.fast.length === 1, JSON.stringify({ calls: one.bodies.length, result: one.result }));
+  check("two-stage: the detailed request has no fast-stage instruction", !/FAST STAGE/.test(String(one.bodies.at(-1)?.messages?.at(-1)?.content ?? "")), String(one.bodies.at(-1)?.messages?.at(-1)?.content ?? "").slice(0, 120));
+  const junk = await staged("2");
+  check("two-stage: an answer that is not 0 or 1 is a checker failure, not an allow", junk.result?.block === true && /neither 0 nor 1/.test(String(junk.result?.reason ?? "")), String(junk.result?.reason ?? "").slice(0, 240));
+  const prose = await staged("I would need more context to decide.");
+  check("two-stage: a prose answer fails closed with its own text", prose.result?.block === true && /neither 0 nor 1/.test(String(prose.result?.reason ?? "")), String(prose.result?.reason ?? "").slice(0, 240));
+}
+
 const bad = report("checker layer");
 process.exitCode = bad ? 1 : 0;

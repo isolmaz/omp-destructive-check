@@ -119,6 +119,37 @@ would have caught on real traffic before you turn it on. The status line reads `
 rest and `dc: WATCH · would block: <rule>` after a decision, and `session_start` prints a warning, so
 it cannot be left on by accident. Toggle it in `/dc → watch (dry-run)`.
 
+## The read-only command class and the readonly mode
+
+The cheapest allow layer is the read-only class: a command line **every one of whose sub-commands is a
+verb that cannot change anything**, with that verb's own flags. It is why `ls`, `git status`,
+`npm test`, `grep -r todo src`, `find . -name '*.js'` and `git clean -n` cost 0 ms and no model
+call. The class is deliberately narrow:
+
+- `sort -o FILE`, `uniq in out`, `find -delete|-exec|-fprint`, `git clean -f`, `sed -i`, `tar -x`,
+  `curl -o`, any redirect (`>`), any variable, glob or command substitution outside quotes → **not**
+  read-only, judged by the ordinary scanners.
+- Interpreters and code runners are never in it: `python -c`, `node -e`, `bun`, `go run`, `bash -c`
+  are judged (shell bodies by the command scanner, everything else by the rules that apply to it).
+- It is an *allow*, never a release: the catastrophic signatures are checked first, and a finding
+  from the delete/move/write scanners is never cleared by it.
+
+`mode: "readonly"` is the parking state built on top of it (`simple | medium | hard | custom |
+readonly`): **every covered call that is not provably read-only blocks**, whatever its target. Use it
+for review/planning sessions, or when the checker is known to be misconfigured and you want the agent
+to be able to look but not touch. It only tightens, so it can never violate the "an allow cannot
+release a block" rule; the rule that reports it is `readonlyMutation`.
+
+### Rules added for the guard's own surface (S4)
+
+| Rule | What it catches | Default |
+|---|---|---|
+| `guardSelf` | a write or delete aimed at the guard's own controls: `~/.omp/shared/destructive-check.ts`, its manifest, `~/.omp/destructive-check.json`, the approval list, `<cwd>/.omp/destructive-check.json`, a directory containing one of them, and `~/.omp/agent/config.yml` when the edit touches `extensions`/`disabledExtensions` | `block` in every mode, exempt from the second chance |
+| `launchGuard` | a launch through `hub` the guard refuses before anything runs: a channel application (`osascript`, `sudo`, `ssh`, `scp`, `nc`, `ncat`, `socat`, `telnet`, `openssl`, `curl`, `wget`), an application name carrying shell metacharacters, an interpreter handed code in a flag (`python -c`, `node -e`, …), or a launch *from* a credential store, the guard's own directory or a system tree | `block` in every mode |
+| `unreadTarget` | a write to a file that exists on disk and was **never read in this session** (or changed since it was read) — a full `read` is the only thing that marks a file as seen, and a changed file invalidates its own mark | `ask` (simple) · `model` (medium) · `block` (hard, readonly); never `allow` |
+| `projectDeny` | a pattern the project's own `.omp/destructive-check.json` added | `block` in every mode |
+| `readonlyMutation` | a call the read-only class cannot vouch for while `mode: "readonly"` is on | `block` in `readonly`, otherwise not raised |
+
 ## Coverage
 
 | Tool | Covered |
@@ -225,7 +256,34 @@ verification off; `balanced` = the defaults above; `strict` = allow-on-deny off,
 authority off, adversarial verification. The panel shows `custom` when the values were
 changed one by one.
 
-## The second chance (justification loop)
+## Project policy file (`<cwd>/.omp/destructive-check.json`)
+
+A project may **tighten** the policy it runs under, never loosen it:
+
+```jsonc
+{
+  "rules": { "insideDelete": "block", "artifactDelete": "ask" },  // more restrictive only
+  "denyPatterns": ["\\bprod-secrets\\b", "terraform destroy"],       // extra denies, regex, matched case-insensitively
+  "note": "never touch the archive folder"
+}
+```
+
+- `mode`, `enabled`, `coverage`, the checker settings, `allowDirs`, `timeoutMs`, `retry.*`, `ui.*` and
+  any value that would make a rule **less** restrictive are refused. Each refusal is recorded with its
+  reason and shown in `/dc → status`, in the `Checker` panel's *Project policy* group and in
+  `dc_inspect config`. `rules.guardSelf`, `rules.projectDeny`, `rules.readonlyMutation` and
+  `rules.unreadTarget` cannot be set to `allow` in **any** file (`RULE_FLOORS`).
+- The merge is most-restrictive-wins, so the file cannot release a rule even in principle
+  (`ruleAction()` is what every decision reads).
+- `projectPolicy.enabled` turns the file off; `projectPolicy.requireTrusted` asks for a host
+  project-trust signal before the file is honoured. **This host version exposes no such signal to an
+  extension** (there is no `trusted`/`isProjectTrusted` field on the extension or tool context and no
+  trust event), so `requireTrusted` is reported as unenforceable in `/dc → status` instead of being
+  pretended. What does protect you is the tighten-only merge plus the visible record of every refused
+  entry — a checked-in file cannot hand itself more rope than the human's own config.
+- The file is re-read when its mtime/size changes and at `session_start`, like the shared config.
+
+## The second chance (justification loop)## The second chance (justification loop)
 
 A destructive call the guard refuses is not always a call the user would refuse. For rules that
 are not exempt, the block reason ends with an invitation instead of the flat refusal:
@@ -590,6 +648,19 @@ reachable in-band; `tools/` and the guard itself are outside the agent's ordinar
 the ACLs in this list.
 
 ## Checker
+
+**Two stages (`checker.twoStage`).** When it is on, the guard first asks a one-digit question —
+*"0 = the User policy clearly allows this action; 1 = it may need blocking, or you are uncertain.
+Err on 1."* — with `checker.fastStageMaxTokens` (default 512) as its output cap. A `0` allows the call
+without the detailed request; a `1` pays for the normal check. Both stages run inside the **same**
+`timeoutMs` budget as a single request always did, so nothing is added to the time a decision may
+take. A reply that is not `0` or `1` — prose, `2`, an empty message — is a **checker failure**, never
+an allow: the user is asked when a UI exists and the call blocks with the real text otherwise.
+`/dc → recent decisions` shows the stage of each check and the fast-stage hit rate, and the audit line
+carries `stage: fast|full` inside the hashed payload. Two-stage is **off by default**: it trades one
+small request for a chance to skip the detailed one, and a model that will not answer a bare digit
+turns every gray-zone call into a failure — turn it on in `/dc → checker` or with
+`"checker": { "twoStage": true }` once you have seen your own model do it.
 
 - **In-process** (default): one HTTPS request straight to the provider, credentials resolved from the
   model registry. No subprocess, no agent session, no tool schemas. OpenAI-compatible

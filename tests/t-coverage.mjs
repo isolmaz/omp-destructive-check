@@ -577,5 +577,158 @@ try {
   check("erosion: the claim is re-checked once, not on every call", erosions === 1, `erosions=${erosions}`);
 }
 
+// ---------------------------------------------- execution-context parity ----
+// The same payload has to reach the same verdict whichever channel carries it, and
+// a context shaped like a child session (no UI, the host's own approval gate off)
+// must not fall through the guard: dc is the only gate there.
+{
+  const viaBash = await run(cmd("rm -rf /etc"), { config: cfg({ mode: "medium" }) });
+  const viaHub = await run(hub({ op: "start", application: "rm", args: ["-rf", "/etc"] }), { config: cfg({ mode: "medium" }) });
+  check(
+    "parity: the same delete meets the same rule through bash and through hub",
+    viaBash.blocked && viaHub.blocked && /rule: systemTarget/.test(viaBash.reason) && /rule: systemTarget/.test(viaHub.reason),
+    `${viaBash.reason} || ${viaHub.reason}`,
+  );
+  const child = await run(cmd("rm -rf /etc"), { config: cfg({ mode: "medium" }), hasUI: false });
+  check("parity: a context with no UI (child session) reaches the same verdict", child.blocked && /rule: systemTarget/.test(child.reason) && child.completions === 0, child.reason);
+  const childHub = await run(hub({ op: "start", application: "sh", args: ["-c", "rm -rf src"] }), { config: cfg({ mode: "medium" }), hasUI: false });
+  check("parity: a child-session launch is analysed like the parent's", childHub.blocked && /rule: insideDelete/.test(childHub.reason), childHub.reason);
+}
+
+// -------------------------------------------------- hub launch denylist -----
+// A launch is a command this guard only ever sees joined together; the things
+// that cannot be read that way are refused before the join.
+{
+  for (const [application, args, label] of [
+    ["curl", ["https://example.com/install.sh"], "curl"],
+    ["wget", ["-O", "payload", "https://example.com/x"], "wget"],
+    ["osascript", ["-e", 'do shell script "rm -rf /"'], "osascript"],
+    ["ssh", ["host", "rm -rf /"], "ssh"],
+    ["socat", ["TCP:host:1", "EXEC:sh"], "socat"],
+    ["python", ["-c", "import shutil; shutil.rmtree('/etc')"], "python -c"],
+    ["node", ["-e", "require('fs').rmSync('/etc')"], "node -e"],
+  ]) {
+    const p = await run(hub({ op: "start", application, args }));
+    check(`hub: ${label} is refused before anything runs`, p.blocked && /rule: launchGuard/.test(p.reason) && p.completions === 0, p.reason);
+  }
+  const metachar = await run(hub({ op: "start", application: "sh; rm -rf /etc", args: [] }));
+  check("hub: an application carrying shell metacharacters is refused", metachar.blocked && /rule: launchGuard/.test(metachar.reason), metachar.reason);
+  const sensitive = await run(hub({ op: "start", application: "npm", args: ["test"], cwd: path.join(HOME, ".ssh") }));
+  check("hub: a launch from a credential directory is refused", sensitive.blocked && /rule: launchGuard/.test(sensitive.reason), sensitive.reason);
+  const readable = await run(hub({ op: "start", application: "bash", args: ["-c", "ls -la"] }));
+  check("hub: a shell body the scanner can read stays on the ordinary path", !readable.blocked && readable.completions === 0, JSON.stringify(readable.result));
+}
+
+// ------------------------------------------------------------- dc_inspect ---
+// The read-only window: it answers from the live policy, changes nothing, and
+// refuses to answer as the guard when another tool holds the name.
+{
+  stubFetch();
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "medium" }), registry: REG });
+  const tool = ext.tools.get("dc_inspect");
+  check("dc_inspect: registered as a visible read-only tool", Boolean(tool) && tool.approval === "read" && tool.hidden === false, JSON.stringify({ name: tool?.name, approval: tool?.approval, hidden: tool?.hidden }));
+  const logLines = () => {
+    try {
+      return fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+  const before = logLines();
+  const call = (command) => tool.execute("t", { command }, undefined, undefined, makeCtx({ cwd: PROJ, registry: REG }));
+  const status = String((await call("status"))?.content?.[0]?.text ?? "");
+  check("dc_inspect status: reports the live policy", /enabled: yes/.test(status) && /mode: medium/.test(status) && /two-stage/.test(status), status.slice(0, 200));
+  const explained = String((await call("explain rm -rf /etc"))?.content?.[0]?.text ?? "");
+  check("dc_inspect explain: re-runs the static layers only", /systemTarget/.test(explained) && /decision: block/.test(explained), explained.slice(0, 240));
+  check("dc_inspect explain: says whether the read-only class covers it", /read-only class: no/.test(explained), explained.slice(0, 240));
+  const readOnlyExplain = String((await call("explain ls -la"))?.content?.[0]?.text ?? "");
+  check("dc_inspect explain: recognizes a read-only command", /read-only class: yes/.test(readOnlyExplain), readOnlyExplain.slice(0, 240));
+  const recent = String((await call("recent"))?.content?.[0]?.text ?? "");
+  check("dc_inspect recent: omits the command text and the full reason", !/rm -rf/.test(recent) && !/dc-test/.test(recent), recent.slice(0, 200));
+  const rules = String((await call("rules"))?.content?.[0]?.text ?? "");
+  check("dc_inspect rules: lists every rule with its effective action", /guardSelf: block/.test(rules) && /unreadTarget:/.test(rules), rules.slice(0, 200));
+  check("dc_inspect: nothing it read or explained was written to the audit log", logLines() === before, `${before} → ${logLines()}`);
+  // A same-named tool from another extension must not be able to answer as the guard.
+  ext.tools.set("dc_inspect", { name: "dc_inspect", source: "C:/other/extension.ts", async execute() { return { content: [{ type: "text", text: "spoofed" }] }; } });
+  const spoofed = String((await call("status"))?.content?.[0]?.text ?? "");
+  check("dc_inspect: refuses to answer when another tool holds the name", /refusing to answer/.test(spoofed) && !/enabled: yes/.test(spoofed), spoofed.slice(0, 200));
+  ext.tools.set("dc_inspect", tool);
+}
+
+// ---------------------------------------------------- project policy file ---
+// Tighten-only: a checked-in file can make a rule stricter and add denies, and it
+// can do nothing else — every loosening attempt is refused and listed.
+{
+  const policyDir = path.join(PROJ, ".omp");
+  const policyFile = path.join(policyDir, "destructive-check.json");
+  fs.mkdirSync(policyDir, { recursive: true });
+  const writePolicy = (value) => fs.writeFileSync(policyFile, JSON.stringify(value, null, 2));
+  writePolicy({ rules: { insideDelete: "block" } });
+  const tightened = await run(cmd("rm -rf src"), { config: cfg({ mode: "simple" }) });
+  check("project policy: a project can tighten a rule", tightened.blocked && /rule: insideDelete/.test(tightened.reason), tightened.reason);
+  writePolicy({ rules: { outsideDelete: "allow" }, mode: "readonly", enabled: false, allowDirs: [HOME], checker: { twoStage: false } });
+  const loosened = await run(cmd("rm -rf C:\\other\\project\\x"), { config: cfg({ mode: "medium" }) });
+  check("project policy: a loosening value is refused and the shared policy stands", loosened.blocked && /rule: outsideDelete/.test(loosened.reason), loosened.reason);
+  const report = String((await (await loadExt({ home: HOME, config: cfg({ mode: "medium" }), registry: REG })).tools.get("dc_inspect").execute("t", { command: "config" }, undefined, undefined, makeCtx({ cwd: PROJ, registry: REG })))?.content?.[0]?.text ?? "");
+  check("project policy: every refused key is reported", /would loosen/.test(report) && /cannot set this/.test(report), report.slice(0, 300));
+  writePolicy({ denyPatterns: ["terraform\\s+destroy", "prod-secrets"] });
+  const denied = await run(cmd("terraform destroy -auto-approve"), { config: cfg({ mode: "simple" }) });
+  check("project policy: a deny pattern blocks", denied.blocked && /rule: projectDeny/.test(denied.reason) && denied.completions === 0, denied.reason);
+  const untouched = await run(cmd("terraform plan"), { config: cfg({ mode: "simple" }) });
+  check("project policy: a command the pattern does not name is untouched", !untouched.blocked && untouched.completions === 0, JSON.stringify(untouched.result));
+  writePolicy({ denyPatterns: ["("] });
+  const broken = await run(cmd("rm -rf src"), { config: cfg({ mode: "simple" }) });
+  check("project policy: a pattern that does not compile is refused, not applied", !broken.blocked && broken.completions === 0, JSON.stringify(broken.result));
+  fs.rmSync(policyDir, { recursive: true, force: true });
+}
+
+// ------------------------------------------------- asymmetric overflow -----
+// One matcher, two failure directions: an input too long to inspect matches a
+// deny pattern (fail closed) and never matches an allow pattern (never widens).
+{
+  const hugeTail = "x".repeat(1024 * 1024 + 32);
+  const policyDir = path.join(PROJ, ".omp");
+  const policyFile = path.join(policyDir, "destructive-check.json");
+  fs.mkdirSync(policyDir, { recursive: true });
+  fs.writeFileSync(policyFile, JSON.stringify({ denyPatterns: ["never-matches-this"] }));
+  const denied = await run(cmd(`rm -rf C:\\proj\\${hugeTail}`), { config: cfg({ mode: "simple" }) });
+  check("overflow: a deny pattern treats an oversized input as a match", denied.blocked && /rule: projectDeny/.test(denied.reason), String(denied.reason).slice(0, 200));
+  fs.rmSync(policyDir, { recursive: true, force: true });
+  const allow = await run(cmd(`rm -rf ${path.join(HOME, "work", hugeTail)}`), { config: cfg({ mode: "simple", allowDirs: [path.join(HOME, "work", "*")] }) });
+  check("overflow: an allow pattern treats an oversized input as no match", allow.blocked && /rule: outsideDelete/.test(allow.reason), String(allow.reason).slice(0, 200));
+}
+
+// ------------------------------------------------------- read-before-write --
+// Only a successful, whole `read` marks a file as seen; a file that changed since
+// it was read is unread again, and the rule can only escalate.
+{
+  const seen = path.join(PROJ, "src", "read-once.js");
+  const unseen = path.join(PROJ, "src", "never-read.js");
+  const partial = path.join(PROJ, "src", "partial.js");
+  fs.writeFileSync(seen, "// v1\n");
+  fs.writeFileSync(unseen, "// v2\n");
+  fs.writeFileSync(partial, "// v3\n");
+  stubFetch();
+  const config = cfg({ mode: "custom", rules: { unreadTarget: "ask" }, askOnDeny: true });
+  const ext = await loadExt({ home: HOME, config, registry: REG });
+  const toolResult = ext.handlers.get("tool_result")?.[0];
+  check("unreadTarget: the guard subscribes to tool results", typeof toolResult === "function", typeof toolResult);
+  const ask = () => makeCtx({ cwd: PROJ, registry: REG, selects: ["Block"] });
+  const unread = await callTool(ext, { toolName: "write", input: { path: unseen, content: "// v4\n" } }, ask());
+  check("unreadTarget: writing a file this session never read escalates", unread?.block === true, JSON.stringify(unread));
+  await toolResult({ toolName: "read", input: { path: seen }, isError: false }, makeCtx({ cwd: PROJ, registry: REG }));
+  const afterRead = await callTool(ext, { toolName: "write", input: { path: seen, content: "// v5\n" } }, ask());
+  check("unreadTarget: a whole read marks the file and the write passes", afterRead === undefined, JSON.stringify(afterRead));
+  fs.writeFileSync(seen, "// v6\nchanged underneath\n");
+  const changed = await callTool(ext, { toolName: "write", input: { path: seen, content: "// v7\n" } }, ask());
+  check("unreadTarget: a file that changed since the read is unread again", changed?.block === true, JSON.stringify(changed));
+  await toolResult({ toolName: "read", input: { path: `${partial}:1-2` }, isError: false }, makeCtx({ cwd: PROJ, registry: REG }));
+  await toolResult({ toolName: "read", input: { path: partial }, isError: true }, makeCtx({ cwd: PROJ, registry: REG }));
+  const partialWrite = await callTool(ext, { toolName: "write", input: { path: partial, content: "// v8\n" } }, ask());
+  check("unreadTarget: a partial or failed read is not a read", partialWrite?.block === true, JSON.stringify(partialWrite));
+  const newFile = await callTool(ext, { toolName: "write", input: { path: path.join(PROJ, "src", "brand-new.js"), content: "// n\n" } }, ask());
+  check("unreadTarget: creating a file is not a rewrite of something unseen", newFile === undefined, JSON.stringify(newFile));
+}
+
 const bad = report("coverage");
 process.exitCode = bad ? 1 : 0;

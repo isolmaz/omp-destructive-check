@@ -360,7 +360,14 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   // moving the cursor through every row.
   const { ctx } = await dcPanel({ overlays: [["\u001b[6~", "\u001b"]] });
   const panel = text(overlayLog.at(-1));
-  check("panel: page-down scrolls the first rows out of view", !panel.includes("friction preset") && panel.includes("rule insideDelete"), panel.slice(0, 200));
+  // The anchor is a row from the *second* page: the first page ends inside the
+  // protection rules, so the checker group is what only a scrolled view shows.
+  // The window follows the cursor, so the assertion is the cursor's own position
+  // counter plus the first row leaving the window: it stays honest however many
+  // settings groups the panel grows.
+  const footer = String(panel).split("\n").at(-2) ?? "";
+  const position = Number((footer.match(/(\d+)\/(\d+)/) ?? [0, "1"])[1]);
+  check("panel: page-down scrolls the window past the first rows", position > 1 && !panel.includes("friction preset"), `position=${position} ${String(panel).slice(0, 120)}`);
   check("panel: the panel still closes after scrolling", ctx.notes.length >= 0, "");
 }
 

@@ -316,6 +316,34 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("the panel rows carry explanations", rows.filter((row) => !row.section).every((row) => String(row.description ?? "").trim()), "a panel row has no description");
 }
 
+// ------------------------------------------------------ new settings (S4) ---
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("two-stage"), pick("back"), pick("close")] });
+  check("/dc turns the two-stage check on and persists it", config.checker?.twoStage === true, JSON.stringify(config.checker));
+  const off = await menu({ config: cfg({ checker: { twoStage: true } }), selections: [pick("checker"), pick("two-stage"), pick("back"), pick("close")] });
+  check("/dc turns the two-stage check off again", off.config.checker?.twoStage === false, JSON.stringify(off.config.checker));
+}
+{
+  const { config } = await menu({ selections: [pick("checker"), pick("fast stage cap"), pick("back"), pick("close")] });
+  check("/dc cycles the fast-stage output cap", config.checker?.fastStageMaxTokens === 1024, JSON.stringify(config.checker));
+}
+{
+  const { config } = await menu({ selections: [pick("two-stage check:"), pick("close")] });
+  check("/dc toggles the two-stage check from the main list", config.checker?.twoStage === true, JSON.stringify(config.checker));
+}
+{
+  const { config } = await menu({ selections: [pick("project policy:"), pick("project policy: on"), pick("close")] });
+  check("/dc turns the project policy file off and persists it", config.projectPolicy?.enabled === false, JSON.stringify(config.projectPolicy));
+  const trust = await menu({ selections: [pick("project policy:"), pick("require a trusted project:"), pick("close")] });
+  check("/dc toggles requireTrusted and persists it", trust.config.projectPolicy?.requireTrusted === false, JSON.stringify(trust.config.projectPolicy));
+}
+{
+  // A rejected key is reported instead of being silently ignored.
+  const { confirms } = await menu({ config: cfg({ modes: "hard", timeoutMS: 500 }), selections: [pick("status"), pick("close")] });
+  const text = confirms.join("\n");
+  check("/dc status lists the rejected config keys", /rejected keys/.test(text) && /modes: unknown key/.test(text), text.slice(0, 400));
+}
+
 // ------------------------------------------------------------- explanations --
 {
   // Dialogue coverage is asserted by every suite that opens one; this one walks

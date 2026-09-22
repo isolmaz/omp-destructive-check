@@ -83,8 +83,8 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
     the "do not retry this through another tool" sentence. Tests and users match on that shape.
     For a rule that is not exempt the block ends with the retry invitation instead of the flat refusal —
     that sentence *is* how the loop is announced, so it is part of the contract too.
-15. **The second chance is bounded and recorded.** `catastrophic`, `systemTarget` and `protectSecrets`
-    are a floor `retry.exempt` can only add to — no setting re-opens the loop for them, and a repeat of
+15. **The second chance is bounded and recorded.** `guardSelf`, `catastrophic`, `systemTarget` and
+    `protectSecrets` are a floor `retry.exempt` can only add to — no setting re-opens the loop for them, and a repeat of
     one is an ordinary block. A repeat without a justification is a block with nothing new to say
     (`No further attempts…`): the guard never spends a checker call on it, and the same operation is
     only ever retried once (`retry.maxAttempts`, `retry.sessionBudget`, `0` = off). One retry means one
@@ -177,3 +177,48 @@ asserts both halves, so a change to the installer or to the suite list has to ke
 `README.md` documents user-visible behavior; change it in the same commit as the behavior.
 The `/dc` menu is the only configuration UI users are expected to touch — a new setting needs a menu
 entry, a default in `DEFAULTS`, and a persistence check in `tests/t-menu.mjs`.
+
+16. **One table, one template.** Every covered tool is an entry in `ADAPTERS` (`kind`, `coverage`,
+    `scope`, `extract`, `scan`, `secrets`, `readOnly`) and `analyzeCall` is the single template over
+    it: scope → extract → scan, then the call-level layers (a project's deny patterns, the readonly
+    gate). A new tool is one entry — do not add a branch to a chain that no longer exists, and do not
+    let a tool reach the decision path without an entry (an uncovered tool is not judged at all, so
+    the table *is* the coverage).
+
+17. **The read-only class is an allow, never a release.** `readOnlyCommand` recognizes a line every
+    one of whose sub-commands is a verb that cannot change anything, with that verb's own flags
+    (`sort -o`, `find -delete`, `git clean -f`, `uniq in out` are outside it; `git clean -n` and
+    `tar -t` are inside). It runs *after* the catastrophic signatures and it short-circuits the
+    scanners only for a line they would otherwise misjudge; a finding from those scanners is never
+    released by it. Interpreters and code runners are never in it. `mode: "readonly"` is built on
+    top: in it, everything that is not provably read-only blocks, whatever its target.
+
+18. **Read-only surfaces stay read-only.** `dc_inspect` (status | config | rules | recent |
+    explain) changes no config, no session state, no cache and no audit line: `explain` re-runs the
+    static layers only and never asks the model. It refuses to answer unless it can prove the
+    running definition is this module's own (the definition the registry holds, and any source path
+    the host records, against the loaded module path), and its model-visible output carries rule
+    names, actions and timings — never the guard's full reasons or the action payload.
+
+19. **A project file may only tighten.** `<cwd>/.omp/destructive-check.json` may make a rule action
+    more restrictive and add deny patterns; `mode`, `enabled`, the checker settings, `allowDirs` and
+    any loosening value are refused, recorded, and shown in `/dc → status` and `dc_inspect config`.
+    The merge is most-restrictive-wins (`ruleAction`), so a project file cannot release a rule even
+    if the merge were wrong, and `RULE_FLOORS` keeps `guardSelf`, `projectDeny`, `readonlyMutation`
+    and `unreadTarget` from being set to `allow` in *any* file. This host exposes no project-trust
+    signal; that is reported rather than assumed.
+
+20. **The guard's own controls are not editable.** `guardSelf` blocks writes and deletes aimed at
+    `~/.omp/shared/destructive-check.ts`, its manifest, `~/.omp/destructive-check.json`, the approval
+    list, the project policy file, a directory containing one of them, and `~/.omp/agent/config.yml`
+    when the edit touches `extensions`/`disabledExtensions`. The lock and the installer stay the
+    reactive half; this is the half that stops the write from happening at all.
+
+21. **The policy is re-read, and one budget covers one decision.** The config is reloaded on
+    `session_start` (a child session must not run the parent's snapshot) and re-stat'ed by
+    mtime+size before every decision, so an edited file takes effect without a restart; writes go
+    through a temporary file and a rename, every key is validated against its type/enum with the
+    default kept on an invalid value, and the rejected keys are listed in `/dc → status`. The
+    two-stage checker (`checker.twoStage`) runs a one-digit pre-filter and then the detailed call
+    inside the **same** `timeoutMs` budget the single request always had: a fast stage that answers
+    anything other than `0`/`1` is a checker failure (invariant 1), never an allow.
