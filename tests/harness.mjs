@@ -155,7 +155,7 @@ export function fakeRegistry(entries) {
   };
 }
 
-export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "", overlay = false, overlays = [], custom = null } = {}) {
+export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "", overlay = false, overlays = [], custom = null, theme = undefined } = {}) {
   const notes = [];
   const statuses = [];
   // `ctx.abort()` is the host's "stop this turn" switch: the deny-and-abort
@@ -186,7 +186,7 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
       overlayLog.push(entry);
       let settle;
       const decided = new Promise((resolve) => (settle = resolve));
-      const component = factory({ requestRender() {} }, undefined, undefined, (value) => {
+      const component = factory({ requestRender() {} }, theme, undefined, (value) => {
         entry.done = value;
         settle(value);
       });
@@ -241,6 +241,33 @@ export function callTool(ext, event, ctx) {
 
 export function bash(command, intent) {
   return { toolName: "bash", input: { command, i: intent ?? "run command" } };
+}
+
+// A host theme for the painted surfaces. It emits real SGR codes, so a suite
+// exercises the same width math the terminal does, and it records every token it
+// was asked for, so a check can name the colours a surface used.
+export function fakeTheme() {
+  const tokens = [];
+  const span = (code, token, text) => {
+    tokens.push(token);
+    return `\x1b[${code}m${text}\x1b[0m`;
+  };
+  return {
+    tokens,
+    fg: (token, text) => span("38;5;75", token, text),
+    bg: (token, text) => span("48;5;236", token, text),
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+  };
+}
+
+// What a terminal sees: escape sequences measure zero, so a painted line and a
+// plain one must still be the same width for the frame to hold.
+export function stripAnsi(text) {
+  return String(text ?? "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+export function visible(text) {
+  return [...stripAnsi(text)].length;
 }
 
 // Checker requests captured by the fetch stub installed per test.

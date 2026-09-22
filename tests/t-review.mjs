@@ -96,7 +96,7 @@ fs.writeFileSync(path.join(PROJ, "cleanup.sh"), "#!/usr/bin/env bash\nrm -rf src
   const ext = await loadExt({ home: HOME, config: cfg({ mode: "custom", rules: { outsideDelete: "model" } }), registry: REG });
   const ctx = makeCtx({ cwd: PROJ, registry: REG });
   await callTool(ext, cmd("rm -rf " + path.join(OUTSIDE, "data")), ctx);
-  const menuCtx = makeCtx({ cwd: PROJ, selects: [pick("coverage:"), pick("processes:"), pick("close")], registry: REG });
+  const menuCtx = makeCtx({ cwd: PROJ, selects: [pick("Safety & approvals"), pick("Tool coverage"), pick("coverage processes:"), pick("back"), pick("close")], registry: REG });
   await ext.commands.get("dc").handler("", menuCtx);
   await callTool(ext, cmd("rm -rf " + path.join(OUTSIDE, "data")), ctx);
   check("D12: a policy change drops cached verdicts", checkerRequests().length === 2, `requests=${checkerRequests().length}`);

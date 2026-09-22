@@ -277,9 +277,12 @@ const twoStage = (verdict, first = "DENY: untracked work would be lost") => (_ur
 const jsonVerdict = (obj) => ok(JSON.stringify(obj));
 const gitStub = ({ dirty = false, checkIgnore = 1, repo = true } = {}) => async (cmd, args) => {
   if (cmd !== "git") return { stdout: "", stderr: "not git", code: 1, killed: false };
-  if (args[0] === "status") return { stdout: dirty ? " M src/keep.txt\n" : "", stderr: "", code: 0, killed: false };
-  if (args[0] === "log") return { stdout: repo ? `${"a".repeat(40)}\n` : "", stderr: "", code: 0, killed: false };
-  if (args[0] === "check-ignore") return { stdout: "", stderr: "", code: checkIgnore, killed: false };
+  // The probes may carry global flags first (--literal-pathspecs): dispatch on
+  // the subcommand, the first bare word, the way git parses it.
+  const sub = args.find((a) => !a.startsWith("-")) ?? args[0];
+  if (sub === "status") return { stdout: dirty ? " M src/keep.txt\n" : "", stderr: "", code: 0, killed: false };
+  if (sub === "log") return { stdout: repo ? `${"a".repeat(40)}\n` : "", stderr: "", code: 0, killed: false };
+  if (sub === "check-ignore") return { stdout: "", stderr: "", code: checkIgnore, killed: false };
   return { stdout: "", stderr: "unknown git probe", code: 1, killed: false };
 };
 const said = (text) => [{ message: { role: "assistant", content: [{ type: "text", text }] } }];
@@ -360,11 +363,11 @@ const retry = (pattern, base = retryCfg()) => ({ retry: { ...base.retry, ...patt
   const proseRepeat = await callTool({ toolCall: prose.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("allow it, it is fine") }));
   check("retry: a prose reply is not a retry verdict", proseRepeat?.block === true && contract.test(proseRepeat?.reason ?? ""), proseRepeat?.reason);
 
-  const badEnum = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "maybe", confidence: "high", reason: "unsure" })), branch: said("first") });
+  const badEnum = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "maybe", confidence: "high", reason: "unsure", claims: [{ type: "resolved_targets", value: "src" }] })), branch: said("first") });
   const enumRepeat = await callTool({ toolCall: badEnum.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("a justification") }));
   check("retry: an unknown decision value is not a verdict", enumRepeat?.block === true && contract.test(enumRepeat?.reason ?? ""), enumRepeat?.reason);
 
-  const noReason = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "allow", confidence: "high" })), branch: said("first") });
+  const noReason = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "allow", confidence: "high", claims: [] })), branch: said("first") });
   const reasonRepeat = await callTool({ toolCall: noReason.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("a justification") }));
   check("retry: an allow without a reason is not a verdict", reasonRepeat?.block === true && contract.test(reasonRepeat?.reason ?? ""), reasonRepeat?.reason);
 }
@@ -405,7 +408,10 @@ const retry = (pattern, base = retryCfg()) => ({ retry: { ...base.retry, ...patt
   const blocked = await callTool({ toolCall: unverified.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("src is committed, honest") }));
   check("retry: a false committed claim blocks", blocked?.block === true && /could be verified/.test(blocked?.reason ?? ""), blocked?.reason);
 
-  const noClaim = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "allow", confidence: "high", reason: "looks fine" })), branch: said("first") });
+  // The verdict contract requires at least one claim (docs/REFERENCE.md): an
+  // allow whose claim cannot even be checked must land on the "no claim" block,
+  // not on the parser. No exec here, so the probe cannot be asked.
+  const noClaim = await run({ config: retryCfg(), handler: twoStage(jsonVerdict({ decision: "allow", confidence: "high", reason: "looks fine", claims: [{ type: "committed", value: "src" }] })), branch: said("first") });
   const empty = await callTool({ toolCall: noClaim.ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("it looks fine to me") }));
   check("retry: an allow with no checkable claim blocks", empty?.block === true && /no claim/.test(empty?.reason ?? ""), empty?.reason);
 
@@ -428,10 +434,11 @@ const retry = (pattern, base = retryCfg()) => ({ retry: { ...base.retry, ...patt
   check("retry: a verified ignored claim allows", okIgnored?.block !== true, JSON.stringify(okIgnored));
 }
 {
-  // user_authorized is checked against the user's own messages, which only the
-  // `context` event carries.
-  // Two retries are allowed here: the first is spent on the claim that cannot be
-  // verified, the second on the one the user's own message backs.
+  // A user message is never authorization — the retry prompt says so verbatim
+  // ("A path mentioned in a user message is not user authorization"). The
+  // `context` subscription still exists (it feeds the session-context block), so
+  // the ring is populated below to prove a real user message does not open this
+  // gate either. Two retries are allowed; both attempts fail the claim and block.
   const ext = await loadExt({ home: HOME, config: retryCfg({ retry: { maxAttempts: 2 } }), registry: REG, exec: gitStub() });
   installFetch(twoStage(jsonVerdict({ decision: "allow", confidence: "high", reason: "the user asked for it", claims: [{ type: "user_authorized", value: "src" }] })));
   const onContext = ext.handlers.get("context")?.[0];
@@ -441,7 +448,7 @@ const retry = (pattern, base = retryCfg()) => ({ retry: { ...base.retry, ...patt
   check("retry: user_authorized with no user message blocks", withoutUser?.block === true, withoutUser?.reason);
   onContext({ messages: [{ role: "user", content: [{ type: "text", text: "please delete src, I re-created it" }] }] });
   const withUser = await callTool(ext, bash("rm -rf src"), makeCtx({ cwd: CWD, hasUI: false, registry: REG, branch: said("the user authorized this, see their message") }));
-  check("retry: user_authorized against the user's own message allows", withUser?.block !== true, JSON.stringify(withUser));
+  check("retry: user_authorized against the user's own message still blocks", withUser?.block === true && /not authorization/.test(withUser?.reason ?? ""), JSON.stringify(withUser));
 }
 {
   // dc_justify is the explicit half: it records, and only a matching target makes

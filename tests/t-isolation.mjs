@@ -1,7 +1,7 @@
 // Isolation mechanics — the out-of-band half of the guard.
 //
 // Everything in destructive-check.ts runs in-band: same user, same filesystem
-// rights as the agent it watches. The README's Threat B runbook tells users to
+// rights as the agent it watches. The runbook in docs/REFERENCE.md tells users to
 // put the boundary somewhere the agent cannot rewrite — a deny ACE on the guard
 // files and on the data that must survive. This suite executes exactly those
 // commands in a scratch directory, so the runbook is known to work on this

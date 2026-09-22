@@ -20,6 +20,9 @@ import {
   overlayLog,
   widgetLog,
   dialogDefects,
+  fakeTheme,
+  stripAnsi,
+  visible,
   check,
   report,
 } from "./harness.mjs";
@@ -42,19 +45,19 @@ const cfg = (extra = {}) => ({
 const ok = (content) => fetchResponse(200, { choices: [{ message: { content } }] });
 const deny = (reason) => ok(`DENY: ${reason}`);
 
-async function run({ config = cfg(), command = "rm -rf src", handler, selects = [], inputs = [], hasUI = true, overlay = true, overlays = [], custom, event } = {}) {
+async function run({ config = cfg(), command = "rm -rf src", handler, selects = [], inputs = [], hasUI = true, overlay = true, overlays = [], custom, event, theme } = {}) {
   installFetch(handler ?? (() => ok("ALLOW: regenerated output")));
   const ext = await loadExt({ home: HOME, config, registry: REG });
-  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, selects: [...selects], inputs: [...inputs], overlay, overlays: [...overlays], custom });
+  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, selects: [...selects], inputs: [...inputs], overlay, overlays: [...overlays], custom, theme });
   const result = await callTool(ext, event ?? bash(command, "clean up source"), ctx);
   return { ext, ctx, result, blocked: result?.block === true };
 }
 
 // The panel is opened by the same /dc command; when the host cannot draw an
 // overlay the plain-list menu underneath takes over.
-async function dcPanel({ config = cfg(), overlays = [], selects = [], inputs = [], hasUI = true } = {}) {
+async function dcPanel({ config = cfg(), overlays = [], selects = [], inputs = [], hasUI = true, theme } = {}) {
   const ext = await loadExt({ home: HOME, config, registry: REG });
-  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, overlay: true, overlays: [...overlays], selects: [...selects], inputs: [...inputs] });
+  const ctx = makeCtx({ cwd: CWD, hasUI, registry: REG, overlay: true, overlays: [...overlays], selects: [...selects], inputs: [...inputs], theme });
   await ext.commands.get("dc").handler("", ctx);
   return { ext, ctx, config: ext.readConfig() };
 }
@@ -249,18 +252,28 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   check("allowlist: the pop-up answer was a session approval", !answered?.block && overlayLog.at(-1)?.done === "allowSession", String(overlayLog.at(-1)?.done));
   const stillAllowed = await callTool({ toolCall: ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] }));
   check("allowlist: the session approval is in force", stillAllowed === undefined, JSON.stringify(stillAllowed));
-  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] });
+  // The allowlist is its own page now: Safety & approvals → Remembered
+  // approvals, and that page's heading is the section the panel offers.
+  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [() => "open:protection", () => "open:allowlist"] });
+  const panelBefore = overlayLog.length;
   await ext.commands.get("dc").handler("", panelCtx);
-  const rows = overlayLog.at(-1)?.options ?? [];
-  check("allowlist: the panel has an Allowlist section", rows.some((row) => row.label === "Allowlist" && row.section), rows.map((row) => row.label).slice(0, 8).join(" | "));
+  const allowPanel = overlayLog[panelBefore + 2];
+  const rows = allowPanel?.options ?? [];
+  check("allowlist: the panel has an Allowlist section", text(allowPanel).includes("Remembered approvals"), rows.map((row) => row.label).slice(0, 8).join(" | "));
   check("allowlist: a human approval is listed with its source and time", rows.some((row) => /^human \(session\) · insideDelete · /.test(String(row.label))), rows.map((row) => row.label).join(" | "));
   check("allowlist: every row explains itself", rows.filter((row) => !row.section).every((row) => String(row.description ?? "").trim()), "a panel row has no description");
   const removeId = rows.find((row) => String(row.id).startsWith("allow.row:"))?.id;
   check("allowlist: the approval row is removable", Boolean(removeId), JSON.stringify(rows.map((row) => row.id)));
-  const removeCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [() => removeId, () => "close"] });
+  const removeCtx = makeCtx({
+    cwd: CWD,
+    registry: REG,
+    overlay: true,
+    overlays: [() => "open:protection", () => "open:allowlist", () => removeId, () => "back", () => "back", () => "close"],
+  });
+  const removeBefore = overlayLog.length;
   await ext.commands.get("dc").handler("", removeCtx);
   check("allowlist: removing a row reports it", removeCtx.notes.some((note) => /approval removed/.test(String(note.message))), JSON.stringify(removeCtx.notes));
-  const after = overlayLog.at(-1)?.options ?? [];
+  const after = overlayLog[removeBefore + 3]?.options ?? [];
   check("allowlist: the removed approval is gone from the editor", !after.some((row) => String(row.id).startsWith("allow.row:")), after.map((row) => row.label).join(" | "));
   const askedAgain = await callTool({ toolCall: ext.toolCall }, bash("rm -rf src"), makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] }));
   check("allowlist: removing the approval asks again", askedAgain?.block === true, JSON.stringify(askedAgain));
@@ -347,53 +360,110 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   const labels = (entry?.options ?? []).map((row) => String(row.label));
   const choices = (entry?.options ?? []).filter((row) => !row.section);
   check("panel: /dc opens the pop-up when the host can draw one", overlayLog.length === before + 1, `calls=${overlayLog.length - before}`);
+  // The flat section list is paged away: every old section lives behind a row
+  // now — on the root or one hop into it. Walk the whole tree once: each hop
+  // proves its page opens, and the walk's rows are what the count below sums.
+  const walkBefore = overlayLog.length;
+  await dcPanel({
+    overlays: [
+      () => "open:protection",
+      () => "open:rules", () => "back",
+      () => "open:coverage", () => "back",
+      () => "open:retry",
+      () => "open:recovery", () => "back",
+      () => "open:exemptions", () => "back",
+      () => "back",
+      () => "open:allowlist", () => "back",
+      () => "open:scope", () => "back",
+      () => "open:project", () => "back",
+      () => "back",
+      () => "open:checker",
+      () => "open:checkerAdvanced", () => "back",
+      () => "back",
+      () => "open:ui",
+      () => "open:statusLine", () => "back",
+      () => "back",
+      () => "open:history", () => "back",
+      () => "open:advanced",
+      () => "open:guard", () => "back",
+      () => "open:memory", () => "back",
+      () => "back",
+      () => "close",
+    ],
+  });
+  const walked = overlayLog.slice(walkBefore);
+  const labelsOf = (index) => (walked[index]?.options ?? []).map((row) => String(row.label));
+  // Render order: 0 root · 1 protection · 4 coverage · 29 advanced · 30 guard.
+  const protectionLabels = labelsOf(1);
+  const advancedLabels = labelsOf(29);
+  const sections = {
+    Simple: [labels, (ls) => ls.includes("Quick settings")],
+    Protection: [labels, (ls) => ls.includes("Safety & approvals")],
+    Coverage: [protectionLabels, (ls) => ls.includes("Tool coverage")],
+    "Retry & justification": [protectionLabels, (ls) => ls.some((label) => label.startsWith("Second chances"))],
+    Checker: [labels, (ls) => ls.some((label) => label.startsWith("checker:"))],
+    UI: [labels, (ls) => ls.includes("Appearance")],
+    Advanced: [labels, (ls) => ls.includes("Advanced & diagnostics")],
+    Guard: [advancedLabels, (ls) => ls.includes("Guard files")],
+    History: [labels, (ls) => ls.includes("History")],
+  };
   for (const group of ["Simple", "Protection", "Coverage", "Retry & justification", "Checker", "UI", "Advanced", "Guard", "History"]) {
-    check(`panel: the ${group} section is on it`, labels.includes(group), labels.slice(0, 12).join(" | "));
+    const [where, has] = sections[group];
+    check(`panel: the ${group} section is on it`, has(where), where.slice(0, 12).join(" | "));
   }
-  check("panel: the first sections are rendered", panel.includes("Simple") && panel.includes("Protection"), panel.slice(0, 200));
+  check("panel: the first sections are rendered", panel.includes("── Quick settings") && panel.includes("── Settings"), panel.slice(0, 200));
   check("panel: Escape closes without changing anything", JSON.stringify(config) === JSON.stringify(cfg()), JSON.stringify(config));
   check("panel: every row carries a description", choices.every((row) => String(row.description ?? "").trim().length > 0), JSON.stringify(choices.filter((row) => !String(row.description ?? "").trim())));
-  check("panel: the rows are settings, not menu labels", choices.length > 30, `rows=${choices.length}`);
+  const settingsIds = new Set(walked.flatMap((page) => (page.options ?? []).filter((row) => !row.section).map((row) => String(row.id))));
+  check("panel: the rows are settings, not menu labels", settingsIds.size > 30, `rows=${settingsIds.size}`);
 }
 
 {
-  // A page down scrolls the window: the later sections are reachable without
-  // moving the cursor through every row.
-  const { ctx } = await dcPanel({ overlays: [["\u001b[6~", "\u001b"]] });
-  const panel = text(overlayLog.at(-1));
-  // The anchor is a row from the *second* page: the first page ends inside the
-  // protection rules, so the checker group is what only a scrolled view shows.
-  // The window follows the cursor, so the assertion is the cursor's own position
-  // counter plus the first row leaving the window: it stays honest however many
-  // settings groups the panel grows.
+  // A page down scrolls the window: the later lines are reachable without
+  // reading through every row above them. The settings pages all fit one
+  // window now, so the walk drives the longest panel there is — the status
+  // report the panel opens (Advanced & diagnostics → status).
+  const pageDown = (component, entry) => {
+    component.handleInput("\u001b[6~");
+    entry.lines = component.render(80);
+    return undefined;
+  };
+  const before = overlayLog.length;
+  const { ctx } = await dcPanel({ overlays: [() => "open:advanced", () => "status", pageDown] });
+  const panel = text(overlayLog[before + 2]);
+  // The anchor is the report's own first line: only a window that actually
+  // scrolled has lost it, however many lines the report grows.
   const footer = String(panel).split("\n").at(-2) ?? "";
   const position = Number((footer.match(/(\d+)\/(\d+)/) ?? [0, "1"])[1]);
-  check("panel: page-down scrolls the window past the first rows", position > 1 && !panel.includes("friction preset"), `position=${position} ${String(panel).slice(0, 120)}`);
+  check("panel: page-down scrolls the window past the first rows", position > 1 && !panel.includes("enabled      : yes"), `position=${position} ${String(panel).slice(0, 120)}`);
   check("panel: the panel still closes after scrolling", ctx.notes.length >= 0, "");
 }
 
 {
-  // A cycle is applied in place: the panel stays open, the file changes.
-  const { config } = await dcPanel({ overlays: [["\r", "\u001b"]] });
+  // A choice is applied in place: the panel stays open, the file changes. The
+  // preset row opens the host's preset list now, so the Enter is followed by
+  // the pick of strict.
+  const { config } = await dcPanel({ overlays: [["\u001b[B", "\r"], ["\u001b"]], selects: ["strict"] });
   check("panel: the friction preset cycles to strict", config.preset === "strict", JSON.stringify(config));
   check("panel: the preset writes the settings it stands for", config.askOnDeny === false && config.askOnError === true && config.retry?.authority === "off" && config.verify?.level === "claims+adversarial", JSON.stringify(config));
 }
 
 {
-  // The Simple section's status-line row opens the sub-panel that holds the
+  // The Appearance page's status-line row opens the sub-panel that holds the
   // location and the detail.
-  const { config } = await dcPanel({ overlays: [["\u001b[B", "\u001b[B", "\r"], ["\r", "\u001b"]] });
-  const sub = text(overlayLog.at(-1));
+  const before = overlayLog.length;
+  const { config } = await dcPanel({ overlays: [() => "open:ui", () => "open:statusLine", () => "ui.statusLine.location"] });
+  const sub = text(overlayLog[before + 2]);
   check("panel: the status-line row opens its own panel", /status line location/.test(sub) && /status line detail/.test(sub) && /bar side/.test(sub), sub.slice(0, 300));
   check("panel: cycling the location persists it", config.ui?.statusLine?.location === "belowEditor", JSON.stringify(config.ui?.statusLine));
 }
 
 {
   // The UI group is reachable from the plain-list menu too, and the snippet the
-  // panel prints is the block the README documents.
+  // panel prints is the block docs/REFERENCE.md documents.
   const { config, panels } = await dcMenu({
     config: cfg({ ui: { statusLine: { barSide: "right" } } }),
-    selects: [pick("ui:"), pick("status line"), pick("show the statusLine snippet"), undefined, pick("close")],
+    selects: [pick("Appearance"), pick("status line"), pick("show the statusLine snippet"), undefined, pick("close")],
   });
   const snippet = panels.join("\n");
   check("panel: the snippet is a copy-pasteable statusLine block", /statusLine:/.test(snippet) && /preset: custom/.test(snippet) && /showHookStatus: false/.test(snippet), snippet.slice(0, 300));
@@ -405,7 +475,7 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   // Every new setting persists through the menu as well: the two surfaces write
   // the same keys.
   const { config } = await dcMenu({
-    selects: [pick("retry:"), pick("retry authority"), undefined, pick("close")],
+    selects: [pick("Safety & approvals"), pick("Second chances"), pick("retry authority"), undefined, pick("close")],
   });
   check("panel: the retry authority cycles from the menu", config.retry?.authority === "ask", JSON.stringify(config.retry));
 }
@@ -419,7 +489,7 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
 
 {
   const { config } = await dcMenu({
-    selects: [pick("policy note"), pick("close")],
+    selects: [pick("Safety & approvals"), pick("policy note"), pick("back"), pick("close")],
     inputs: ["bu makinede arşive dokunma"],
   });
   check("panel: the policy note is stored as written", config.policyNote === "bu makinede arşive dokunma", JSON.stringify(config.policyNote));
@@ -428,10 +498,11 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
 // ------------------------------------------------------ history and guard ---
 
 {
-  // `explain a decision` shows the whole trace of one entry, not a one-liner.
+  // The history page's decision rows show the whole trace of one entry, not a
+  // one-liner.
   await run({ config: cfg({ mode: "custom", rules: { insideDelete: "model" } }), handler: () => deny("untracked work"), overlays: [["d"]] });
   const { panels } = await dcMenu({
-    selects: [pick("explain a decision"), (options) => options.map((option) => option.label).find((label) => label.startsWith("model:deny")), undefined, pick("close")],
+    selects: [pick("History"), (options) => options.map((option) => option.label).find((label) => label.startsWith("model:deny")), undefined, pick("close")],
   });
   const trace = panels.join("\n");
   check("history: the trace names the layer and the rule", /layer\s*: /.test(trace) && /rule\s*: insideDelete/.test(trace), trace.slice(0, 400));
@@ -441,7 +512,7 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
 
 {
   // The guard section reports the same text the pop-up panel would.
-  const { panels } = await dcMenu({ selects: [pick("guard:"), pick("integrity:"), pick("close")] });
+  const { panels } = await dcMenu({ selects: [pick("Advanced & diagnostics"), pick("Guard files"), pick("integrity:"), undefined, pick("close")] });
   check("guard: the integrity report is reachable from the panel too", /state\s*: (ok|unmanaged|missing|changed)/.test(panels.join("\n")), panels.join("\n").slice(0, 200));
 }
 
@@ -519,6 +590,84 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   check("deny & abort: off by default, a deny only refuses", plain.blocked === true && plain.ctx.control.aborted === 0, JSON.stringify(plain.ctx.control));
   const escape = await run({ config: cfg({ ui: { denyAbort: true } }), command: "git reset --hard", handler: () => deny("uncommitted work"), overlays: [["\u001b"]] });
   check("deny & abort: Escape is the deny answer and aborts too", escape.blocked === true && escape.ctx.control.aborted === 1, JSON.stringify(escape.ctx.control));
+}
+
+// ------------------------------------------------------------- painting ----
+// The /dc panel and its reports wear the host theme; the approval prompt does
+// not. These checks measure what a terminal would see: escapes measure zero, so
+// a painted line must still be exactly as wide as the frame around it.
+{
+  const rowsOf = (component) => {
+    const spec = component.spec ?? {};
+    return (typeof spec.rows === "function" ? spec.rows() : spec.rows) ?? [];
+  };
+  // Open a setting by id rather than by position: sections are skipped by the
+  // component, so the loop reads the cursor back instead of counting presses.
+  const chooseRow = (id) => (component) => {
+    const spec = component.spec ?? {};
+    const target = rowsOf(component).findIndex((row) => row.id === id && !row.section);
+    if (target < 0) return undefined;
+    for (let guard = 0; guard < 200 && spec.state?.selected !== target; guard += 1) {
+      component.handleInput(spec.state.selected < target ? "\u001b[B" : "\u001b[A");
+    }
+    component.handleInput("\r");
+    return undefined;
+  };
+  // A report body is longer than the window, which is what puts the counters on
+  // the border. The harness only re-renders for scripted keys, not for a script,
+  // so both frames are captured here: before the page-down, and after it.
+  const frames = [];
+  const pageDown = (times) => (component, entry) => {
+    frames.push(component.render(80));
+    for (let index = 0; index < times; index += 1) component.handleInput("\u001b[6~");
+    entry.lines = component.render(80);
+    frames.push(entry.lines);
+    return undefined;
+  };
+
+  const theme = fakeTheme();
+  const before = overlayLog.length;
+  await dcPanel({ theme, overlays: [chooseRow("open:advanced"), chooseRow("status"), pageDown(6)] });
+  const panel = overlayLog[before];
+  const report = overlayLog[before + 2];
+  const panelLines = panel?.lines ?? [];
+  const reportLines = report?.lines ?? [];
+  const framed = [...new Set(panelLines.map(visible))];
+  const framedReport = [...new Set(reportLines.map(visible))];
+
+  check("painting: the /dc panel wears the host theme", panelLines.some((line) => line.includes("\x1b[")), String(panelLines[0] ?? "").slice(0, 80));
+  check("painting: the frame is the host's rounded chrome", stripAnsi(panelLines[0] ?? "").startsWith("╭─ destructive-check"), stripAnsi(panelLines[0] ?? "").slice(0, 40));
+  check("painting: the title carries the accent and the bold face", theme.tokens.includes("accent") && (panelLines[0] ?? "").includes("\x1b[1m"), JSON.stringify([...new Set(theme.tokens)]));
+  // The frame is the contract: a themed line that measured its escapes would
+  // push the right border out, and every line would end somewhere else.
+  check("painting: every line of the panel is the same visible width", framed.length === 1, JSON.stringify(framed));
+  check("painting: every line of a report is the same visible width", reportLines.length > 0 && framedReport.length === 1, JSON.stringify(framedReport));
+  check("painting: the cursor row is filled across the panel", panelLines.some((line) => line.includes("\x1b[48;5;236m") && line.includes("▸")), panelLines.filter((line) => line.includes("\x1b[48;5;236m")).map((line) => stripAnsi(line)).join("|").slice(0, 120));
+  check("painting: the tag line is coloured by what it says", theme.tokens.includes("success"), JSON.stringify([...new Set(theme.tokens)]));
+  check("painting: an unscrolled report counts what is below", /↓ \d+ more\s/.test(stripAnsi(frames[0]?.at(-1) ?? "")), stripAnsi(frames[0]?.at(-1) ?? ""));
+  check("painting: a scrolled report counts what is hidden above", /\s↑ \d+ more\s/.test(stripAnsi(frames[1]?.[0] ?? "")), stripAnsi(frames[1]?.[0] ?? ""));
+  check("painting: the reports are painted too", reportLines.some((line) => line.includes("\x1b[")), String(reportLines[0] ?? "").slice(0, 60));
+
+  // Opt-in, twice over: a host with no theme, and the approval prompt, which
+  // keeps the plain box whatever the host offers.
+  const bare = await dcPanel({});
+  const bareLines = overlayLog.at(-1)?.lines ?? [];
+  check("painting: a host without a theme gets no escape codes", bareLines.length > 0 && !bareLines.some((line) => line.includes("\x1b[")), String(bareLines[0] ?? "").slice(0, 60));
+  check("painting: a host without a theme keeps the sharp box", stripAnsi(bareLines[0] ?? "").startsWith("┌─ destructive-check"), stripAnsi(bareLines[0] ?? "").slice(0, 40));
+  check("painting: the panel still reports its state to a themeless host", bare.ctx && bareLines.some((line) => /ENFORCING/.test(stripAnsi(line))), JSON.stringify(bareLines.length));
+
+  const approval = await run({ theme: fakeTheme(), command: "git reset --hard", handler: () => deny("uncommitted work") });
+  const approvalLines = overlayLog.at(-1)?.lines ?? [];
+  check("painting: the approval prompt stays unthemed", approvalLines.length > 0 && !approvalLines.some((line) => line.includes("\x1b[")), String(approvalLines[0] ?? "").slice(0, 60));
+  check("painting: the approval prompt still offers its answers", /\[a\] Allow once/.test(approvalLines.map(stripAnsi).join("\n")) && approval.blocked === true, approvalLines.map(stripAnsi).join("|").slice(0, 160));
+
+  // The panel is drawn from agent-authored text — the command, a justification —
+  // and an escape sequence in it must never reach the terminal. Without a theme
+  // the panel emits none of its own, so an escape in the output came from the
+  // text it was handed.
+  const injected = await run({ command: "rm -rf src\u001b[31m\u001b]2;owned\u0007", handler: () => deny("uncommitted work\u001b[31m") });
+  const injectedLines = overlayLog.at(-1)?.lines ?? [];
+  check("painting: an escape sequence in the action never reaches the panel", injectedLines.length > 0 && !injectedLines.some((line) => line.includes("\x1b")), injectedLines.join("\n").slice(0, 200));
 }
 
 const bad = report("pop-up UI");

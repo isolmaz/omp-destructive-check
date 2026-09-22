@@ -32,7 +32,7 @@ For a rule that is not exempt, a first block ends with this invitation instead o
     change and why that is safe (which paths, which data), then repeat the same call. A repeat without
     a concrete justification is blocked again.
 
-`catastrophic`, `systemTarget` and `protectSecrets` are an exemption floor: no setting re-opens the
+`guardSelf`, `catastrophic`, `systemTarget` and `protectSecrets` are an exemption floor: no setting re-opens the
 loop for them, and a repeat of one is an ordinary block. If the reason ends with `Do not retry this
 action or an equivalent one through another tool; if it is genuinely required, ask the user to change
 the /dc settings.`, there is no loop for that call — the rule is exempt, the authority is off, or the
@@ -45,13 +45,13 @@ flagged; it must be one of the targets the guard resolved) and `intent` (what wi
 is safe), plus optional `evidence` and `policyClause`. It records that text only — it never changes the
 policy and never allows anything by itself.
 
-The checker judges the repeat, and its `allow` counts only when the guard itself verifies at least one
-**claim** in the verdict, so state the checkable facts:
+The checker judges the repeat. At least one claim is required, and the guard must verify every
+supplied claim against an exact resolved target:
 
-- `committed` — the path is committed: `git status --porcelain -- <path>` is empty and a commit covers it.
+- `committed` — clean tracked content, with no untracked or ignored data in the target.
 - `ignored` — git ignores the path (`git check-ignore -q <path>` exits 0).
-- `artifact` — the target is a build artifact or temp path.
-- `user_authorized` — the target is named in one of the last 12 user messages.
+- `artifact` — a build/temp target that git confirms as ignored.
+- `user_authorized` — a conversational mention is not approval; the guard will not verify this claim.
 - `resolved_targets` — your list matches exactly the targets the guard resolved.
 
 A claim the guard cannot check is refused: it verifies nothing and no `allow` rests on it. Prose, a
@@ -65,13 +65,13 @@ different target or command is a new decision, and a retry through another tool 
 ## An approved delete
 
 With the default recovery, an approved delete may come back **rewritten**: the guard revises the input
-so the command moves the target into `~/.omp/dc-trash/<session>/<timestamp>/` instead of deleting it,
+so the command moves the target into a unique directory under `~/.omp/dc-trash/<session>/` instead of deleting it,
 and the tool result says so (`destructive-check: moved <src> to <dest>`). A delete it cannot express as
 a single move keeps its allow and runs unchanged.
 
 ## What the user has
 
-- the `/dc` panel (or plain menu): `Simple` · `Protection` · `Coverage` · `Retry & justification` · `Allowlist` · `Checker` · `UI` · `Advanced` · `Guard` · `History`;
+- `/dc`: protection and friction presets; **Safety & approvals**, **Checker**, **Appearance**, **History**, **Advanced & diagnostics**. Esc returns to the previous page; advanced settings are inside their categories.
 - the approval pop-up, answered `Allow once` / `Allow for this session` / `Deny` (Esc is Deny);
 - the decision history (`recent decisions`, `explain a decision`) and the audit log at `~/.omp/logs/destructive-check.jsonl` — hash-chained, rotating, with a chain check;
 - `node tools/dc-audit.mjs doctor [--json]`: the chain, the installed guard vs its manifest, the config file, the decision counts — exit 1 when broken.

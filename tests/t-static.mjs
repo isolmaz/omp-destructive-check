@@ -594,7 +594,7 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
   check("internal error blocks in hard mode", hard.blocked && /analysis failed/.test(String(hard.result?.reason ?? "")), JSON.stringify(hard.result));
 
   let confirmText = "";
-  const menuCtx = makeCtx({ cwd: CWD, registry: REG, selects: [pick("recent decisions"), pick("close")] });
+  const menuCtx = makeCtx({ cwd: CWD, registry: REG, selects: [pick("History"), pick("error · internal"), pick("back"), pick("close")] });
   menuCtx.ui.confirm = async (_title, message) => ((confirmText = String(message)), true);
   await callTool({ toolCall: medium.ext.toolCall }, hostile, menuCtx);
   await medium.ext.commands.get("dc").handler("", menuCtx);

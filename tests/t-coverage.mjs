@@ -254,7 +254,7 @@ for (const [command, label] of [
   check("audit: editing a written line is reported as a broken chain", status === 1 && /BROKEN/.test(output), output || "no log to tamper with");
 }
 {
-  const { panels, defects } = await dc({ selects: ["audit log", "verify the audit chain", "close"] });
+  const { panels, defects } = await dc({ selects: ["History", "audit log entries", "verify the audit chain", "back", "close"] });
   const panel = panels.at(-1) ?? "";
   check("/dc: the audit panel reports entries and chain state", /entries\s*:\s*\d+/.test(panel) && /chain\s*:\s*(intact|BROKEN)/.test(panel), panel);
   check("/dc: every dialogue explains its options", defects.length === 0, defects.join("; "));
@@ -294,7 +294,7 @@ try {
   const manifestOf = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
   fs.writeFileSync(MANIFEST, JSON.stringify({ sha256: manifestOf(INSTALLED), installedAt: "2026-09-11T00:00:00.000Z", version: "2.4" }));
   {
-    const { panels } = await dc({ selects: ["guard: ok", "integrity: ok", "close"], extPath: INSTALLED });
+    const { panels } = await dc({ selects: ["Advanced & diagnostics", "Guard files", "integrity: ok", "back", "back", "close"], extPath: INSTALLED });
     const panel = panels.at(-1) ?? "";
     check("guard integrity: a matching install reports ok", /state\s*: ok/.test(panel), panel);
     check("guard integrity: the panel names the loaded file", panel.includes(INSTALLED), panel);
@@ -303,7 +303,7 @@ try {
     // Appended, not replaced: the panel has to run against a file the host can
     // still load, and an extra comment is a real edit with a new hash.
     fs.appendFileSync(INSTALLED, "\n// edited after the install, off the books\n");
-    const { panels } = await dc({ selects: ["guard: changed", "integrity: changed", "close"], extPath: INSTALLED });
+    const { panels } = await dc({ selects: ["Advanced & diagnostics", "Guard files", "integrity: changed", "back", "back", "close"], extPath: INSTALLED });
     const panel = panels.at(-1) ?? "";
     check("guard integrity: an edit after the install reports changed", /state\s*: changed/.test(panel) && /install\.mjs --force/.test(panel), panel);
   }
@@ -311,22 +311,22 @@ try {
     // A copy with no manifest next to it is "unmanaged" — never a passing hash
     // taken from a manifest that describes some other file.
     fs.rmSync(MANIFEST, { force: true });
-    const { panels } = await dc({ selects: ["guard: unmanaged", "integrity: unmanaged", "close"], extPath: INSTALLED });
+    const { panels } = await dc({ selects: ["Advanced & diagnostics", "Guard files", "integrity: unmanaged", "back", "back", "close"], extPath: INSTALLED });
     const panel = panels.at(-1) ?? "";
     check("guard integrity: a copy with no manifest is unmanaged, not ok", /state\s*: unmanaged/.test(panel), panel);
   }
   {
     fs.copyFileSync(EXT_PATH, INSTALLED);
     fs.writeFileSync(MANIFEST, JSON.stringify({ sha256: manifestOf(INSTALLED), installedAt: "2026-09-11T00:00:00.000Z", version: "2.4" }));
-    await dc({ selects: ["guard: ok", "lock: destructive-check.ts: writable · destructive-check.json: writable", "lock the guard only", "close"], extPath: INSTALLED });
+    await dc({ selects: ["Advanced & diagnostics", "Guard files", "lock: destructive-check.ts: writable · destructive-check.json: writable", "lock the guard only", "back", "back", "close"], extPath: INSTALLED });
     check("guard lock: locking leaves the installed file read-only", (fs.statSync(INSTALLED).mode & 0o200) === 0, `mode ${fs.statSync(INSTALLED).mode.toString(8)}`);
     check("guard lock: the config stays writable when only the guard is locked", (fs.statSync(path.join(HOME, ".omp", "destructive-check.json")).mode & 0o200) !== 0, "");
-    await dc({ selects: ["guard: ok", "lock: destructive-check.ts: read-only · destructive-check.json: writable", "unlock both files", "close"], extPath: INSTALLED });
+    await dc({ selects: ["Advanced & diagnostics", "Guard files", "lock: destructive-check.ts: read-only · destructive-check.json: writable", "unlock both files", "back", "back", "close"], extPath: INSTALLED });
     check("guard lock: unlocking restores a writable file", (fs.statSync(INSTALLED).mode & 0o200) !== 0, `mode ${fs.statSync(INSTALLED).mode.toString(8)}`);
   }
   {
     fs.writeFileSync(`${INSTALLED}.bak`, "// the previous guard\n");
-    const { panels } = await dc({ selects: ["guard: ok", "restore the previous guard (.bak)", "close"], extPath: INSTALLED });
+    const { panels } = await dc({ selects: ["Advanced & diagnostics", "Guard files", "restore the previous guard (.bak)", "back", "back", "close"], extPath: INSTALLED });
     check("guard restore: the previous copy is written back", fs.readFileSync(INSTALLED, "utf8") === "// the previous guard\n", fs.readFileSync(INSTALLED, "utf8"));
     check("guard restore: the panel says a restart is needed", /Restart the omp session/.test(panels.at(-1) ?? ""), panels.at(-1) ?? "");
   }
@@ -399,9 +399,44 @@ try {
   for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, ctx);
   check("watch: session_start warns that nothing is enforced", ctx.notes.some((n) => n.level === "warning" && /WATCH/.test(String(n.message))), JSON.stringify(ctx.notes).slice(0, 240));
   check("watch: the resting status line says WATCH", ctx.statuses.some((s) => /^dc: WATCH/.test(String(s.text))), JSON.stringify(ctx.statuses));
+  // The warning is a fact about the policy, not about a session: every child
+  // session fires session_start, and a subagent is not a new reason to warn.
+  const child = makeCtx({ cwd: PROJ, registry: REG });
+  for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, child);
+  check("watch: a child session does not repeat the warning", child.notes.length === 0, JSON.stringify(child.notes).slice(0, 240));
 }
 {
-  const { defects } = await dc({ selects: [(options) => options.map((o) => o.label).find((l) => l.startsWith("watch"))], config: cfg({ mode: "hard" }) });
+  // A guard that is switched off is a setting its owner made: the status line
+  // says `dc: off` and no warning is announced. Warning on every session meant
+  // every subagent repeated a notice the user had already answered.
+  stubFetch();
+  const ext = await loadExt({ home: HOME, config: cfg({ enabled: false }), registry: REG });
+  const parent = makeCtx({ cwd: PROJ, registry: REG });
+  const child = makeCtx({ cwd: PROJ, registry: REG });
+  for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, parent);
+  for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, child);
+  check("inert: a guard that is switched off announces nothing", parent.notes.length === 0 && child.notes.length === 0, JSON.stringify([...parent.notes, ...child.notes]).slice(0, 240));
+  check("inert: the off state shows on the status line instead", parent.statuses.some((s) => /^dc: off/.test(String(s.text))), JSON.stringify(parent.statuses));
+  // And it does not come back at the end of the session as an "could not enforce"
+  // gap: a guard that judged nothing has no gap, and the doctor still lists it.
+  for (const handler of ext.handlers.get("session_stop") ?? []) await handler({}, parent);
+  check("inert: the session end does not chase the same setting", parent.notes.length === 0, JSON.stringify(parent.notes).slice(0, 240));
+}
+{
+  // The trap that *does* deserve a notice — a policy whose channels are all out
+  // of scope, which looks armed — says it once per process, not once per session.
+  stubFetch();
+  const config = cfg({ coverage: { bash: false, eval: false, fileTools: false, processes: false } });
+  const ext = await loadExt({ home: HOME, config, registry: REG });
+  const parent = makeCtx({ cwd: PROJ, registry: REG });
+  const child = makeCtx({ cwd: PROJ, registry: REG });
+  for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, parent);
+  for (const handler of ext.handlers.get("session_start") ?? []) await handler({}, child);
+  check("inert: a policy that cannot stop anything says so once", parent.notes.filter((n) => /inert/.test(String(n.message))).length === 1, JSON.stringify(parent.notes).slice(0, 240));
+  check("inert: the child session stays quiet", child.notes.length === 0, JSON.stringify(child.notes).slice(0, 240));
+}
+{
+  const { defects } = await dc({ selects: ["Safety & approvals", (options) => options.map((o) => o.label).find((l) => l.startsWith("watch"))], config: cfg({ mode: "hard" }) });
   const written = JSON.parse(fs.readFileSync(path.join(HOME, ".omp", "destructive-check.json"), "utf8"));
   check("/dc: watch mode toggles and persists", written.dryRun === true, JSON.stringify(written));
   // The row has to explain *what* it does, not just carry a label: read the
@@ -522,7 +557,10 @@ try {
   fs.writeFileSync(path.join(CWD, "src", "keep.txt"), "untracked user work\n");
   const config = cfg({ mode: "custom", rules: { insideDelete: "model" }, askOnDeny: false });
   const gitArgs = { status: "", log: `${"a".repeat(40)}\n`, "check-ignore": 0 };
-  const exec = async (cmd, args) => ({ stdout: gitArgs[args[0]] ?? "", stderr: "", code: 0, killed: false });
+  const exec = async (cmd, args) => {
+    const sub = args.find((a) => gitArgs[a] !== undefined) ?? args[0];
+    return { stdout: gitArgs[sub] ?? "", stderr: "", code: 0, killed: false };
+  };
   const verdict = (obj) => fetchResponse(200, { choices: [{ message: { content: JSON.stringify(obj) } }] });
   installFetch((_url, init) => (String(init.body).includes("SECOND CHANCE") ? verdict({ decision: "allow", confidence: "high", reason: "the target is committed", claims: [{ type: "committed", value: "src" }] }) : fetchResponse(200, { choices: [{ message: { content: "DENY: untracked work would be lost" } }] })));
   const ext = await loadExt({ home, config, registry: REG, exec });
@@ -554,7 +592,7 @@ try {
   // The chain covers the new fields: recomputing it without them must not match.
   const { chain, ...core } = entry;
   check("second chance: the new fields are inside the hashed payload", createHash("sha256").update(JSON.stringify(core)).digest("hex") === chain, String(chain));
-  check("second chance: the rewritten command moves the target into the trash", /mv -f -- "src"/.test(String(second?.input?.command ?? "")), String(second?.input?.command ?? ""));
+  check("second chance: the rewritten command moves the target into the trash", /mv -- "src"/.test(String(second?.input?.command ?? "")), String(second?.input?.command ?? ""));
   check("second chance: the trash directory was created on disk", fs.existsSync(path.join(home, ".omp", "dc-trash")), path.join(home, ".omp", "dc-trash"));
 
   // A claim that was verified and then contradicted is what erosion acts on: the
@@ -567,7 +605,7 @@ try {
     .at(-1) ?? {};
   check("erosion: a contradicted committed claim is recorded", eroded?.justification === false && /no longer holds/.test(String(eroded?.detail)), JSON.stringify(eroded));
   check("erosion: session mode records the authority drop", eroded?.erosion === "authority → ask", JSON.stringify(eroded));
-  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [[]] });
+  const panelCtx = makeCtx({ cwd: CWD, registry: REG, overlay: true, overlays: [() => "open:protection", () => "open:retry", () => "close"] });
   await ext.commands.get("dc").handler("", panelCtx);
   const rows = overlayLog.at(-1)?.options ?? [];
   check("erosion: the panel shows the eroded authority", rows.some((row) => /retry authority: ask \(eroded by a false claim\)/.test(String(row.label))), rows.map((row) => row.label).slice(0, 4).join(" | "));

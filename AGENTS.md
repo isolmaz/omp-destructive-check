@@ -11,7 +11,9 @@ destructive-check.ts   the whole extension (single file, zero dependencies)
 install.mjs            copies the extension into ~/.omp/shared/, writes the manifest, --restore
 tools/dc-audit.mjs     independent audit-log verifier (node:crypto, exit 1 on a broken chain)
 tests/                 stubbed-host suites + real-session e2e + a mutation gate
-README.md              user-facing documentation (keep it in sync with behavior)
+README.md              user-facing overview: levels, coverage, install, docs map (keep it in sync with behavior)
+docs/SETTINGS.md       every configuration key: what it does and why
+docs/REFERENCE.md      deep reference: rules, coverage, UI, audit, runbook, limitations
 ```
 
 Everything the guard needs ships in `destructive-check.ts`: no build step, no imports outside
@@ -62,10 +64,10 @@ re-implements the walk with its own digest so the two agree.
    for a "simpler" counter, and keep `tools/dc-audit.mjs` an independent walk. The previous hash is read
    from the **tail of the file** for every append, never cached in memory: two omp sessions share one
    log, and a cached hash would let the second writer chain onto a line that is no longer last. The
-   append itself is one `open(…, "a")` + one `writeSync` + close (one line cannot be interleaved), and
-   the exclusive `${LOG}.lock` is paid only where a lost race destroys the whole file — rotation and
-   quarantine — because a per-line lock (~280 µs) and `fsync` (~390 µs) each cost more than the entire
-   static budget (see the speed table). A tail that stops mid-line, or whose last line is not a chained
+   append, tail read, rotation and quarantine share one exclusive `${LOG}.lock`. Never read the tail
+   outside that transaction and claim an atomic append makes the chain concurrent-safe. Lock
+   acquisition is bounded; failure retains the decision in session history and reports degraded
+   auditing rather than mutating the file without ownership. A tail that stops mid-line or has an invalid
    entry, is **quarantined** (`<path>.corrupt.<ts>`, kept whole, fresh chain, `degraded` entry) instead
    of being chained onto: a partial read would produce a break no verifier could explain. Command text
    is masked for credentials (`token=`, `api_key:`, `bearer …`) and the file is created `0600` — the log
@@ -143,7 +145,7 @@ node tests/t-llm.mjs           # checker: wire contract, verdicts, failure polic
 node tests/t-menu.mjs          # /dc menu: every setting persists, self-test, escape handling
 node tests/t-coverage.mjs      # script bodies, hub launches, probes, catastrophic class, audit log
 node tests/t-review.mjs        # the external review's findings D01–D23, one block per finding
-node tests/t-isolation.mjs     # deny-ACE mechanics from the README runbook (Windows only)
+node tests/t-isolation.mjs     # deny-ACE mechanics from the docs/REFERENCE.md runbook (Windows only)
 node tests/t-install.mjs       # the installer's pre-install gate and its --skip-tests bypass
 node tests/mutation-check.mjs  # test-quality gate (see below)
 node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cases skip
@@ -160,7 +162,7 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 - **A check must be able to fail.** Before adding one, name the plausible bug it catches. No
   tautologies (`x !== undefined` on a value you just built), no re-asserting the same path across
   modes, no asserting source text or mock echoes.
-- `tests/mutation-check.mjs` enforces that: it breaks the extension in 48 places and requires the
+- `tests/mutation-check.mjs` enforces that: it breaks the extension in 67 places and requires the
   suites to catch every break. **Run it after touching policy or checker code**; a "PATTERN NOT
   FOUND" line means the mutation went stale and the gate fails.
 - The harness **fails closed**: `loadExt`'s default `exec` stub returns exit code 1, so a test that
@@ -185,7 +187,8 @@ git add -A && git commit && git push
 (`--skip-tests` is the deliberate bypass, and `--force` does not skip the gate). `tests/t-install.mjs`
 asserts both halves, so a change to the installer or to the suite list has to keep that contract.
 
-`README.md` documents user-visible behavior; change it in the same commit as the behavior.
+`README.md` and the files under `docs/` document user-visible behavior; change them in the same
+commit as the behavior.
 The `/dc` menu is the only configuration UI users are expected to touch — a new setting needs a menu
 entry, a default in `DEFAULTS`, and a persistence check in `tests/t-menu.mjs`.
 
@@ -264,3 +267,10 @@ entry, a default in `DEFAULTS`, and a persistence check in `tests/t-menu.mjs`.
     line's chain); `/dc → doctor` and `dc_inspect doctor` print the live half (enforcement, integrity,
     lock, chain, checker, child, config, degraded) and must agree with the file half
     (`node tools/dc-audit.mjs doctor`) on the chain verdict and the entry count.
+27. **The panel is measured as raw text and coloured afterwards.** `spec.paint` opts a surface into the
+    host theme (`/dc` and its reports); the approval prompt stays out of it, and a host that hands over
+    no theme gets the plain box with no escape code at all, so the theme is never required. All width
+    math is ANSI-aware (`visibleWidth`/`clipVisible`/`padVisible`) with measurement done on the
+    sanitized raw string *before* the theme touches it — colour must never move the frame. Foreign text
+    goes through `plain()` before it enters a line: the panel never forwards an escape it did not put
+    there itself, and `tests/t-ui.mjs` fails if one gets through.

@@ -92,8 +92,8 @@ const mutations = [
     name: "the menu crashes when a select returns nothing",
     suite: "tests/t-menu.mjs",
     expect: "survives closing the menu",
-    from: 'if (choice === undefined || choice.toLowerCase().startsWith("close")) open = false;',
-    to: 'if (choice.toLowerCase().startsWith("close")) open = false;',
+    from: 'if (answer === undefined || answer === null) return undefined;',
+    to: 'if (answer === undefined || answer === null) return answer.toLowerCase();',
   },
   {
     name: "an unanswered user prompt opens the gate",
@@ -211,8 +211,8 @@ const mutations = [
     name: "decisions stop being appended to the audit log",
     suite: "tests/t-coverage.mjs",
     expect: "audit: a blocked decision is appended to the log file",
-    from: '        nodeFs.writeSync(fd, `${written.line}\\n`);',
-    to: "",
+    from: 'while (offset < bytes.length) {',
+    to: 'while (false && offset < bytes.length) {',
   },
   {
     name: "a read-only directory no longer narrows the scope",
@@ -436,6 +436,13 @@ const mutations = [
     suite: "tests/t-llm.mjs",
     expect: "retry: an unknown decision value is not a verdict",
     from: "  if (decision !== \"allow\" && decision !== \"block\") return null;",
+    to: "  if (false) return null;",
+  },
+  {
+    name: "an allow without a reason reaches the caller",
+    suite: "tests/t-llm.mjs",
+    expect: "retry: an allow without a reason is not a verdict",
+    from: "  if (!reason) return null;",
     to: "  if (false) return null;",
   },
   {
