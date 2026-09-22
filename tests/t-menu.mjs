@@ -344,6 +344,51 @@ async function menu({ config = cfg(), selections = [], inputs = [], hasUI = true
   check("/dc status lists the rejected config keys", /rejected keys/.test(text) && /modes: unknown key/.test(text), text.slice(0, 400));
 }
 
+// ------------------------------------------------------ new settings (S5) ---
+{
+  // Every new setting is a menu entry + a DEFAULTS key + a persistence check.
+  const { config } = await menu({ selections: [pick("deny & abort:"), pick("close")] });
+  check("/dc turns deny-and-abort on and persists it", config.ui?.denyAbort === true, JSON.stringify(config.ui));
+  const off = await menu({ config: cfg({ ui: { denyAbort: true } }), selections: [pick("deny & abort:"), pick("close")] });
+  check("/dc turns deny-and-abort off again", off.config.ui?.denyAbort === false, JSON.stringify(off.config.ui));
+}
+{
+  const { config } = await menu({ selections: [pick("session context:"), pick("close")] });
+  check("/dc turns the session context block on and persists it", config.checker?.includeContext === true, JSON.stringify(config.checker));
+  const capped = await menu({ selections: [pick("context cap:"), pick("close")] });
+  check("/dc cycles the context cap", capped.config.checker?.contextMaxChars === 1200, JSON.stringify(capped.config.checker));
+}
+{
+  const { config } = await menu({ selections: [pick("read-only dirs:"), exact("add a read-only directory"), pick("close")], inputs: ["D:\\archive"] });
+  check("/dc stores a read-only directory", config.readOnlyDirs?.[0] === "D:\\archive", JSON.stringify(config.readOnlyDirs));
+  const guard = await loadExt({ home: HOME, config, registry: REG });
+  const inside = await callTool(guard, bash("rm -rf D:\\archive\\old"), makeCtx({ cwd: CWD, registry: REG }));
+  check("the read-only directory narrows the scope for a real decision", inside?.block === true && /rule: outsideDelete/.test(String(inside?.reason ?? "")), String(inside?.reason ?? "").slice(0, 200));
+  const cleared = await menu({ config, selections: [pick("read-only dirs:"), pick("clear the list"), pick("close")] });
+  check("/dc clears the read-only directories", (cleared.config.readOnlyDirs ?? []).length === 0, JSON.stringify(cleared.config.readOnlyDirs));
+}
+{
+  // The doctor is the one screen the whole stage exists for: it has to be one
+  // keypress away and it has to say what is enforced, not just which mode is set.
+  const { confirms, error } = await menu({ selections: [pick("doctor"), pick("close")] });
+  const text = confirms.join("\n");
+  check("/dc opens the doctor", /enforcement/.test(text) && /audit/.test(text) && /degraded/.test(text), text.slice(0, 300));
+  check("/dc doctor names what is enforced", /enforced: \d+ block rule/.test(text), text.slice(0, 300));
+  check("/dc doctor does not throw", !error, String(error));
+}
+{
+  // The panel is the other surface: every new row has to be there and explain
+  // itself (dialogDefects covers the description half).
+  const { config } = await menu({ overlay: true, overlays: [[]] });
+  const rows = overlayLog.at(-1)?.options ?? [];
+  const label = (prefix) => rows.find((row) => String(row.label ?? "").startsWith(prefix));
+  check("the panel carries the deny-and-abort row", Boolean(label("deny & abort:")), rows.map((r) => r.label).join(" | ").slice(0, 200));
+  check("the panel carries the session-context rows", Boolean(label("session context:")) && Boolean(label("context cap:")), rows.length);
+  check("the panel carries the read-only dirs row", Boolean(label("read-only dirs:")), rows.length);
+  check("the panel carries the doctor row", Boolean(label("run the doctor")), rows.length);
+  check("the panel pass writes nothing when no row is chosen", JSON.stringify(config) === JSON.stringify(cfg()), JSON.stringify(config).slice(0, 160));
+}
+
 // ------------------------------------------------------------- explanations --
 {
   // Dialogue coverage is asserted by every suite that opens one; this one walks

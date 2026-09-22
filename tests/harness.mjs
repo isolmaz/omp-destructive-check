@@ -64,7 +64,7 @@ export function dialogDefects() {
 let seq = 0;
 
 // ------------------------------------------------------------------ loader --
-export async function loadExt({ home, config, registry, exec, extPath } = {}) {
+export async function loadExt({ home, config, registry, exec, spawn, extPath } = {}) {
   fs.mkdirSync(path.join(home, ".omp"), { recursive: true });
   const configPath = path.join(home, ".omp", "destructive-check.json");
   fs.writeFileSync(configPath, JSON.stringify(config ?? {}, null, 2));
@@ -81,6 +81,7 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
   const commands = new Map();
   const tools = new Map();
   const execCalls = [];
+  const spawnCalls = [];
   const pi = {
     on(event, handler) {
       if (!handlers.has(event)) handlers.set(event, []);
@@ -110,6 +111,15 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
       // exec stub to test the CLI engine.
       return { stdout: "", stderr: "dc-test: no CLI checker stub installed", code: 1, killed: false };
     },
+    // The persistent CLI checker child. A host that owns its process table may
+    // provide one, and this is where a test provides a stub: without it the guard
+    // falls back to the one-shot `exec` path (which is the fail-closed default
+    // above), so no suite ever spawns a real process by accident.
+    spawnChild(cmd, args, opts) {
+      spawnCalls.push({ cmd, args, opts });
+      if (spawn) return spawn(cmd, args, opts);
+      throw new Error("dc-test: no CLI checker child stub installed");
+    },
     pi: {
     },
     logger: { debug() {}, info() {}, warn() {}, error() {} },
@@ -121,6 +131,7 @@ export async function loadExt({ home, config, registry, exec, extPath } = {}) {
     commands,
     tools,
     execCalls,
+    spawnCalls,
     configPath,
     toolCall: handlers.get("tool_call")?.[0],
     readConfig: () => JSON.parse(fs.readFileSync(configPath, "utf8")),
@@ -147,6 +158,9 @@ export function fakeRegistry(entries) {
 export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry = null, branch = [], sessionId = "", overlay = false, overlays = [], custom = null } = {}) {
   const notes = [];
   const statuses = [];
+  // `ctx.abort()` is the host's "stop this turn" switch: the deny-and-abort
+  // setting pulls it, so the stub counts the pulls instead of guessing.
+  const control = { aborted: 0 };
   const ui = {
     notify: (message, level) => notes.push({ message, level }),
     setStatus: (key, text) => statuses.push({ key, text }),
@@ -207,6 +221,10 @@ export function makeCtx({ cwd, hasUI = true, selects = [], inputs = [], registry
     ui,
     notes,
     statuses,
+    control,
+    abort: () => {
+      control.aborted += 1;
+    },
     hasUI,
     cwd,
     modelRegistry: registry,

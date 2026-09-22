@@ -639,7 +639,8 @@ try {
   const status = String((await call("status"))?.content?.[0]?.text ?? "");
   check("dc_inspect status: reports the live policy", /enabled: yes/.test(status) && /mode: medium/.test(status) && /two-stage/.test(status), status.slice(0, 200));
   const explained = String((await call("explain rm -rf /etc"))?.content?.[0]?.text ?? "");
-  check("dc_inspect explain: re-runs the static layers only", /systemTarget/.test(explained) && /decision: block/.test(explained), explained.slice(0, 240));
+  check("dc_inspect explain: re-runs the static layers only", /systemTarget/.test(explained) && /action: block/.test(explained), explained.slice(0, 240));
+  check("dc_inspect explain: names the layer, the rule and the scope", /layer: static-deny · rule: systemTarget/.test(explained) && /scope: .*proj/.test(explained), explained.slice(0, 240));
   check("dc_inspect explain: says whether the read-only class covers it", /read-only class: no/.test(explained), explained.slice(0, 240));
   const readOnlyExplain = String((await call("explain ls -la"))?.content?.[0]?.text ?? "");
   check("dc_inspect explain: recognizes a read-only command", /read-only class: yes/.test(readOnlyExplain), readOnlyExplain.slice(0, 240));
@@ -728,6 +729,186 @@ try {
   check("unreadTarget: a partial or failed read is not a read", partialWrite?.block === true, JSON.stringify(partialWrite));
   const newFile = await callTool(ext, { toolName: "write", input: { path: path.join(PROJ, "src", "brand-new.js"), content: "// n\n" } }, ask());
   check("unreadTarget: creating a file is not a rewrite of something unseen", newFile === undefined, JSON.stringify(newFile));
+}
+
+// ------------------------------------------------- audit durability (S5) ---
+// The log is a record two sessions share: the append is one write on an appending
+// handle, the file-moving parts (rotation, quarantine) are the only ones that take
+// a lock, and a tail this process must not extend is moved aside whole instead of
+// being chained onto.
+{
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "hard" }), registry: REG });
+  const ctx = makeCtx({ cwd: PROJ, registry: REG, hasUI: false });
+  stubFetch();
+  await callTool(ext, cmd("rm -rf src"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("audit: the lock is released after a decision", !fs.existsSync(`${LOG}.lock`), "a .lock file was left behind");
+  const last = JSON.stringify(readLog().at(-1) ?? {});
+  const entry = JSON.parse(last);
+  check("audit: the decision carries the machine-readable trace fields", entry.ruleId === "insideDelete" && entry.layer === "static-deny" && entry.layer !== undefined, JSON.stringify({ ruleId: entry.ruleId, layer: entry.layer }));
+  check("audit: the decision carries the scope it was taken against", /proj/.test(String(entry.scope ?? "")), String(entry.scope));
+
+  // Rotation is the move that needs exclusivity: the previous .1 is replaced, the
+  // new file starts a fresh chain, and nothing is written through the lock.
+  fs.writeFileSync(LOG, `${"x".repeat(4096)}\n`.repeat(1300));
+  await callTool(ext, cmd("rm -rf src"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("audit: a full log rotates to .1 and keeps the record", fs.existsSync(`${LOG}.1`), "no rotated file");
+  const fresh = fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean);
+  check("audit: the first line after rotation starts a fresh chain", JSON.parse(String(fresh[0] ?? "{}")).prev === "" && fresh.length === 1, JSON.stringify(fresh.length));
+  check("audit: rotation leaves no lock behind", !fs.existsSync(`${LOG}.lock`), "a .lock file was left behind");
+
+  // A tail that stops mid-line is a file this process must not extend: chaining
+  // onto the entry before it would produce a chain no verifier could explain.
+  fs.appendFileSync(LOG, '{"ts":"2026-01-01T00:00:00.000Z","rule":"insideDelete","act');
+  await callTool(ext, cmd("rm -rf src"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  const quarantined = fs.readdirSync(path.dirname(LOG)).filter((name) => name.includes(".corrupt."));
+  check("audit: a half-written tail is quarantined instead of extended", quarantined.length === 1, JSON.stringify(quarantined));
+  const afterQuarantine = fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean);
+  check("audit: the chain starts cold after a quarantine", afterQuarantine.length === 1 && JSON.parse(String(afterQuarantine[0] ?? "{}")).prev === "", JSON.stringify(afterQuarantine.slice(0, 1)));
+  const walk = cliAuditJson(["--file", LOG, "--json"]);
+  check("audit: the independent walker agrees the new chain is intact", walk.ok === true, JSON.stringify(walk).slice(0, 200));
+}
+
+// --------------------------------------------------- outcome linking (S5) ---
+// Whether a blocked call actually ran is an observation the guard can only make
+// later, and it is written as its own chained entry linked to the decision.
+{
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "hard" }), registry: REG });
+  stubFetch();
+  const toolResult = ext.handlers.get("tool_result")?.[0];
+  const blocked = await callTool(ext, cmd("rm -rf src"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("outcome: the call is blocked first", blocked?.block === true, JSON.stringify(blocked));
+  const grepLines = readLog;
+  const before = grepLines().length;
+  await toolResult({ toolName: "bash", input: { command: "rm -rf src" }, isError: false }, makeCtx({ cwd: PROJ, registry: REG }));
+  const entries = grepLines();
+  const outcome = entries[entries.length - 1] ?? {};
+  check("outcome: a blocked call that comes back through a tool result is recorded", entries.length === before + 1 && outcome.action === "outcome" && outcome.outcome === "ran", JSON.stringify(outcome));
+  const blockLine = entries.find((e) => e?.action === "block");
+  check("outcome: the outcome entry links to the decision line it belongs to", outcome.link === blockLine?.chain, JSON.stringify({ link: outcome.link, chain: blockLine?.chain }));
+  check("outcome: the log's chain is still intact with the link in it", cliAuditJson(["--file", LOG, "--json"]).ok === true, "chain broken");
+  const again = await toolResult({ toolName: "bash", input: { command: "rm -rf src" }, isError: false }, makeCtx({ cwd: PROJ, registry: REG }));
+  check("outcome: one block links one outcome, not a line per tool result", grepLines().length === entries.length, `again=${again}`);
+}
+
+// ------------------------------------------------------------- degraded -----
+// What the guard could not enforce in this session, named where the user and the
+// agent can both read it — a channel that is off is a channel the user thinks is on.
+{
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "hard", coverage: { bash: true, eval: false, fileTools: true, processes: true } }), registry: REG });
+  const tool = ext.tools.get("dc_inspect");
+  const call = (command) => tool.execute("t", { command }, undefined, undefined, makeCtx({ cwd: PROJ, registry: REG }));
+  const status = String((await call("status"))?.content?.[0]?.text ?? "");
+  check("degraded: a channel that is off is reported as not enforced", /coverage\.eval/.test(status) && /not judged/.test(status), status.slice(-220));
+  const statusJson = JSON.parse(String((await call("status --json"))?.content?.[0]?.text ?? "{}"));
+  check("degraded: the JSON status carries the list as objects", Array.isArray(statusJson.degraded) && statusJson.degraded.some((entry) => entry.code === "coverage.eval"), JSON.stringify(statusJson.degraded).slice(0, 200));
+  const hubResult = await callTool(ext, { toolName: "hub", input: { op: "restart", name: "web" } }, makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("degraded: an unparsable hub payload is still a block", hubResult?.block === true, JSON.stringify(hubResult));
+  const after = String((await call("status"))?.content?.[0]?.text ?? "");
+  check("degraded: the hub payload appears in the live list", /hub-payload/.test(after), after.slice(-200));
+  const lines = readLog();
+  check("degraded: the audit line says what the session could not enforce", lines.some((entry) => /coverage\.eval/.test(String(entry?.degraded ?? ""))), JSON.stringify(lines.slice(-3).map((e) => e?.degraded ?? null)));
+}
+
+// ------------------------------------------------------------- doctor -------
+// One screen for the live half, and the file half has to agree with it: the chain
+// verdict and the entry count are the two the two implementations overlap on.
+{
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "medium" }), registry: REG });
+  const tool = ext.tools.get("dc_inspect");
+  const call = (command) => tool.execute("t", { command }, undefined, undefined, makeCtx({ cwd: PROJ, registry: REG }));
+  const text = String((await call("doctor"))?.content?.[0]?.text ?? "");
+  for (const needle of ["enforcement", "integrity", "lock", "audit", "checker child", "config", "rejected keys", "degraded", "node tools/dc-audit.mjs doctor"]) {
+    check(`doctor: the report shows ${needle}`, text.includes(needle), text.slice(0, 300));
+  }
+  const json = JSON.parse(String((await call("doctor --json"))?.content?.[0]?.text ?? "{}"));
+  const fileHalf = cliAuditJson(["doctor", "--home", HOME, "--json"]);
+  check("doctor: the live half and the file half agree on the chain", json.audit.chain.toLowerCase() === String(fileHalf.file.chain).toLowerCase(), JSON.stringify({ live: json.audit.chain, file: fileHalf.file.chain }));
+  check("doctor: the live half and the file half agree on the entry count", json.audit.entries === fileHalf.file.entries, JSON.stringify({ live: json.audit.entries, file: fileHalf.file.entries }));
+  check("doctor: the report names what is enforced, not only the mode", /enforced: \d+ block rule/.test(json.enforcement), json.enforcement);
+}
+
+// ------------------------------------------------------- explain --json -----
+// The decision trace as an object: the same fields the audit line carries, so a CI
+// consumer and the log cannot drift apart.
+{
+  const policyFile = path.join(PROJ, ".omp", "destructive-check.json");
+  fs.mkdirSync(path.dirname(policyFile), { recursive: true });
+  fs.writeFileSync(policyFile, JSON.stringify({ denyPatterns: ["terraform\\s+destroy"] }, null, 2));
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "medium" }), registry: REG });
+  const tool = ext.tools.get("dc_inspect");
+  const call = (command) => tool.execute("t", { command }, undefined, undefined, makeCtx({ cwd: PROJ, registry: REG }));
+  const before = fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean).length;
+  const trace = JSON.parse(String((await call("explain terraform destroy --json"))?.content?.[0]?.text ?? "{}"));
+  for (const key of ["rule", "layer", "action", "matchedPattern", "cwd", "scope", "degraded", "ms"]) {
+    check(`explain --json: carries ${key}`, Object.prototype.hasOwnProperty.call(trace, key), JSON.stringify(trace).slice(0, 240));
+  }
+  check("explain --json: names the rule and the layer that fired", trace.rule === "projectDeny" && trace.layer === "static-deny", JSON.stringify(trace).slice(0, 240));
+  check("explain --json: names the policy pattern that matched", trace.matchedPattern === "terraform\\s+destroy", String(trace.matchedPattern));
+  check("explain --json: the analysis is measured", typeof trace.ms === "number" && trace.ms >= 0, String(trace.ms));
+  check("explain --json: never writes an audit line", fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean).length === before, "the explain path logged");
+  const recent = JSON.parse(String((await call("recent 5 --json"))?.content?.[0]?.text ?? "[]"));
+  check("recent --json: one object per decision with the trace fields", Array.isArray(recent) && recent.length > 0 && recent.every((entry) => "layer" in entry && "ruleId" in entry && "action" in entry), JSON.stringify(recent.slice(0, 1)).slice(0, 240));
+  fs.rmSync(policyFile, { force: true });
+}
+
+// A mutation that stops the log from being written must show up as failed checks,
+// not as a crash: the suite reads the log through here, and an unreadable or empty
+// file is an empty list.
+function readLog() {
+  try {
+    const lines = fs.readFileSync(LOG, "utf8").trim().split("\n").filter(Boolean);
+    const out = [];
+    for (const line of lines) {
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+        // A line this reader cannot parse is a finding, not a crash: the checks
+        // below decide what it means.
+        out.push(null);
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+// The CLI tool exits 1 when the report is unhealthy (a scratch home has no
+// installed guard), so its stdout is what the agreement test reads, not its code.
+function cliAuditJson(args) {
+  try {
+    return JSON.parse(execFileSync(process.execPath, [AUDIT, ...args], { encoding: "utf8" }));
+  } catch (err) {
+    return JSON.parse(String(err.stdout ?? "{}"));
+  }
+}
+
+// ------------------------------------------------- config freshness (S5) ----
+// The policy is re-read without a restart, but not on every call: the stamp is
+// checked at most once per TTL, and forced at the two moments the user is looking
+// (`session_start` and every /dc open). Both halves matter — a guard that never
+// re-reads is a guard that runs yesterday's policy, and a guard that stats on every
+// call is the regression this stage exists to fix.
+{
+  const configFile = path.join(HOME, ".omp", "destructive-check.json");
+  const ext = await loadExt({ home: HOME, config: cfg({ mode: "medium" }), registry: REG });
+  stubFetch();
+  const write = (mode) => fs.writeFileSync(configFile, JSON.stringify(cfg({ mode }), null, 2));
+  // A hand-edited file is picked up by the next decision (the module never read
+  // the stamp before), and the mode it names is the mode that decides. The command
+  // is one only the readonly gate has an opinion about, so the mode is the only
+  // thing the assertion can be reading.
+  write("readonly");
+  const inside = await callTool(ext, cmd("mkdir -p a1"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("freshness: a hand-edited policy takes effect without a restart", inside?.block === true && /rule: readonlyMutation/.test(String(inside?.reason ?? "")), String(inside?.reason ?? "").slice(0, 200));
+  // Inside the TTL the running snapshot stands: the second edit is not seen yet.
+  write("medium");
+  const immediate = await callTool(ext, cmd("mkdir -p a2"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("freshness: within the TTL the running snapshot stands", immediate?.block === true && /rule: readonlyMutation/.test(String(immediate?.reason ?? "")), String(immediate?.reason ?? "").slice(0, 200));
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const later = await callTool(ext, cmd("mkdir -p a3"), makeCtx({ cwd: PROJ, registry: REG, hasUI: false }));
+  check("freshness: the next check after the TTL reads the file again", later === undefined, JSON.stringify(later));
+  write("hard");
 }
 
 const bad = report("coverage");

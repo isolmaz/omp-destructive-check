@@ -680,6 +680,54 @@ for (const command of ["ls -la", "npm test", 'grep -rn "rm -rf" src/', 'git comm
   check("guardSelf: the audit log directory is not claimed by the rule", !/rule: guardSelf/.test(String(other.result?.reason ?? "")), String(other.result?.reason ?? "").slice(0, 200));
 }
 
+// ------------------------------------------------------------ readOnlyDirs ---
+// The read-only list is the other claim about the filesystem: a delete or a write
+// inside one is outside the project whatever the allowed dirs say, so the entry can
+// only ever narrow the scope. The two cases that would show a widening bug are an
+// entry that overlaps an allowDirs entry, and an artifact name inside one.
+{
+  const shared = path.join(HOME, "shared");
+  const archive = path.join(shared, "archive");
+  fs.mkdirSync(path.join(archive, "node_modules"), { recursive: true });
+  const base = { mode: "custom", rules: { insideDelete: "allow", artifactDelete: "allow", outsideDelete: "block", outsideWrite: "block" }, allowDirs: [shared] };
+  const inside = await run(cmd(`rm -rf "${shared}\\work"`), { config: cfg(base) });
+  check("readOnlyDirs: without the entry, an allowed dir is inside the project", inside.result === undefined, JSON.stringify(inside.result));
+  const narrowed = await run(cmd(`rm -rf "${archive}\\old"`), { config: cfg({ ...base, readOnlyDirs: [archive] }) });
+  check("readOnlyDirs: a delete inside a read-only dir is outside the project", narrowed.blocked && /rule: outsideDelete/.test(String(narrowed.result?.reason ?? "")), String(narrowed.result?.reason ?? "").slice(0, 240));
+  const artifact = await run(cmd(`rm -rf "${archive}\\node_modules"`), { config: cfg({ ...base, readOnlyDirs: [archive] }) });
+  check("readOnlyDirs: an artifact name inside a read-only dir is not an artifact allow", artifact.blocked && /rule: outsideDelete/.test(String(artifact.result?.reason ?? "")), String(artifact.result?.reason ?? "").slice(0, 240));
+  const wrote = await run({ toolName: "write", input: { path: path.join(archive, "notes.txt"), content: "x" } }, { config: cfg({ ...base, readOnlyDirs: [archive] }) });
+  check("readOnlyDirs: a write inside a read-only dir is outside the project", wrote.result === undefined || wrote.blocked === true, JSON.stringify(wrote.result));
+  const readOnlyCommand = await run(cmd(`ls -la "${archive}"`), { config: cfg({ ...base, readOnlyDirs: [archive] }) });
+  check("readOnlyDirs: reading a read-only dir stays free", readOnlyCommand.result === undefined && readOnlyCommand.completions === 0, JSON.stringify(readOnlyCommand.result));
+  const refusedCfg = cfg({ ...base, readOnlyDirs: ["C:\\", "D:\\data"] });
+  const refusedExt = await loadExt({ home: HOME, config: refusedCfg, registry: REG });
+  const refusedCtx = makeCtx({ cwd: CWD, hasUI: false, registry: REG });
+  await refusedExt.commands.get("dc").handler("", refusedCtx);
+  const status = refusedCtx.notes.map((n) => n.message).join("\n");
+  check("readOnlyDirs: a refused entry is reported with its reason, not applied silently", /readOnly refused/.test(status) && /filesystem root is never project scope/.test(status), status.slice(0, 400));
+  check("readOnlyDirs: the accepted entry is listed apart from the refused one", /readOnly dirs: D:\\data/.test(status) && !/readOnly dirs: C:/.test(status), status.slice(0, 400));
+}
+
+// ------------------------------------------------------- near-miss reasons ---
+// A block says what would have allowed the call, in the same shape it has always
+// had: the rule, the target and the "what next" sentence are untouched.
+{
+  const line = (result) => String(result?.reason ?? "");
+  const outside = await run(cmd("rm -rf C:\\other\\project\\data"), { config: cfg({ mode: "medium" }) });
+  check("near miss: an outside delete names the scope that would have allowed it", /Near miss: the target is outside every project root/.test(line(outside.result)) && /allowDirs/.test(line(outside.result)), line(outside.result).slice(0, 300));
+  check("near miss: the block still ends with the retry contract", /\(mode: medium, rule: outsideDelete\)/.test(line(outside.result)) && /Do not attempt it through another tool\.$/.test(line(outside.result)), line(outside.result).slice(-160));
+  // A file that exists on disk and was never read: the alternative that would have
+  // allowed it is naming it and reading it first.
+  const unseen = path.join(HOME, "data", "never-seen.txt");
+  fs.mkdirSync(path.dirname(unseen), { recursive: true });
+  fs.writeFileSync(unseen, "old\n");
+  const unread = await run({ toolName: "write", input: { path: unseen, content: "new\n" } }, { config: cfg({ mode: "custom", rules: { unreadTarget: "block" } }) });
+  check("near miss: the read-before-write block says reading it first would clear it", /rule: unreadTarget/.test(line(unread.result)) && /reading the file first/.test(line(unread.result)), line(unread.result).slice(0, 300));
+  const exempt = await run(cmd("rm -rf /etc/passwd"), { config: cfg({ mode: "medium" }) });
+  check("near miss: an exempt rule carries no alternative", !/Near miss/.test(line(exempt.result)) && /rule: systemTarget/.test(line(exempt.result)), line(exempt.result).slice(0, 240));
+}
+
 const bad = report("policy modes");
 process.exitCode = bad ? 1 : 0;
 void results;

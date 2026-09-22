@@ -16,6 +16,7 @@ import {
   fetchResponse,
   selectLog,
   confirmLog,
+  checkerRequests,
   overlayLog,
   widgetLog,
   dialogDefects,
@@ -489,6 +490,35 @@ const text = (entry) => (entry?.lines ?? []).join("\n");
   const defects = dialogDefects();
   check("every dialogue exercised here explains its options", defects.length === 0, defects.slice(0, 8).join(" | "));
   check("the pop-up surface was actually exercised", overlayLog.length > 8, `overlays=${overlayLog.length}`);
+}
+
+// ------------------------------------------------- deny & abort (S5) -------
+// `ui.denyAbort` is a setting, not a fourth button: the deny answer keeps its
+// meaning and also aborts the turn and holds the hard preset until /dc is opened.
+{
+  const denied = await run({ config: cfg({ ui: { denyAbort: true } }), command: "git reset --hard", handler: () => deny("uncommitted work"), overlays: [["d"]] });
+  check("deny & abort: the deny answer stops the turn", denied.ctx.control.aborted === 1, JSON.stringify(denied.ctx.control));
+  check("deny & abort: the denial is still the decision", denied.blocked === true, JSON.stringify(denied.result));
+  check("deny & abort: the status line says the guard is hard now", denied.ctx.statuses.some((s) => /hard \(lockdown\)/.test(String(s.text))), JSON.stringify(denied.ctx.statuses).slice(0, 240));
+  // The lockdown is a hard overlay: a git command that medium escalates to the
+  // checker is now a block that costs no request at all. A *different* command
+  // (the first one is an operation with a spent attempt, which the loop would
+  // hard-block whatever the policy says).
+  const calls = checkerRequests().length;
+  const after = await callTool(denied.ext, bash("git clean -fd", "clean up history"), makeCtx({ cwd: CWD, registry: REG, hasUI: false }));
+  check("deny & abort: the hard preset is the floor until /dc is opened", after?.block === true && /\(mode: medium → hard \(lockdown\), rule: gitDestructive\)/.test(String(after?.reason ?? "")) && checkerRequests().length === calls, `${String(after?.reason ?? "").slice(0, 160)} requests=${checkerRequests().length - calls}`);
+  // Opening /dc is the release, and it is the only one.
+  await denied.ext.commands.get("dc").handler("", denied.ctx);
+  const status = denied.ctx.notes.map((n) => n.message).join("\n");
+  check("deny & abort: opening /dc lifts the lockdown", /lockdown lifted/.test(status), status.slice(0, 240));
+  check("deny & abort: the status line is back to the ordinary mode", denied.ctx.statuses.some((s) => String(s.text) === "dc: medium"), JSON.stringify(denied.ctx.statuses).slice(0, 240));
+  const relaxed = await run({ config: cfg({ ui: { denyAbort: true } }), command: "git reset --hard", handler: () => ok("ALLOW: the agent's own branch") });
+  check("deny & abort: after the release the ordinary policy runs again", relaxed.blocked === false, JSON.stringify(relaxed.result));
+  // Off by default: a deny must not abort the turn of a user who did not ask for it.
+  const plain = await run({ config: cfg(), command: "git reset --hard", handler: () => deny("uncommitted work"), overlays: [["d"]] });
+  check("deny & abort: off by default, a deny only refuses", plain.blocked === true && plain.ctx.control.aborted === 0, JSON.stringify(plain.ctx.control));
+  const escape = await run({ config: cfg({ ui: { denyAbort: true } }), command: "git reset --hard", handler: () => deny("uncommitted work"), overlays: [["\u001b"]] });
+  check("deny & abort: Escape is the deny answer and aborts too", escape.blocked === true && escape.ctx.control.aborted === 1, JSON.stringify(escape.ctx.control));
 }
 
 const bad = report("pop-up UI");

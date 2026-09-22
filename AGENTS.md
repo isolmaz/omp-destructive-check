@@ -15,9 +15,11 @@ README.md              user-facing documentation (keep it in sync with behavior)
 ```
 
 Everything the guard needs ships in `destructive-check.ts`: no build step, no imports outside
-`node:fs` / `node:path` / `node:os` / `node:crypto` / `node:url`. Keep it that way — the file is copied
-verbatim into `~/.omp/shared/` and loaded by every omp profile. The audit chain uses `node:crypto`'s
-SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so the two agree.
+`node:fs` / `node:path` / `node:os` / `node:crypto` / `node:url` — plus `node:child_process`, which
+exists for exactly one thing and is imported for it: the persistent `omp --mode rpc` checker child on
+the CLI path (invariant 22). Keep it that way — the file is copied verbatim into `~/.omp/shared/` and
+loaded by every omp profile. The audit chain uses `node:crypto`'s SHA-256, and `tools/dc-audit.mjs`
+re-implements the walk with its own digest so the two agree.
 
 ## Invariants (change these only with evidence)
 
@@ -59,9 +61,15 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
    failed. The chain (`prev` + `chain` per line, SHA-256) is what makes an edit visible; do not trade it
    for a "simpler" counter, and keep `tools/dc-audit.mjs` an independent walk. The previous hash is read
    from the **tail of the file** for every append, never cached in memory: two omp sessions share one
-   log, and a cached hash would let the second writer chain onto a line that is no longer last. Command
-   text is masked for credentials (`token=`, `api_key:`, `bearer …`) and the file is created `0600` —
-   the log records the decision, not the secret.
+   log, and a cached hash would let the second writer chain onto a line that is no longer last. The
+   append itself is one `open(…, "a")` + one `writeSync` + close (one line cannot be interleaved), and
+   the exclusive `${LOG}.lock` is paid only where a lost race destroys the whole file — rotation and
+   quarantine — because a per-line lock (~280 µs) and `fsync` (~390 µs) each cost more than the entire
+   static budget (see the speed table). A tail that stops mid-line, or whose last line is not a chained
+   entry, is **quarantined** (`<path>.corrupt.<ts>`, kept whole, fresh chain, `degraded` entry) instead
+   of being chained onto: a partial read would produce a break no verifier could explain. Command text
+   is masked for credentials (`token=`, `api_key:`, `bearer …`) and the file is created `0600` — the log
+   records the decision, not the secret.
 9. **Integrity is about the file that is running.** `guardIntegrity()` hashes the loaded copy
    (`import.meta.url`) against the manifest next to *it*; the shared install directory is a layout, not
    an assumption. A copy with no manifest beside it is `unmanaged` — never `ok` by comparing against a
@@ -80,7 +88,8 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
    `dc: <mode>` and decisions append `· blocked · <rule label>`. Integrity, lock state and the audit
    path belong in `/dc → status`, not on that line.
 14. **Block reasons stay structured**: `destructive-check: <what> (mode: …, rule: …) — <detail>` plus
-    the "do not retry this through another tool" sentence. Tests and users match on that shape.
+    the "do not retry this through another tool" sentence, and — where a rule has one — the near-miss
+   sentence between them (25). Tests and users match on that shape.
     For a rule that is not exempt the block ends with the retry invitation instead of the flat refusal —
     that sentence *is* how the loop is announced, so it is part of the contract too.
 15. **The second chance is bounded and recorded.** `guardSelf`, `catastrophic`, `systemTarget` and
@@ -96,9 +105,11 @@ SHA-256, and `tools/dc-audit.mjs` re-implements the walk with its own digest so 
 
 ## Checker wiring (the parts that actually bite)
 
-- Requests go out as plain `fetch` — no pi-ai RPC, no subprocess, no agent session. OpenAI-compatible
+- Requests go out as plain `fetch` — no pi-ai RPC, no extra process, no agent session. OpenAI-compatible
   (`openai-completions`, `openrouter`) and Anthropic Messages are spoken natively; anything else
-  (Gemini CLI OAuth, Codex, Cursor) routes to the CLI engine via `engine: "auto"`.
+  (Gemini CLI OAuth, Codex, Cursor) routes to the CLI engine via `engine: "auto"`, which is the one
+  persistent `omp --mode rpc` child (invariant 22) with a one-shot `omp -p` run as its documented
+  fallback.
 - **OpenCode-style gateways require `x-opencode-session`.** Without it they answer
   `400 MissingSessionID` and every check silently pays for a CLI run (measured 8.6 s vs 1.7-3.0 s).
   The client also sends `user-agent`. An unknown gateway gets exactly one retry with a session id.
@@ -215,10 +226,41 @@ entry, a default in `DEFAULTS`, and a persistence check in `tests/t-menu.mjs`.
     reactive half; this is the half that stops the write from happening at all.
 
 21. **The policy is re-read, and one budget covers one decision.** The config is reloaded on
-    `session_start` (a child session must not run the parent's snapshot) and re-stat'ed by
-    mtime+size before every decision, so an edited file takes effect without a restart; writes go
-    through a temporary file and a rename, every key is validated against its type/enum with the
-    default kept on an invalid value, and the rejected keys are listed in `/dc → status`. The
-    two-stage checker (`checker.twoStage`) runs a one-digit pre-filter and then the detailed call
-    inside the **same** `timeoutMs` budget the single request always had: a fast stage that answers
-    anything other than `0`/`1` is a checker failure (invariant 1), never an allow.
+    `session_start` (a child session must not run the parent's snapshot) and re-stat'ed by mtime+size
+    before a decision — **at most once per second** (`FRESHNESS_TTL_MS`), because a `statSync` per call
+    was the whole static-path regression (measured: 930 µs → 1464 µs on the heaviest case, against a
+    +500 µs budget). `session_start` and every `/dc` open force it, so the two moments a human is
+    looking are always current; a hand-edited file is otherwise picked up by the next check after the
+    second it was saved. Writes go through a temporary file and a rename, every key is validated against
+    its type/enum with the default kept on an invalid value, and the rejected keys are listed in
+    `/dc → status`. The two-stage checker (`checker.twoStage`) runs a one-digit pre-filter and then the
+    detailed call inside the **same** `timeoutMs` budget the single request always had: a fast stage that
+    answers anything other than `0`/`1` is a checker failure (invariant 1), never an allow.
+22. **One subprocess, and only for the CLI checker.** The persistent `omp --mode rpc` child is the only
+    process this extension ever owns: started lazily on the first CLI check, one prompt frame per check,
+    the assistant's `text_delta` frames are the verdict (a `thinking_delta` never is), killed on
+    `session_shutdown`, idle-reaped after two minutes, and a decision that runs out of its `timeoutMs`
+    forwards `{"type":"abort"}` and drops the child. Any failure to get an answer travels the ordinary
+    failure policy after **one** `omp -p` fallback inside the remaining budget (never a restarted clock)
+    and is recorded in `degraded`. A host that owns its process table may take over the spawn
+    (`EXT_PI.spawnChild`); no test may ever spawn a real process.
+23. **The action is never trimmed.** `maxCommandChars` may cap the command text and
+    `maxPromptChars` may trim the rule lines, the intent and the session-context block, but a request
+    whose *action line* does not fit the budget is a checker failure (ask, or block with that text) —
+    never a verdict on a clipped command the agent did not write. The fast stage is skipped rather than
+    asked about an action it cannot see, because its `0` is an allow.
+24. **Read-only scope only narrows.** `readOnlyDirs` maps a target to the *outside* class before the
+    artifact/inside branches, so an entry can only ever move a target from inside/artifact to outside:
+    it cannot widen the delete/write scope, it overrides an overlapping `allowDirs` entry, and it keeps
+    an artifact name inside it away from the artifact allow. Entries are validated exactly like
+    `allowDirs` entries (root, home, system tree refused and reported).
+25. **A block reason may add a near miss, never a new shape.** The near-miss sentence ("what would have
+    allowed this call") is appended between the detail and the "what to do next" sentence, so
+    `<what> (mode: …, rule: …) — <detail>. <near miss> <what next>` still matches; it names policy facts
+    (a scope root, a rule class, the read-before-write rule) and the exempt floor carries none.
+26. **Every decision carries its trace, and the diagnostics must agree.** Each audit line names
+    `ruleId`, `layer`, `scope` and the `degraded` list of its moment; a blocked call that later comes
+    back through a `tool_result` gets its own chained line (`outcome: ran|not-run`, `link` = the decision
+    line's chain); `/dc → doctor` and `dc_inspect doctor` print the live half (enforcement, integrity,
+    lock, chain, checker, child, config, degraded) and must agree with the file half
+    (`node tools/dc-audit.mjs doctor`) on the chain verdict and the entry count.
