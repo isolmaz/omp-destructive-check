@@ -1,6 +1,7 @@
 # destructive-check
 
 ![platform](https://img.shields.io/badge/platform-omp%20extension-4c8dff)
+[![CI](https://github.com/isolmaz/omp-destructive-check/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/isolmaz/omp-destructive-check/actions/workflows/ci.yml)
 ![source](https://img.shields.io/badge/source-single%20file%20%C2%B7%200%20deps-brightgreen)
 
 A guard for the [omp](https://github.com/can1357/oh-my-pi) coding agent. **Before a destructive
@@ -139,6 +140,11 @@ node tests/t-e2e.mjs           # real omp sessions (needs auth, slower)
 Suites run offline against an isolated `HOME` with a stubbed host and stubbed `fetch`; the stubs
 fail closed. → Conventions: [AGENTS.md](AGENTS.md)
 
+CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the first six suites above and
+`mutation-check` — the commands you run locally, in that order — on Windows and Linux with Node 24,
+for pushes to `main` and pull requests. It skips `t-isolation` (Windows ACEs), `t-install` and `t-e2e`
+(needs auth). Run the same checks locally with Node 24+ (native TypeScript loading); no install step.
+
 ## Documentation
 
 | File | What it covers |
@@ -161,6 +167,7 @@ destructive-check.ts   the extension (single file, zero dependencies)
 install.mjs            copy it into ~/.omp/shared, write the manifest, print the config snippet
 tools/dc-audit.mjs     independent verifier for the audit log (node:crypto, exit 1 on a broken chain)
 tests/                 stubbed-host suites + real-session e2e + a mutation gate
+.github/workflows/     ci.yml: the stubbed suites + mutation gate on every push to main and PR
 docs/SETTINGS.md       every configuration key: what it does and why
 docs/REFERENCE.md      deep reference: rules, coverage, UI, audit, runbook, limits
 skills/                the companion skill: what the agent does after a block
