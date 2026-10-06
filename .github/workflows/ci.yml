@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          # t-review reads an older revision of the extension (git show HEAD~3:...).
+          fetch-depth: 0
       # Windows only: the suites assert Windows path semantics (drive letters, backslashes);
       # on Linux they fail by design, not by regression.
       # The extension is a .ts file loaded by node's native type stripping; there are
