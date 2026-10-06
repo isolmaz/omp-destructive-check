@@ -141,7 +141,7 @@ Suites run offline against an isolated `HOME` with a stubbed host and stubbed `f
 fail closed. → Conventions: [AGENTS.md](AGENTS.md)
 
 CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the first six suites above and
-`mutation-check` — the commands you run locally, in that order — on Windows and Linux with Node 24,
+`mutation-check` — the commands you run locally, in that order — on Windows with Node 24,
 for pushes to `main` and pull requests. It skips `t-isolation` (Windows ACEs), `t-install` and `t-e2e`
 (needs auth). Run the same checks locally with Node 24+ (native TypeScript loading); no install step.
 

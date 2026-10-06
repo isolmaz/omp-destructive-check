@@ -98,7 +98,8 @@ for (const command of ["rm -rf D:\\userdata\\out", "rm -rf C:\\Users\\dev\\.cach
 // scope (artifact / inside the project), not rejected up front as a filesystem root:
 // `~` expands to the same shape, so this is the common case there, not an edge one.
 {
-  const posixCwd = "C:\\Users\\dev\\proj";
+  // `/Users/...` resolves against the process drive, so the project must live on that drive too.
+  const posixCwd = `${process.cwd().slice(0, 2)}\\Users\\dev\\proj`;
   const inside = await run(cmd("rm -rf /Users/dev/proj/dist"), { config: cfg({ mode: "medium" }), cwd: posixCwd });
   check("posix home path inside the project is not treated as a root", !inside.blocked && inside.completions === 0, JSON.stringify(inside.result)?.slice(0, 200));
   const home = await run(cmd("rm -rf /Users/dev"), { config: cfg({ mode: "simple" }) });

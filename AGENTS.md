@@ -178,7 +178,7 @@ node tests/t-e2e.mjs           # real omp sessions; needs auth, slower, some cas
 ## CI
 
 `.github/workflows/ci.yml` runs `t-static`, `t-llm`, `t-menu`, `t-coverage`, `t-review`, `t-ui` and
-`mutation-check` on Windows and Linux (Node 24) for pushes to `main` and pull requests. `t-isolation`,
+`mutation-check` on Windows (Node 24) for pushes to `main` and pull requests. `t-isolation`,
 `t-install` and `t-e2e` are not in CI. A new suite that needs no network or credentials belongs in
 both the README test list and the workflow.
 
